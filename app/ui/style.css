@@ -171,3 +171,22 @@ kbd { font-family: var(--f-mono); font-size: 10.5px; color: var(--dim); margin-l
 .sprog .btn { margin-top: 8px; }
 .err { color: var(--lo); }
 .empty { height: auto; min-height: 60vh; }
+
+/* chat */
+.chatfab { position: fixed; right: 18px; bottom: 18px; z-index: 5; background: var(--pencil); color: #fff; border: 0; border-radius: 22px; padding: 10px 18px; font-size: 13.5px; cursor: pointer; box-shadow: 0 6px 20px rgba(0,0,0,.4); }
+.chat { position: fixed; right: 0; top: 0; bottom: 0; width: min(400px, 92vw); z-index: 8; background: #1f2023; border-left: 1px solid var(--line); display: flex; flex-direction: column; padding: 14px 14px 12px; gap: 8px; box-shadow: -12px 0 30px rgba(0,0,0,.35); }
+.chead { display: flex; justify-content: space-between; gap: 8px; }
+.chead h3 { margin: 0; font-family: var(--f-display); font-size: 20px; }
+.chat .claude { font-size: 12.5px; }
+.msgs { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; padding: 4px 2px; }
+.msg { max-width: 92%; padding: 8px 11px; border-radius: 10px; font-size: 13px; white-space: pre-wrap; line-height: 1.45; }
+.msg.me { align-self: flex-end; background: var(--pencil-soft); border: 1px solid rgba(239,75,63,.4); }
+.msg.ai { align-self: flex-start; background: var(--surface); border: 1px solid var(--line); }
+.msg.ai ul { margin: 6px 0 0; padding-left: 16px; color: var(--muted); }
+.msg .by { display: block; font-family: var(--f-mono); font-size: 10.5px; color: var(--dim); margin-top: 4px; }
+.msg.wait { color: var(--muted); font-style: italic; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chips button { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 3px 10px; font-size: 12px; cursor: pointer; color: var(--muted); }
+.chips button:hover { color: var(--fg); border-color: var(--muted); }
+.cin { display: flex; gap: 6px; align-items: flex-end; }
+.cin textarea { flex: 1; resize: none; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px; font: inherit; color: var(--fg); }

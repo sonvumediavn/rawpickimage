@@ -121,6 +121,7 @@
             <option value="score">Điểm cao trước</option>
             <option value="name">Theo tên file</option>
           </select>
+          <button class="btn" id="btnGather" title="Chuyển ảnh đã chọn vào một thư mục con ngay trong thư mục gốc, không cần xuất">Gom ảnh đã chọn vào thư mục con…</button>
           <button class="btn primary" id="btnExport">Xuất ảnh ra thư mục…</button>
         </div>
       </div>
@@ -128,6 +129,25 @@
     </div>
   </main>
 </div>
+
+<button class="chatfab" id="chatFab" aria-controls="chat" aria-expanded="false">Trò chuyện với AI</button>
+<aside class="chat" id="chat" hidden aria-label="Trò chuyện với AI chọn ảnh">
+  <div class="chead">
+    <div>
+      <h3>AI chọn ảnh</h3>
+      <p class="meta" id="chatWho">Đang dùng AI trong máy</p>
+    </div>
+    <button class="btn sm" id="chatClose" aria-label="Đóng">✕</button>
+  </div>
+  <label class="chk claude"><input type="checkbox" id="chatClaude" disabled> Dùng Claude (tài khoản Claude Code của bạn) cho câu hỏi tự do</label>
+  <p class="note" id="chatHint"></p>
+  <div class="msgs" id="chatMsgs" aria-live="polite"></div>
+  <div class="chips" id="chatChips"></div>
+  <form class="cin" id="chatForm">
+    <textarea id="chatInput" rows="2" placeholder="Ví dụ: ưu tiên ảnh có người cười, chỉ giữ 300 ảnh"></textarea>
+    <button class="btn primary" id="chatSend">Gửi</button>
+  </form>
+</aside>
 
 <div class="detail" id="detail" hidden role="dialog" aria-modal="true">
   <div class="dview">

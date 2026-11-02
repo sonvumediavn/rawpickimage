@@ -88,7 +88,7 @@ impl Analyzer {
         }
     }
 
-    pub fn analyze(&self, path: &Path, files: Vec<PathBuf>, idx: usize) -> Result<Analysis> {
+    pub fn analyze(&self, path: &Path, files: Vec<PathBuf>, _idx: usize) -> Result<Analysis> {
         // One decode at >=1280 px long side (DCT-scaled), everything else derives from it.
         let pv = preview::load(path, 1280)?;
         let hi = pv.rgb;
@@ -150,7 +150,9 @@ impl Analyzer {
 
         let thumb = self.thumbs_dir.as_ref().and_then(|d| {
             let t = metrics::resize_long(&hi, 480);
-            let p = d.join(format!("{idx:06}.jpg"));
+            // Named after the file, not its position, so cached thumbnails stay right
+            // when the folder's contents change.
+            let p = d.join(format!("{}.jpg", file_key(path)));
             let mut f = std::io::BufWriter::new(std::fs::File::create(&p).ok()?);
             image::codecs::jpeg::JpegEncoder::new_with_quality(&mut f, 82).encode_image(&t).ok()?;
             Some(p)
@@ -187,6 +189,12 @@ impl Analyzer {
             thumb,
         })
     }
+}
+
+/// Short stable name for cache files derived from a photo's path.
+pub fn file_key(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    format!("{:08x}{:08x}", crc32fast::hash(s.as_bytes()), crc32fast::hash(s.chars().rev().collect::<String>().as_bytes()))
 }
 
 /// Group files of one shot (same folder + stem): RAW + JPEG twins, XMP sidecars.

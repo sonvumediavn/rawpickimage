@@ -355,6 +355,7 @@ function renderMain() {
     st.session = null;
   }
   $("btnExport").disabled = m.phase !== "ready";
+  $("btnGather").disabled = m.phase !== "ready";
   $("btnTrain").disabled = m.phase !== "ready";
 }
 
@@ -545,6 +546,7 @@ function wireResults() {
   $("reasonSel").onchange = () => { st.reason = $("reasonSel").value; if (st.reason) { st.tab = "all"; for (const x of $("tabs").children) x.setAttribute("aria-pressed", String(x.dataset.t === "all")); } renderGrid(); };
   $("sortSel").onchange = () => { st.sort = $("sortSel").value; renderGrid(); };
   $("btnExport").onclick = doExport;
+  $("btnGather").onclick = doGather;
 }
 
 async function doExport() {
@@ -588,6 +590,29 @@ async function doExport() {
   st.metas = await invoke("list_sessions");
   renderTabs();
   renderMain();
+}
+
+/** Move the selected shots into a sub-folder of the source folder: no copy, no export. */
+async function doGather() {
+  const id = st.sid, m = meta(id);
+  if (!m || m.phase !== "ready") return;
+  const sub = prompt(`Chuyển ${st.summary.selected} ảnh đã chọn (kèm file RAW, JPEG, XMP cùng tên) vào thư mục con trong:\n${m.source}\n\nTên thư mục con:`, "Anh-da-chon");
+  if (!sub || !sub.trim()) return;
+  try {
+    const r = await invoke("gather_selected", { id, sub: sub.trim() });
+    st.views[id] = r.view;
+    Object.assign(m, r.view.meta);
+    st.session = null; // force a full re-render with the new paths
+    renderMain();
+    renderTabs();
+    const rep = r.report;
+    toast(`Đã chuyển ${rep.photos} ảnh (${rep.files} file) vào ${esc(rep.dir)}. File chỉ được đổi chỗ, giữ nguyên chất lượng.` +
+      (rep.errors.length ? ` <b>${rep.errors.length} lỗi</b>: ${esc(rep.errors[0])}` : "") + ` · <a id="openOut">Mở thư mục</a>`, 15000);
+    const a = document.getElementById("openOut");
+    if (a) a.onclick = () => T.opener.openPath(rep.dir);
+  } catch (e) {
+    toast(esc(e));
+  }
 }
 
 // ---------------------------------------------------------------- detail view
@@ -802,6 +827,77 @@ function wireDetail() {
   });
 }
 
+// ---------------------------------------------------------------- chat with the AI
+
+const CHAT_EXAMPLES = ["Ưu tiên ảnh có người cười", "Độ nét quan trọng nhất", "Chỉ giữ 300 ảnh", "Tôi thích ảnh tông tối", "Chọn theo phong cách của tôi", "Khắt khe hơn"];
+let chatBusy = false;
+
+function chatAdd(kind, html) {
+  const d = document.createElement("div");
+  d.className = "msg " + kind;
+  d.innerHTML = html;
+  $("chatMsgs").appendChild(d);
+  $("chatMsgs").scrollTop = 1e9;
+  return d;
+}
+
+async function sendChat(text) {
+  text = text.trim();
+  if (!text || chatBusy) return;
+  chatBusy = true;
+  $("chatInput").value = "";
+  chatAdd("me", esc(text));
+  const claude = $("chatClaude").checked;
+  const wait = chatAdd("ai wait", claude ? "Đang hỏi Claude…" : "Đang xử lý…");
+  try {
+    const r = await invoke("chat", { id: st.sid, message: text, useClaude: claude });
+    wait.remove();
+    chatAdd("ai", esc(r.reply) + (r.changes.length ? `<ul>${r.changes.map((c) => `<li>${esc(c)}</li>`).join("")}</ul>` : "") + `<span class="by">${r.by === "claude" ? "Claude" : "AI trong máy"}</span>`);
+    if (r.prefs) {
+      st.prefs = r.prefs;
+      const m = meta();
+      if (m) m.prefs = JSON.parse(JSON.stringify(r.prefs));
+      renderPresets();
+      renderWeights();
+      renderRules();
+      renderOptions();
+    }
+    if (r.verdicts && st.session) applyVerdicts(r.verdicts);
+  } catch (e) {
+    wait.remove();
+    chatAdd("ai", esc(e) + `<span class="by">lỗi</span>`);
+  } finally {
+    chatBusy = false;
+  }
+}
+
+function wireChat() {
+  const open = (on) => {
+    $("chat").hidden = !on;
+    $("chatFab").hidden = on;
+    $("chatFab").setAttribute("aria-expanded", String(on));
+    if (on) $("chatInput").focus();
+  };
+  $("chatFab").onclick = () => open(true);
+  $("chatClose").onclick = () => open(false);
+  $("chatChips").innerHTML = CHAT_EXAMPLES.map((x) => `<button type="button">${esc(x)}</button>`).join("");
+  for (const b of $("chatChips").children) b.onclick = () => sendChat(b.textContent);
+  $("chatForm").onsubmit = (e) => { e.preventDefault(); sendChat($("chatInput").value); };
+  $("chatInput").onkeydown = (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendChat($("chatInput").value); } };
+  $("chatClaude").onchange = () => {
+    $("chatWho").textContent = $("chatClaude").checked ? "Đang dùng Claude qua Claude Code" : "Đang dùng AI trong máy";
+    try { localStorage.setItem("useClaude", $("chatClaude").checked ? "1" : "0"); } catch (e) { /* storage off */ }
+  };
+  chatAdd("ai", "Bạn muốn chọn ảnh theo kiểu nào? Nói tự nhiên, ví dụ «ưu tiên ảnh có người cười, chỉ giữ 300 ảnh». Tôi chỉnh cách chấm và chọn lại ngay cho phiên đang mở.\n\nAI cũng học gu của bạn mỗi lần bạn xuất ảnh hoặc sửa tay.<span class=\"by\">AI trong máy</span>");
+  invoke("claude_status").then((c) => {
+    $("chatClaude").disabled = !c.found;
+    $("chatHint").textContent = c.found ? `${c.hint} · ${c.version || ""}` : c.hint;
+    let pref = "0";
+    try { pref = localStorage.getItem("useClaude") || "0"; } catch (e) { /* storage off */ }
+    if (c.found && pref === "1") { $("chatClaude").checked = true; $("chatClaude").onchange(); }
+  });
+}
+
 // ---------------------------------------------------------------- boot
 
 (async function boot() {
@@ -814,6 +910,7 @@ function wireDetail() {
   wireResults();
   wireDetail();
   wireZoom();
+  wireChat();
   if (!st.metas.length) await newSession();
   await selectSession(st.metas[0].id);
   restoreSessions();

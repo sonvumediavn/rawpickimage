@@ -6,25 +6,37 @@ toàn bằng CPU, không cần card đồ hoạ, không gửi ảnh đi đâu.
 
 ## Dùng thế nào
 
-1. Mở SonVu Raw Pick, kéo thư mục ảnh vào ô bên trái (hoặc bấm để chọn). Có thẻ nhớ thì bấm **Chép từ thẻ nhớ…**
-   để chép an toàn trước (kiểm tra checksum, có thể sao lưu thêm một ổ).
-2. Ứng dụng phân tích và chia ảnh thành **Đã chọn**, **Cần xem lại**, **Bị loại** kèm lý do.
-3. Bấm vào ảnh để xem điểm từng tiêu chí, khung khuôn mặt, mắt nhắm. Phím `P` chọn, `X` loại,
-   `U` trả về quyết định của AI, `←` `→` chuyển ảnh.
-4. Bấm **Xuất thư mục đã lọc**. Kết quả nằm cạnh thư mục gốc:
+1. Mở SonVu Raw Pick, kéo thư mục ảnh vào (hoặc bấm để chọn). Mỗi thư mục là một **phiên** có tab riêng;
+   bấm **+ Phiên mới** hoặc kéo nhiều thư mục vào cùng lúc để lọc nhiều sự kiện. Các phiên được phân tích
+   lần lượt để máy cũ không bị đuối, và tự mở lại khi bật ứng dụng (giữ cả các ảnh bạn sửa tay).
+   Có thẻ nhớ thì bấm **Chép từ thẻ nhớ…** để chép an toàn trước (kiểm tra checksum, có thể sao lưu thêm một ổ).
+2. Ứng dụng chấm điểm và chia ảnh thành **Đã chọn**, **Cần xem lại**, **Bị loại** kèm lý do.
+3. Bấm vào ảnh để xem điểm từng tiêu chí, khung khuôn mặt, mắt nhắm. Cuộn chuột hoặc chụm hai ngón để phóng
+   to, kéo để di chuyển, nhấp đúp (hoặc phím `1`) để xem 100% kiểm tra độ nét, phím `0` về vừa khung.
+   Phím `P` chọn, `X` loại, `U` trả về quyết định của AI, `←` `→` chuyển ảnh.
+4. Bấm **Trò chuyện với AI** để yêu cầu bằng lời: «ưu tiên ảnh có người cười», «chỉ giữ 300 ảnh»,
+   «tôi thích ảnh tông tối», «chọn theo phong cách của tôi»… AI chỉnh cách chấm và chọn lại ngay.
+   AI trong máy hiểu các yêu cầu thường gặp, chạy offline. Máy nào đã cài **Claude Code** và đăng nhập tài
+   khoản Claude thì bật «Dùng Claude» để hỏi tự do (dùng tài khoản của bạn, không cần API key).
+5. Lấy ảnh ra theo một trong hai cách:
+   - **Gom ảnh đã chọn vào thư mục con…**: chuyển ảnh đã chọn vào một thư mục con ngay trong thư mục gốc
+     (ví dụ `Anh-da-chon/`). Chỉ đổi chỗ file, không chép lại, xong ngay.
+   - **Xuất ảnh ra thư mục…**: chọn thư mục đích trên máy, ứng dụng tạo `Ten-su-kien_da-loc` bên trong.
+     Chọn **Chép** (giữ ảnh gốc) hoặc **Chuyển** (bản gốc chỉ bị xoá sau khi bản mới đã kiểm tra khớp).
 
 ```
 Ten-su-kien_da-loc/
   1_Da-chon/
-  2_Can-xem-lai/
-  3_Bi-loai/
+  2_Can-xem-lai/        (nếu bật)
+  3_Bi-loai/            (nếu bật)
     Nham-mat/  Mo-net/  Chay-sang/  Thieu-sang/  Nghieng/
     Bo-cuc/    Nhieu/   Trung-lap/  Mat-loi/     Diem-thap/
   bao-cao.csv      (mở bằng Excel: điểm, lý do, gợi ý sửa từng ảnh)
   tong-ket.txt     (thống kê buổi chụp, theo từng máy)
 ```
 
-Ảnh gốc **không bao giờ bị di chuyển hay xoá**. File RAW, JPEG cùng tên và file `.xmp` đi chung với nhau.
+**Chất lượng ảnh giữ nguyên tuyệt đối**: file RAW, JPEG cùng tên và `.xmp` được chép hoặc chuyển nguyên
+bản từng byte, không nén lại, không chuyển định dạng. Ảnh hiện trong ứng dụng chỉ là bản xem nhanh.
 
 ## Ứng dụng chấm những gì
 

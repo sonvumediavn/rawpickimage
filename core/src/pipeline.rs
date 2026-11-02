@@ -162,3 +162,94 @@ pub fn export_all(source: &Path, items: &[Item], verdicts: &[Verdict], out_dir: 
         .collect();
     export::export(&entries, out_dir, opts, &|n, t| (p.on_step)(n, t, "Đang xuất ảnh"), p.cancel)
 }
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct GatherReport {
+    pub dir: PathBuf,
+    pub photos: usize,
+    pub files: usize,
+    pub errors: Vec<String>,
+}
+
+/// Move the selected photos (RAW + JPEG twin + XMP) into a sub-folder of the source folder.
+/// Same drive, so each file is only renamed: not a byte is rewritten. Updates `items` in place
+/// so the session keeps working with the new locations.
+pub fn gather_selected(source: &Path, items: &mut [Item], verdicts: &[Verdict], sub: &str) -> Result<GatherReport> {
+    let sub = sub.trim().trim_matches(['/', '\\']);
+    anyhow::ensure!(!sub.is_empty() && !sub.contains("..") && !sub.contains(['/', '\\', ':']), "Tên thư mục không hợp lệ");
+    let dir = source.join(sub);
+    std::fs::create_dir_all(&dir)?;
+    let mut rep = GatherReport { dir: dir.clone(), ..Default::default() };
+    for (it, v) in items.iter_mut().zip(verdicts) {
+        if v.decision != Decision::Selected || it.path.starts_with(&dir) {
+            continue;
+        }
+        let rel = it.path.parent().and_then(|d| d.strip_prefix(source).ok()).map(Path::to_path_buf).unwrap_or_default();
+        let target = dir.join(rel);
+        std::fs::create_dir_all(&target)?;
+        let mut moved_any = false;
+        let mut new_files = Vec::with_capacity(it.files.len());
+        for f in &it.files {
+            let mut dst = target.join(f.file_name().unwrap_or_default());
+            let mut k = 2;
+            while dst.exists() {
+                let stem = f.file_stem().unwrap_or_default().to_string_lossy();
+                let ext = f.extension().map(|x| format!(".{}", x.to_string_lossy())).unwrap_or_default();
+                dst = target.join(format!("{stem}_{k}{ext}"));
+                k += 1;
+            }
+            match std::fs::rename(f, &dst) {
+                Ok(()) => {
+                    rep.files += 1;
+                    moved_any = true;
+                    if *f == it.path {
+                        it.path = dst.clone();
+                    }
+                    new_files.push(dst);
+                }
+                Err(e) => {
+                    rep.errors.push(format!("Không chuyển được {}: {e}", f.display()));
+                    new_files.push(f.clone());
+                }
+            }
+        }
+        it.files = new_files;
+        if let Some(a) = it.analysis.as_mut() {
+            a.path = it.path.clone();
+            a.files = it.files.clone();
+        }
+        rep.photos += moved_any as usize;
+    }
+    Ok(rep)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gathers_selected_shots_with_their_twins() {
+        let t = tempfile::tempdir().unwrap();
+        let src = t.path().join("Cuoi");
+        std::fs::create_dir_all(src.join("Cam2")).unwrap();
+        let raw = src.join("Cam2/DSC_1.NEF");
+        let jpg = src.join("Cam2/DSC_1.JPG");
+        let other = src.join("DSC_9.JPG");
+        for (p, b) in [(&raw, &b"raw"[..]), (&jpg, b"jpg"), (&other, b"x")] {
+            std::fs::write(p, b).unwrap();
+        }
+        let mut items = vec![
+            Item { path: jpg.clone(), files: vec![jpg.clone(), raw.clone()], analysis: None, error: None },
+            Item { path: other.clone(), files: vec![other.clone()], analysis: None, error: None },
+        ];
+        let refs: Vec<Option<&Analysis>> = vec![None, None];
+        let mut v = cull::cull(&refs, &Settings::default(), None);
+        cull::set_manual(&mut v[0], Decision::Selected);
+        let r = gather_selected(&src, &mut items, &v, "Da-chon").unwrap();
+        assert_eq!((r.photos, r.files), (1, 2), "{:?}", r.errors);
+        assert_eq!(std::fs::read(src.join("Da-chon/Cam2/DSC_1.NEF")).unwrap(), b"raw");
+        assert!(!raw.exists() && other.exists());
+        assert_eq!(items[0].path, src.join("Da-chon/Cam2/DSC_1.JPG"));
+        assert!(gather_selected(&src, &mut items, &v, "../x").is_err());
+    }
+}

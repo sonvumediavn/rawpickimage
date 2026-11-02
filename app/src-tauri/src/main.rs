@@ -622,6 +622,238 @@ async fn export_folder(handle: AppHandle, id: u32, parent: String) -> Result<Exp
     .map_err(|e| e.to_string())?
 }
 
+#[derive(Serialize)]
+struct GatherResult {
+    report: pipeline::GatherReport,
+    view: SessionView,
+}
+
+/// Move the selected photos into a sub-folder of the source folder (no export).
+#[tauri::command]
+fn gather_selected(handle: AppHandle, id: u32, sub: String) -> Result<GatherResult, String> {
+    let app = handle.state::<Arc<App>>();
+    let mut map = app.sessions.lock().unwrap();
+    let s = map.get_mut(&id).ok_or("Phiên đã đóng")?;
+    if s.phase != Phase::Ready {
+        return Err("Phiên này chưa phân tích xong".into());
+    }
+    let source = s.source.clone().ok_or("Phiên chưa có thư mục")?;
+    let old: Vec<String> = s.items.iter().map(|i| i.path.display().to_string()).collect();
+    let report = pipeline::gather_selected(&source, &mut s.items, &s.verdicts, &sub).map_err(|e| format!("{e:#}"))?;
+    // Manual choices follow the files to their new place.
+    for (i, o) in old.iter().enumerate() {
+        let new = s.items[i].path.display().to_string();
+        if *o != new {
+            if let Some(d) = s.overrides.remove(o) {
+                s.overrides.insert(new, d);
+            }
+        }
+    }
+    app.recull(s);
+    let view = session_view(&app, s);
+    app.save_sessions(&map);
+    Ok(GatherResult { report, view })
+}
+
+// ---------------------------------------------------------------- chat
+
+/// Run Claude Code (signed in with the user's own Claude account) in print mode.
+/// Unix: through a login shell so the user's PATH (Homebrew, ~/.local/bin, nvm…) applies,
+/// since apps started from the Dock/Finder don't get it.
+fn claude_command(args: &str) -> std::process::Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut c = std::process::Command::new("cmd");
+        c.arg("/C").arg(format!("claude {args}"));
+        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        c
+    }
+    #[cfg(not(windows))]
+    {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+        let mut c = std::process::Command::new(shell);
+        let home = std::env::var("HOME").unwrap_or_default();
+        c.arg("-lc").arg(format!("PATH=\"$PATH:{home}/.local/bin:{home}/.claude/local:/opt/homebrew/bin:/usr/local/bin\" exec claude {args}"));
+        c
+    }
+}
+
+fn run_with_timeout(mut cmd: std::process::Command, input: Option<String>, secs: u64) -> Result<std::process::Output, String> {
+    use std::io::Write;
+    use std::process::Stdio;
+    cmd.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() }).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| format!("Không chạy được Claude Code: {e}"))?;
+    if let (Some(text), Some(mut stdin)) = (input, child.stdin.take()) {
+        let _ = stdin.write_all(text.as_bytes());
+    }
+    let id = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
+        Ok(r) => r.map_err(|e| e.to_string()),
+        Err(_) => {
+            #[cfg(windows)]
+            let _ = std::process::Command::new("taskkill").args(["/PID", &id.to_string(), "/T", "/F"]).output();
+            #[cfg(not(windows))]
+            let _ = std::process::Command::new("kill").arg(id.to_string()).output();
+            Err("Claude trả lời quá lâu, thử lại sau".into())
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ClaudeStatus {
+    found: bool,
+    version: Option<String>,
+    hint: String,
+}
+
+#[tauri::command]
+async fn claude_status() -> ClaudeStatus {
+    tauri::async_runtime::spawn_blocking(|| match run_with_timeout(claude_command("--version"), None, 20) {
+        Ok(o) if o.status.success() => ClaudeStatus {
+            found: true,
+            version: Some(String::from_utf8_lossy(&o.stdout).trim().to_string()),
+            hint: "Dùng Claude Code đã đăng nhập trên máy này (tài khoản Claude của bạn)".into(),
+        },
+        _ => ClaudeStatus {
+            found: false,
+            version: None,
+            hint: "Chưa thấy Claude Code trên máy này. Cài từ claude.com/claude-code, mở Terminal gõ «claude» và đăng nhập một lần, rồi mở lại ứng dụng.".into(),
+        },
+    })
+    .await
+    .unwrap_or(ClaudeStatus { found: false, version: None, hint: String::new() })
+}
+
+#[derive(Serialize)]
+struct ChatResult {
+    reply: String,
+    changes: Vec<String>,
+    by: &'static str,
+    prefs: Option<Prefs>,
+    verdicts: Option<VerdictsView>,
+    before: Option<usize>,
+    after: Option<usize>,
+}
+
+fn chat_context(s: &Session) -> Option<rawpick_core::chat::Context> {
+    if s.items.is_empty() {
+        return None;
+    }
+    let mut sum = [0f32; 6];
+    let mut n = [0usize; 6];
+    let mut cams = std::collections::BTreeSet::new();
+    let mut times = vec![];
+    for a in s.items.iter().filter_map(|i| i.analysis.as_ref()) {
+        for (k, c) in rawpick_core::analyze::CRITERIA.iter().enumerate() {
+            if let Some(v) = a.scores.get(c) {
+                sum[k] += v;
+                n[k] += 1;
+            }
+        }
+        cams.insert(a.camera.clone());
+        if let Some(t) = a.time {
+            times.push(t);
+        }
+    }
+    times.sort_by(f64::total_cmp);
+    let mut mean = [0f32; 6];
+    for k in 0..6 {
+        mean[k] = if n[k] > 0 { (sum[k] / n[k] as f32 * 10.0).round() / 10.0 } else { 0.0 };
+    }
+    Some(rawpick_core::chat::Context {
+        summary: cull::summarize(&s.verdicts),
+        mean_scores: mean,
+        with_people: n[5],
+        cameras: cams.into_iter().collect(),
+        hours: times.last().zip(times.first()).map(|(b, a)| ((b - a) / 3600.0) as f32).unwrap_or(0.0),
+    })
+}
+
+/// One chat message: understand it (offline, or with Claude), change the session's settings,
+/// re-decide, and say what changed.
+#[tauri::command]
+async fn chat(handle: AppHandle, id: Option<u32>, message: String, use_claude: bool) -> Result<ChatResult, String> {
+    use rawpick_core::chat;
+    let app = handle.state::<Arc<App>>().inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let (mut prefs, ctx) = {
+            let map = app.sessions.lock().unwrap();
+            match id.and_then(|i| map.get(&i)) {
+                Some(s) => (s.prefs.clone(), chat_context(s)),
+                None => (app.global.lock().unwrap().prefs.clone(), None),
+            }
+        };
+        let (patch, mut notes, by) = if use_claude {
+            let ready = app.store().load(&prefs.profile).ready();
+            let prompt = chat::claude_prompt(&message, &prefs.settings, &prefs.preset, ctx.as_ref(), ready);
+            let dir = app.data_dir.join("claude-chat");
+            let _ = std::fs::create_dir_all(&dir);
+            // Answer-only: no shell, no file edits, no web. Runs in an empty folder.
+            let mut cmd = claude_command("-p --output-format json --disallowedTools Bash Edit Write NotebookEdit WebFetch WebSearch");
+            cmd.current_dir(&dir);
+            let out = run_with_timeout(cmd, Some(prompt), 180)?;
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            if !out.status.success() && stdout.trim().is_empty() {
+                let err = String::from_utf8_lossy(&out.stderr);
+                return Err(format!("Claude Code báo lỗi: {}. Nếu chưa đăng nhập, mở Terminal gõ «claude» để đăng nhập.", err.trim().chars().take(300).collect::<String>()));
+            }
+            let ans = chat::parse_claude_answer(&stdout).map_err(|e| format!("{e}. Nếu chưa đăng nhập, mở Terminal gõ «claude» để đăng nhập."))?;
+            (ans.patch, vec![ans.reply], "claude")
+        } else {
+            let u = chat::understand(&message, &prefs.settings.weights);
+            (u.patch, u.notes, "local")
+        };
+        if patch.is_empty() {
+            let reply = if by == "local" { chat::HELP.to_string() } else { notes.join("\n") };
+            return Ok(ChatResult { reply, changes: vec![], by, prefs: None, verdicts: None, before: None, after: None });
+        }
+        let changes = patch.apply(&mut prefs.settings, &mut prefs.preset);
+        {
+            let mut g = app.global.lock().unwrap();
+            g.prefs = prefs.clone();
+        }
+        app.save_global();
+        let mut map = app.sessions.lock().unwrap();
+        let (verdicts, before, after) = match id.and_then(|i| map.get_mut(&i)) {
+            Some(s) => {
+                s.prefs = prefs.clone();
+                if s.phase == Phase::Ready {
+                    let before = s.verdicts.iter().filter(|v| v.decision == Decision::Selected).count();
+                    app.recull(s);
+                    let after = s.verdicts.iter().filter(|v| v.decision == Decision::Selected).count();
+                    (Some(VerdictsView { verdicts: s.verdicts.clone(), summary: cull::summarize(&s.verdicts) }), Some(before), Some(after))
+                } else {
+                    (None, None, None)
+                }
+            }
+            None => (None, None, None),
+        };
+        app.save_sessions(&map);
+        drop(map);
+        let mut reply = String::new();
+        if by == "claude" {
+            reply += &notes.remove(0);
+        } else {
+            reply += "Đã chỉnh theo yêu cầu.";
+            for n in notes {
+                reply += "\n";
+                reply += &n;
+            }
+        }
+        if let (Some(b), Some(a)) = (before, after) {
+            reply += &format!("\nẢnh đã chọn: {b} → {a}.");
+        }
+        Ok(ChatResult { reply, changes, by, prefs: Some(prefs), verdicts, before, after })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 async fn copy_card(handle: AppHandle, card: String, dest: String, backup: Option<String>) -> Result<CopyReport, String> {
     let app = handle.state::<Arc<App>>().inner().clone();
@@ -666,7 +898,8 @@ async fn big_preview(handle: AppHandle, id: u32, idx: usize, full: Option<bool>)
             let s = map.get(&id).ok_or("Phiên đã đóng")?;
             (s.items.get(idx).ok_or("Sai ảnh")?.path.clone(), pipeline::work_dir(&app.data_dir, s.source.as_ref().ok_or("Phiên chưa có thư mục")?))
         };
-        let out = work.join("big").join(if full { format!("{idx:06}-full.jpg") } else { format!("{idx:06}.jpg") });
+        let key = rawpick_core::analyze::file_key(&path);
+        let out = work.join("big").join(if full { format!("{key}-full.jpg") } else { format!("{key}.jpg") });
         if !out.exists() {
             let long = if full { u32::MAX } else { 1800 };
             let pv = preview::load(&path, long).map_err(|e| format!("{e:#}"))?;
@@ -746,6 +979,9 @@ fn main() {
             train,
             export_target,
             export_folder,
+            gather_selected,
+            claude_status,
+            chat,
             copy_card,
             cancel,
             big_preview

@@ -9,3 +9,4 @@ pub mod options;
 pub mod export;
 pub mod ingest;
 pub mod pipeline;
+pub mod chat;
