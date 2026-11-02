@@ -16,6 +16,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 
+mod web;
+
 const FACE_MODEL: &str = "face_detection_yunet_2023mar.onnx";
 
 /// Settings of one session. New sessions start from the last settings used.
@@ -44,6 +46,8 @@ struct Global {
     prefs: Prefs,
     /// Folder last chosen for exports.
     export_parent: Option<PathBuf>,
+    /// The web version served by this app.
+    web: web::WebPrefs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,9 +120,19 @@ struct App {
     global: Mutex<Global>,
     card_cancel: AtomicBool,
     card_busy: AtomicBool,
+    /// The desktop window; events also go to every open web page.
+    handle: std::sync::OnceLock<AppHandle>,
+    web: web::Web,
 }
 
 impl App {
+    fn emit<S: Serialize + Clone>(&self, event: &str, payload: S) {
+        if let Some(h) = self.handle.get() {
+            let _ = h.emit(event, payload.clone());
+        }
+        self.web.broadcast(event, &payload);
+    }
+
     fn store(&self) -> Store {
         Store::new(learn::default_dir(&self.data_dir))
     }
@@ -299,14 +313,14 @@ fn session_view(app: &App, s: &Session) -> SessionView {
     }
 }
 
-fn emitter(app: &AppHandle, session: Option<u32>) -> impl Fn(usize, usize, &str) + Sync + '_ {
+fn emitter(app: &App, session: Option<u32>) -> impl Fn(usize, usize, &str) + Sync + '_ {
     move |done, total, stage| {
-        let _ = app.emit("progress", ProgressEvent { session, done, total, stage: stage.to_string() });
+        app.emit("progress", ProgressEvent { session, done, total, stage: stage.to_string() });
     }
 }
 
-fn sessions_changed(app: &AppHandle) {
-    let _ = app.emit("sessions-changed", ());
+fn sessions_changed(app: &App) {
+    app.emit("sessions-changed", ());
 }
 
 fn folder_name(p: &Path) -> String {
@@ -328,8 +342,7 @@ struct AppInfo {
     sessions: Vec<SessionMeta>,
 }
 
-#[tauri::command]
-fn app_info(app: State<'_, Arc<App>>) -> AppInfo {
+fn op_app_info(app: &Arc<App>) -> AppInfo {
     let g = app.global.lock().unwrap().clone();
     let sessions: Vec<SessionMeta> = app.sessions.lock().unwrap().values().map(meta).collect();
     let mut profiles = app.store().list();
@@ -356,9 +369,7 @@ fn app_info(app: State<'_, Arc<App>>) -> AppInfo {
     }
 }
 
-#[tauri::command]
-fn new_session(handle: AppHandle) -> SessionMeta {
-    let app = handle.state::<Arc<App>>();
+fn op_new_session(app: &Arc<App>) -> SessionMeta {
     let id = app.next_id.fetch_add(1, Ordering::SeqCst);
     let prefs = app.global.lock().unwrap().prefs.clone();
     let mut map = app.sessions.lock().unwrap();
@@ -367,29 +378,25 @@ fn new_session(handle: AppHandle) -> SessionMeta {
     map.insert(id, s);
     app.save_sessions(&map);
     drop(map);
-    sessions_changed(&handle);
+    sessions_changed(app);
     m
 }
 
-#[tauri::command]
-fn close_session(handle: AppHandle, id: u32) {
-    let app = handle.state::<Arc<App>>();
+fn op_close_session(app: &Arc<App>, id: u32) {
     let mut map = app.sessions.lock().unwrap();
     if let Some(s) = map.remove(&id) {
         s.cancel.store(true, Ordering::SeqCst);
     }
     app.save_sessions(&map);
     drop(map);
-    sessions_changed(&handle);
+    sessions_changed(app);
 }
 
-#[tauri::command]
-fn list_sessions(app: State<'_, Arc<App>>) -> Vec<SessionMeta> {
+fn op_list_sessions(app: &Arc<App>) -> Vec<SessionMeta> {
     app.sessions.lock().unwrap().values().map(meta).collect()
 }
 
-#[tauri::command]
-fn get_session(app: State<'_, Arc<App>>, id: u32) -> Result<SessionView, String> {
+fn op_get_session(app: &Arc<App>, id: u32) -> Result<SessionView, String> {
     let map = app.sessions.lock().unwrap();
     let s = map.get(&id).ok_or("Phiên đã đóng")?;
     Ok(session_view(&app, s))
@@ -397,8 +404,7 @@ fn get_session(app: State<'_, Arc<App>>, id: u32) -> Result<SessionView, String>
 
 /// Save a session's settings (they also become the defaults for new sessions)
 /// and re-decide instantly; no re-analysis needed.
-#[tauri::command]
-fn save_prefs(app: State<'_, Arc<App>>, id: Option<u32>, prefs: Prefs) -> Option<VerdictsView> {
+fn op_save_prefs(app: &Arc<App>, id: Option<u32>, prefs: Prefs) -> Option<VerdictsView> {
     app.global.lock().unwrap().prefs = prefs.clone();
     app.save_global();
     let mut map = app.sessions.lock().unwrap();
@@ -414,18 +420,15 @@ fn save_prefs(app: State<'_, Arc<App>>, id: Option<u32>, prefs: Prefs) -> Option
     out
 }
 
-#[tauri::command]
-fn profile_info(app: State<'_, Arc<App>>, name: String) -> ProfileView {
+fn op_profile_info(app: &Arc<App>, name: String) -> ProfileView {
     app.profile_view(&name)
 }
 
 /// Analyse a folder in a session. With `source` = None the session's saved folder is reopened
 /// (instant thanks to the cache). Several calls queue up and run one after another.
-#[tauri::command]
-async fn analyze(handle: AppHandle, id: u32, source: Option<String>) -> Result<SessionView, String> {
-    let app = handle.state::<Arc<App>>().inner().clone();
-    let h2 = handle.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+fn op_analyze(app: &Arc<App>, id: u32, source: Option<String>) -> Result<SessionView, String> {
+    let app = app.clone();
+    (move || {
         let (source, prefs, cancel) = {
             let mut map = app.sessions.lock().unwrap();
             let s = map.get_mut(&id).ok_or("Phiên đã đóng")?;
@@ -453,8 +456,8 @@ async fn analyze(handle: AppHandle, id: u32, source: Option<String>) -> Result<S
             app.save_sessions(&map);
             out
         };
-        sessions_changed(&h2);
-        let on_step = emitter(&h2, Some(id));
+        sessions_changed(&app);
+        let on_step = emitter(&app, Some(id));
         on_step(0, 0, "Đang chờ phiên khác phân tích xong");
 
         let work = pipeline::work_dir(&app.data_dir, &source);
@@ -468,7 +471,7 @@ async fn analyze(handle: AppHandle, id: u32, source: Option<String>) -> Result<S
             if let Some(s) = app.sessions.lock().unwrap().get_mut(&id) {
                 s.phase = Phase::Analyzing;
             }
-            sessions_changed(&h2);
+            sessions_changed(&app);
             an.thumbs_dir = Some(thumbs);
             let p = Progress { on_step: &on_step, cancel: &cancel };
             pipeline::analyze_all(&source, prefs.recursive, &an, Some(&work), &p).map_err(|e| format!("{e:#}"))
@@ -481,7 +484,7 @@ async fn analyze(handle: AppHandle, id: u32, source: Option<String>) -> Result<S
                 drop(r);
                 s.phase = if s.items.is_empty() { Phase::Empty } else { Phase::Ready };
                 drop(map);
-                sessions_changed(&h2);
+                sessions_changed(&app);
                 return Err("Đã dừng".into());
             }
             Ok(r) => r,
@@ -489,7 +492,7 @@ async fn analyze(handle: AppHandle, id: u32, source: Option<String>) -> Result<S
                 s.phase = Phase::Failed;
                 s.error = Some(e.clone());
                 drop(map);
-                sessions_changed(&h2);
+                sessions_changed(&app);
                 return Err(e);
             }
         };
@@ -498,7 +501,7 @@ async fn analyze(handle: AppHandle, id: u32, source: Option<String>) -> Result<S
             s.error = Some("Thư mục không có ảnh RAW hoặc JPEG nào".into());
             let e = s.error.clone().unwrap();
             drop(map);
-            sessions_changed(&h2);
+            sessions_changed(&app);
             return Err(e);
         }
         s.suggestions = pipeline::suggestions(&items, &source);
@@ -510,16 +513,13 @@ async fn analyze(handle: AppHandle, id: u32, source: Option<String>) -> Result<S
         let view = session_view(&app, s);
         app.save_sessions(&map);
         drop(map);
-        sessions_changed(&h2);
+        sessions_changed(&app);
         Ok(view)
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    })()
 }
 
 /// Sơn's manual choice for one photo; `None` returns it to the AI's decision.
-#[tauri::command]
-fn set_decision(app: State<'_, Arc<App>>, id: u32, idx: usize, decision: Option<Decision>) -> Result<VerdictsView, String> {
+fn op_set_decision(app: &Arc<App>, id: u32, idx: usize, decision: Option<Decision>) -> Result<VerdictsView, String> {
     let mut map = app.sessions.lock().unwrap();
     let s = map.get_mut(&id).ok_or("Phiên đã đóng")?;
     let key = s.items.get(idx).ok_or("Sai ảnh")?.path.display().to_string();
@@ -547,8 +547,7 @@ fn learn_from(app: &App, profile: &str, items: &[Item], verdicts: &[Verdict]) ->
     app.profile_view(profile)
 }
 
-#[tauri::command]
-fn train(app: State<'_, Arc<App>>, id: u32) -> Result<ProfileView, String> {
+fn op_train(app: &Arc<App>, id: u32) -> Result<ProfileView, String> {
     let map = app.sessions.lock().unwrap();
     let s = map.get(&id).ok_or("Phiên đã đóng")?;
     Ok(learn_from(&app, &s.prefs.profile, &s.items, &s.verdicts))
@@ -561,8 +560,7 @@ struct ExportResult {
 }
 
 /// The folder an export into `parent` will create.
-#[tauri::command]
-fn export_target(app: State<'_, Arc<App>>, id: u32, parent: String) -> Result<String, String> {
+fn op_export_target(app: &Arc<App>, id: u32, parent: String) -> Result<String, String> {
     let map = app.sessions.lock().unwrap();
     let s = map.get(&id).ok_or("Phiên đã đóng")?;
     let src = s.source.as_ref().ok_or("Phiên chưa có thư mục")?;
@@ -570,11 +568,9 @@ fn export_target(app: State<'_, Arc<App>>, id: u32, parent: String) -> Result<St
 }
 
 /// Export into `<parent>/<folder name>_da-loc`, `parent` chosen by Sơn.
-#[tauri::command]
-async fn export_folder(handle: AppHandle, id: u32, parent: String) -> Result<ExportResult, String> {
-    let app = handle.state::<Arc<App>>().inner().clone();
-    let h2 = handle.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+fn op_export_folder(app: &Arc<App>, id: u32, parent: String) -> Result<ExportResult, String> {
+    let app = app.clone();
+    (move || {
         let parent = PathBuf::from(parent);
         if !parent.is_dir() {
             return Err(format!("Không tìm thấy thư mục {}", parent.display()));
@@ -592,9 +588,9 @@ async fn export_folder(handle: AppHandle, id: u32, parent: String) -> Result<Exp
             opts.report = opts.report && s.prefs.settings.options.report;
             (s.source.clone().unwrap(), s.items.clone(), s.verdicts.clone(), opts, s.prefs.profile.clone(), s.cancel.clone())
         };
-        sessions_changed(&h2);
+        sessions_changed(&app);
         let out = parent.join(format!("{}_da-loc", folder_name(&source)));
-        let on_step = emitter(&h2, Some(id));
+        let on_step = emitter(&app, Some(id));
         let p = Progress { on_step: &on_step, cancel: &cancel };
         let res = pipeline::export_all(&source, &items, &verdicts, &out, &opts, &p).map_err(|e| format!("{e:#}"));
         {
@@ -612,14 +608,12 @@ async fn export_folder(handle: AppHandle, id: u32, parent: String) -> Result<Exp
             g.export_parent = Some(parent);
         }
         app.save_global();
-        sessions_changed(&h2);
+        sessions_changed(&app);
         let report = res?;
         // Every export teaches the AI what Sơn finally kept.
         let profile = learn_from(&app, &profile, &items, &verdicts);
         Ok(ExportResult { report, profile })
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    })()
 }
 
 #[derive(Serialize)]
@@ -629,9 +623,7 @@ struct GatherResult {
 }
 
 /// Move the selected photos into a sub-folder of the source folder (no export).
-#[tauri::command]
-fn gather_selected(handle: AppHandle, id: u32, sub: String) -> Result<GatherResult, String> {
-    let app = handle.state::<Arc<App>>();
+fn op_gather_selected(app: &Arc<App>, id: u32, sub: String) -> Result<GatherResult, String> {
     let mut map = app.sessions.lock().unwrap();
     let s = map.get_mut(&id).ok_or("Phiên đã đóng")?;
     if s.phase != Phase::Ready {
@@ -711,9 +703,8 @@ struct ClaudeStatus {
     hint: String,
 }
 
-#[tauri::command]
-async fn claude_status() -> ClaudeStatus {
-    tauri::async_runtime::spawn_blocking(|| match run_with_timeout(claude_command("--version"), None, 20) {
+fn op_claude_status() -> ClaudeStatus {
+    match run_with_timeout(claude_command("--version"), None, 20) {
         Ok(o) if o.status.success() => ClaudeStatus {
             found: true,
             version: Some(String::from_utf8_lossy(&o.stdout).trim().to_string()),
@@ -724,9 +715,7 @@ async fn claude_status() -> ClaudeStatus {
             version: None,
             hint: "Chưa thấy Claude Code trên máy này. Cài từ claude.com/claude-code, mở Terminal gõ «claude» và đăng nhập một lần, rồi mở lại ứng dụng.".into(),
         },
-    })
-    .await
-    .unwrap_or(ClaudeStatus { found: false, version: None, hint: String::new() })
+    }
 }
 
 #[derive(Serialize)]
@@ -776,11 +765,10 @@ fn chat_context(s: &Session) -> Option<rawpick_core::chat::Context> {
 
 /// One chat message: understand it (offline, or with Claude), change the session's settings,
 /// re-decide, and say what changed.
-#[tauri::command]
-async fn chat(handle: AppHandle, id: Option<u32>, message: String, use_claude: bool) -> Result<ChatResult, String> {
+fn op_chat(app: &Arc<App>, id: Option<u32>, message: String, use_claude: bool) -> Result<ChatResult, String> {
     use rawpick_core::chat;
-    let app = handle.state::<Arc<App>>().inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
+    let app = app.clone();
+    (move || {
         let (mut prefs, ctx) = {
             let map = app.sessions.lock().unwrap();
             match id.and_then(|i| map.get(&i)) {
@@ -849,33 +837,26 @@ async fn chat(handle: AppHandle, id: Option<u32>, message: String, use_claude: b
             reply += &format!("\nẢnh đã chọn: {b} → {a}.");
         }
         Ok(ChatResult { reply, changes, by, prefs: Some(prefs), verdicts, before, after })
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    })()
 }
 
-#[tauri::command]
-async fn copy_card(handle: AppHandle, card: String, dest: String, backup: Option<String>) -> Result<CopyReport, String> {
-    let app = handle.state::<Arc<App>>().inner().clone();
-    let h2 = handle.clone();
-    tauri::async_runtime::spawn_blocking(move || {
+fn op_copy_card(app: &Arc<App>, card: String, dest: String, backup: Option<String>) -> Result<CopyReport, String> {
+    let app = app.clone();
+    (move || {
         if app.card_busy.swap(true, Ordering::SeqCst) {
             return Err("Đang chép một thẻ khác".to_string());
         }
         app.card_cancel.store(false, Ordering::SeqCst);
-        let on_step = emitter(&h2, None);
+        let on_step = emitter(&app, None);
         let r = ingest::safe_copy(Path::new(&card), Path::new(&dest), backup.as_deref().map(Path::new), &|n, t| on_step(n, t, "Đang chép thẻ"), &app.card_cancel)
             .map_err(|e| format!("{e:#}"));
         app.card_busy.store(false, Ordering::SeqCst);
         r
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    })()
 }
 
 /// Stop a session's analysis/export, or the card copy when `id` is None.
-#[tauri::command]
-fn cancel(app: State<'_, Arc<App>>, id: Option<u32>) {
+fn op_cancel(app: &Arc<App>, id: Option<u32>) {
     match id {
         Some(id) => {
             if let Some(s) = app.sessions.lock().unwrap().get(&id) {
@@ -888,11 +869,10 @@ fn cancel(app: State<'_, Arc<App>>, id: Option<u32>) {
 
 /// A larger preview for the detail view, cached next to the thumbnails.
 /// `full` = the preview at its native size (for checking focus at 100 %).
-#[tauri::command]
-async fn big_preview(handle: AppHandle, id: u32, idx: usize, full: Option<bool>) -> Result<String, String> {
-    let app = handle.state::<Arc<App>>().inner().clone();
+fn op_big_preview(app: &Arc<App>, id: u32, idx: usize, full: Option<bool>) -> Result<String, String> {
+    let app = app.clone();
     let full = full.unwrap_or(false);
-    tauri::async_runtime::spawn_blocking(move || {
+    (move || {
         let (path, work) = {
             let map = app.sessions.lock().unwrap();
             let s = map.get(&id).ok_or("Phiên đã đóng")?;
@@ -912,9 +892,85 @@ async fn big_preview(handle: AppHandle, id: u32, idx: usize, full: Option<bool>)
             std::fs::rename(&tmp, &out).map_err(|e| e.to_string())?;
         }
         Ok(out.display().to_string())
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    })()
+}
+
+// ---------------------------------------------------------------- one entry point
+
+/// Arguments of every command, as the page sends them (camelCase).
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct Args {
+    id: Option<u32>,
+    idx: Option<usize>,
+    source: Option<String>,
+    prefs: Option<Prefs>,
+    name: Option<String>,
+    decision: Option<Decision>,
+    parent: Option<String>,
+    sub: Option<String>,
+    message: Option<String>,
+    use_claude: bool,
+    card: Option<String>,
+    dest: Option<String>,
+    backup: Option<String>,
+    full: Option<bool>,
+    path: Option<String>,
+    lan: Option<bool>,
+    remote: Option<bool>,
+    new_password: bool,
+    tunnel_host: Option<String>,
+    tunnel_token: Option<String>,
+}
+
+fn need<T>(v: Option<T>, what: &str) -> Result<T, String> {
+    v.ok_or_else(|| format!("Thiếu {what}"))
+}
+
+fn json<T: Serialize>(v: T) -> Result<serde_json::Value, String> {
+    serde_json::to_value(v).map_err(|e| e.to_string())
+}
+
+/// Every command of the app, shared by the desktop window and the web version.
+fn dispatch(app: &Arc<App>, cmd: &str, args: serde_json::Value) -> Result<serde_json::Value, String> {
+    let a: Args = if args.is_null() { Args::default() } else { serde_json::from_value(args).map_err(|e| format!("Sai tham số: {e}"))? };
+    match cmd {
+        "app_info" => json(op_app_info(app)),
+        "new_session" => json(op_new_session(app)),
+        "close_session" => json(op_close_session(app, need(a.id, "id")?)),
+        "list_sessions" => json(op_list_sessions(app)),
+        "get_session" => json(op_get_session(app, need(a.id, "id")?)?),
+        "save_prefs" => json(op_save_prefs(app, a.id, need(a.prefs, "prefs")?)),
+        "profile_info" => json(op_profile_info(app, need(a.name, "name")?)),
+        "analyze" => json(op_analyze(app, need(a.id, "id")?, a.source)?),
+        "set_decision" => json(op_set_decision(app, need(a.id, "id")?, need(a.idx, "idx")?, a.decision)?),
+        "train" => json(op_train(app, need(a.id, "id")?)?),
+        "export_target" => json(op_export_target(app, need(a.id, "id")?, need(a.parent, "parent")?)?),
+        "export_folder" => json(op_export_folder(app, need(a.id, "id")?, need(a.parent, "parent")?)?),
+        "gather_selected" => json(op_gather_selected(app, need(a.id, "id")?, need(a.sub, "sub")?)?),
+        "claude_status" => json(op_claude_status()),
+        "chat" => json(op_chat(app, a.id, need(a.message, "message")?, a.use_claude)?),
+        "copy_card" => json(op_copy_card(app, need(a.card, "card")?, need(a.dest, "dest")?, a.backup)?),
+        "cancel" => json(op_cancel(app, a.id)),
+        "big_preview" => json(op_big_preview(app, need(a.id, "id")?, need(a.idx, "idx")?, a.full)?),
+        "list_dir" => json(web::list_dir(a.path.as_deref())?),
+        "open_path" => {
+            let p = need(a.path, "path")?;
+            tauri_plugin_opener::open_path(&p, None::<&str>).map_err(|e| format!("Không mở được {p}: {e}"))?;
+            json(())
+        }
+        "web_info" => json(web::info(app)),
+        "web_set" => json(web::set(app, a.lan, a.remote, a.new_password, a.tunnel_host, a.tunnel_token)?),
+        "open_web" => json(web::open(app, &need(a.path, "path")?)?),
+        _ => Err(format!("Không có lệnh {cmd}")),
+    }
+}
+
+/// The desktop window's single command; long work runs off the UI thread.
+#[tauri::command]
+async fn call(state: State<'_, Arc<App>>, cmd: String, args: Option<serde_json::Value>) -> Result<serde_json::Value, String> {
+    let app = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || dispatch(&app, &cmd, args.unwrap_or_default())).await.map_err(|e| e.to_string())?
 }
 
 fn find_model(handle: &AppHandle, data_dir: &Path) -> Option<PathBuf> {
@@ -954,7 +1010,7 @@ fn main() {
             let next = sessions.keys().max().map(|m| m + 1).unwrap_or(1);
             let model = find_model(app.handle(), &data_dir);
             let (analyzer, face_warning) = Analyzer::new(model.as_deref(), None);
-            app.manage(Arc::new(App {
+            let app_state = Arc::new(App {
                 data_dir,
                 analyzer: Mutex::new(analyzer),
                 face_warning,
@@ -963,29 +1019,22 @@ fn main() {
                 global: Mutex::new(global),
                 card_cancel: AtomicBool::new(false),
                 card_busy: AtomicBool::new(false),
-            }));
+                handle: std::sync::OnceLock::new(),
+                web: web::Web::default(),
+            });
+            let _ = app_state.handle.set(app.handle().clone());
+            web::start(&app_state);
+            app.manage(app_state);
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![
-            app_info,
-            new_session,
-            close_session,
-            list_sessions,
-            get_session,
-            save_prefs,
-            profile_info,
-            analyze,
-            set_decision,
-            train,
-            export_target,
-            export_folder,
-            gather_selected,
-            claude_status,
-            chat,
-            copy_card,
-            cancel,
-            big_preview
-        ])
-        .run(tauri::generate_context!())
-        .expect("không khởi động được SonVu Raw Pick");
+        .invoke_handler(tauri::generate_handler![call])
+        .build(tauri::generate_context!())
+        .expect("không khởi động được SonVu Raw Pick")
+        .run(|handle, event| {
+            if let tauri::RunEvent::Exit = event {
+                if let Some(app) = handle.try_state::<Arc<App>>() {
+                    app.web.stop_tunnel();
+                }
+            }
+        });
 }

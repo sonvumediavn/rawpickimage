@@ -190,3 +190,41 @@ kbd { font-family: var(--f-mono); font-size: 10.5px; color: var(--dim); margin-l
 .chips button:hover { color: var(--fg); border-color: var(--muted); }
 .cin { display: flex; gap: 6px; align-items: flex-end; }
 .cin textarea { flex: 1; resize: none; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px; font: inherit; color: var(--fg); }
+
+/* Web version: settings in the window, folder picker and login in the browser. */
+.webbox { display: flex; flex-direction: column; gap: 8px; }
+.webbox .wurl { display: flex; gap: 6px; align-items: center; font-family: var(--f-mono); font-size: 12px; word-break: break-all; }
+.webbox .wurl a { color: var(--hi); min-width: 0; }
+.webbox .wurl .btn { flex: none; white-space: nowrap; }
+.webbox .wpass { display: flex; gap: 8px; align-items: center; color: var(--muted); }
+.webbox .wpass code { font-family: var(--f-mono); font-size: 15px; color: var(--fg); background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 2px 8px; letter-spacing: .06em; }
+.webbox details summary { cursor: pointer; color: var(--muted); }
+.webbox details[open] { display: flex; flex-direction: column; gap: 6px; }
+.webbox input:not([type=checkbox]) { background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+.modal .box.login { display: flex; flex-direction: column; gap: 10px; width: min(380px, 92vw); }
+.modal .box.login h3 { font-family: var(--f-display); letter-spacing: .03em; }
+.modal .box.login input, .fpick .fpath { background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; min-width: 0; }
+.fpick { width: min(640px, 94vw) !important; display: flex; flex-direction: column; gap: 10px; }
+.fpick .frow { display: flex; gap: 8px; align-items: center; }
+.fpick .frow .fpath { flex: 1; font-family: var(--f-mono); font-size: 12.5px; }
+.fpick .frow.end { justify-content: flex-end; }
+.fpick .frow.end .meta { margin: 0 auto 0 0; }
+.fpick .fplaces { display: flex; flex-wrap: wrap; gap: 6px; }
+.fpick .flist { list-style: none; margin: 0; padding: 4px; height: min(46vh, 380px); overflow-y: auto; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; }
+.fpick .flist.loading { opacity: .5; }
+.fpick .flist li { padding: 7px 10px; border-radius: 6px; cursor: pointer; }
+.fpick .flist li::before { content: "▸ "; color: var(--dim); }
+.fpick .flist li:hover, .fpick .flist li:focus { background: var(--raised); outline: none; }
+.fpick .flist li.none { color: var(--dim); cursor: default; }
+.fpick .flist li.none::before { content: ""; }
+
+/* Phones and small windows (web version on a phone). */
+@media (max-width: 820px) {
+  body { overflow: auto; }
+  .shell { grid-template-columns: 1fr; height: auto; }
+  .shell > main { order: -1; overflow: visible; padding: 12px 12px 40px; }
+  aside#rail { border-right: 0; border-top: 1px solid var(--line); overflow: visible; }
+  .toolbar { flex-wrap: wrap; }
+  .tools { flex-wrap: wrap; }
+  .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+}

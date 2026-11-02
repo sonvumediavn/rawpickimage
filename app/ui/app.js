@@ -2,7 +2,8 @@
 "use strict";
 
 const T = window.__TAURI__;
-const invoke = (cmd, args) => T.core.invoke(cmd, args);
+// One command on the Rust side, shared by the window and the web version.
+const invoke = (cmd, args) => T.core.invoke("call", { cmd, args: args || {} });
 const fileSrc = (p) => (p ? T.core.convertFileSrc(p) : "");
 const $ = (id) => document.getElementById(id);
 
@@ -898,6 +899,54 @@ function wireChat() {
   });
 }
 
+// ---------------------------------------------------------------- web version
+
+function renderWeb(w) {
+  const box = $("webBox");
+  if (window.RP_WEB) {
+    box.innerHTML = `<p class="note">Bạn đang dùng bản web. Thư mục, ảnh và AI đã học đều là của máy tính đang mở SonVu Raw Pick; chọn hay chuyển ảnh ở đây là làm trên máy đó.</p>
+      <button class="btn" id="webLogout">Đăng xuất</button>`;
+    $("webLogout").onclick = async () => { await fetch("/api/logout", { method: "POST", headers: { "X-RP": "1" } }); location.reload(); };
+    return;
+  }
+  if (!w) return;
+  const r = w.remote;
+  const remoteLine = !r.on ? "" : r.state === "ready"
+    ? `<div class="wurl"><a href="#" data-url="${esc(r.url)}">${esc(r.url)}</a><button class="btn sm" data-copy="${esc(r.url)}">Chép</button></div>`
+    : r.state === "error" ? `<p class="note err">${esc(r.error || "Không kết nối được")}</p>`
+    : `<p class="note">${esc(r.error || "Đang mở đường truy cập từ xa…")}</p>`;
+  box.innerHTML = `
+    <div class="wurl"><a href="#" data-url="${esc(w.local_url)}">${esc(w.local_url)}</a></div>
+    <label class="chk"><input type="checkbox" id="webLan" ${w.lan ? "checked" : ""}> Cho điện thoại, máy khác cùng wifi vào</label>
+    ${w.lan && w.lan_url ? `<div class="wurl"><a href="#" data-url="${esc(w.lan_url)}">${esc(w.lan_url)}</a><button class="btn sm" data-copy="${esc(w.lan_url)}">Chép</button></div>` : ""}
+    <label class="chk"><input type="checkbox" id="webRemote" ${r.on ? "checked" : ""}> Vào từ bất kỳ đâu qua internet</label>
+    ${remoteLine}
+    <div class="wpass">Mật khẩu <code>${esc(w.password)}</code><button class="btn sm" id="webNewPass">Đổi</button></div>
+    <details class="wfixed" ${w.fixed_host ? "open" : ""}>
+      <summary>Địa chỉ cố định (tên miền riêng)</summary>
+      <p class="note">Link internet tự sinh sẽ đổi mỗi lần mở ứng dụng. Muốn địa chỉ cố định (ví dụ pick.sonvumedia.vn), tạo một Tunnel trong tài khoản Cloudflare miễn phí rồi dán mã vào đây.</p>
+      <input id="webHost" placeholder="pick.tenmien.vn" value="${esc(w.fixed_host || "")}">
+      <input id="webToken" type="password" placeholder="${w.has_token ? "Đã lưu mã tunnel (dán mã mới để thay)" : "Mã tunnel Cloudflare"}">
+      <button class="btn sm" id="webSaveFixed">Lưu</button>
+    </details>
+    <p class="note">Ai có mật khẩu là điều khiển được máy này: mở thư mục, chọn, chuyển và xuất ảnh. Máy phải bật và đang mở ứng dụng thì web mới vào được.</p>`;
+  for (const a of box.querySelectorAll("a[data-url]")) a.onclick = (e) => { e.preventDefault(); invoke("open_web", { path: a.dataset.url }).catch((x) => toast(esc(String(x)))); };
+  for (const b of box.querySelectorAll("[data-copy]")) b.onclick = () => navigator.clipboard.writeText(b.dataset.copy).then(() => toast("Đã chép link."), () => toast(esc(b.dataset.copy)));
+  const set = (args) => invoke("web_set", args).then(renderWeb).catch((x) => toast(esc(String(x))));
+  $("webLan").onchange = () => set({ lan: $("webLan").checked });
+  $("webRemote").onchange = () => set({ remote: $("webRemote").checked });
+  $("webNewPass").onclick = () => {
+    if (confirm("Tạo mật khẩu mới? Mọi trình duyệt đang vào bản web sẽ phải đăng nhập lại.")) set({ newPassword: true });
+  };
+  $("webSaveFixed").onclick = () => set({ tunnelHost: $("webHost").value.trim(), tunnelToken: $("webToken").value.trim() || null });
+}
+
+function wireWeb() {
+  if (window.RP_WEB) return renderWeb(null);
+  invoke("web_info").then(renderWeb).catch(() => { $("webSec").hidden = true; });
+  T.event.listen("web-changed", (e) => renderWeb(e.payload));
+}
+
 // ---------------------------------------------------------------- boot
 
 (async function boot() {
@@ -911,6 +960,7 @@ function wireChat() {
   wireDetail();
   wireZoom();
   wireChat();
+  wireWeb();
   if (!st.metas.length) await newSession();
   await selectSession(st.metas[0].id);
   restoreSessions();

@@ -88,6 +88,33 @@ tự bật những việc chạy trên máy; việc chia sẻ, đăng bài luôn
 | Kiểm tra trước khi đăng fanpage | Giai đoạn 3 |
 | Khách tìm ảnh bằng selfie | Giai đoạn 4 |
 
+## Bản web (dùng song song, kể cả từ xa)
+
+Ứng dụng trên máy tính tự mở thêm một bản web giống hệt giao diện trong app. Ảnh vẫn nằm và được xử lý
+trên máy tính đó; trình duyệt chỉ nhận ảnh thu nhỏ và ảnh xem trước. Bản web có đủ quyền như app: duyệt
+thư mục trên máy, lọc, gom, chuyển, xuất ảnh, chat với AI. Máy phải bật và đang mở SonVu Raw Pick.
+
+Cài đặt nằm ở mục **Bản web** bên trái app:
+
+- **Trên chính máy đó**: bấm link `http://127.0.0.1:8686` (mở sẵn, đã đăng nhập).
+- **Điện thoại, máy khác cùng wifi**: bật «Cho điện thoại, máy khác cùng wifi vào», mở link
+  `http://192.168.x.x:8686` hiện ra. Windows có thể hỏi cho phép qua tường lửa: chọn **Allow**.
+- **Từ bất kỳ đâu qua internet**: bật «Vào từ bất kỳ đâu qua internet». Lần đầu app tải công cụ kết nối
+  `cloudflared` của Cloudflare (miễn phí, không cần tài khoản) và hiện link dạng
+  `https://xxx.trycloudflare.com`. Link này đổi mỗi lần mở app.
+- **Địa chỉ cố định với tên miền riêng** (ví dụ `pick.tenmien.vn`), không cần thuê máy chủ:
+  1. Tạo tài khoản Cloudflare (gói Free), thêm tên miền, đổi nameserver ở nơi mua tên miền theo hướng dẫn.
+  2. Vào **Zero Trust → Networks → Tunnels → Create a tunnel** (loại Cloudflared), đặt tên, chép mã
+     trong lệnh cài (đoạn dài sau `--token`, hoặc dán cả lệnh cũng được).
+  3. Ở bước **Public Hostname**: Subdomain `pick`, Domain là tên miền của bạn, Service `HTTP`,
+     URL `localhost:8686`.
+  4. Trong app, mở «Địa chỉ cố định», điền `pick.tenmien.vn`, dán mã tunnel, bấm **Lưu**, rồi bật
+     «Vào từ bất kỳ đâu qua internet».
+
+Mọi trình duyệt đều phải nhập **mật khẩu** hiện trong app (trừ khi mở bằng link trong app). Nhập sai 5 lần
+phải đợi 1 phút; bấm **Đổi** để tạo mật khẩu mới và đăng xuất mọi nơi. Ai có mật khẩu là điều khiển
+được máy này, nên chỉ đưa cho người tin cậy.
+
 ## Cài đặt
 
 Bộ cài được build tự động bằng GitHub Actions (tab **Actions** → **Đóng gói Windows và Mac** → tải
