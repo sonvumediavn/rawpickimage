@@ -45,6 +45,36 @@ function toast(html, ms = 5000) {
 function esc(s) {
   return String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 }
+
+/**
+ * In-page question box. The app's webview (macOS above all) silently refuses the browser's own
+ * confirm() and prompt(), so every question goes through this.
+ * With `value` it asks for text and resolves to the text (or null); otherwise to true/false.
+ */
+function ask(text, { value = null, ok = "Đồng ý", title = "" } = {}) {
+  return new Promise((resolve) => {
+    const wrap = document.createElement("div");
+    wrap.className = "modal ask";
+    const withInput = value !== null;
+    wrap.innerHTML = `<form class="box">
+      ${title ? `<h3>${esc(title)}</h3>` : ""}
+      <p class="asktext">${esc(text)}</p>
+      ${withInput ? `<input class="askin" spellcheck="false" aria-label="${esc(title || text)}">` : ""}
+      <div class="row2 end"><button type="button" class="btn" data-no>Huỷ</button><button type="submit" class="btn primary">${esc(ok)}</button></div>
+    </form>`;
+    const input = wrap.querySelector(".askin");
+    if (input) input.value = value;
+    const done = (v) => { wrap.remove(); document.removeEventListener("keydown", onKey, true); resolve(v); };
+    const onKey = (e) => { if (e.key === "Escape") { e.stopPropagation(); done(withInput ? null : false); } };
+    wrap.querySelector("form").onsubmit = (e) => { e.preventDefault(); done(withInput ? input.value : true); };
+    wrap.querySelector("[data-no]").onclick = () => done(withInput ? null : false);
+    wrap.onclick = (e) => { if (e.target === wrap) done(withInput ? null : false); };
+    document.addEventListener("keydown", onKey, true);
+    document.body.append(wrap);
+    (input || wrap.querySelector("[type=submit]")).focus();
+    if (input) input.select();
+  });
+}
 function cls(v) { return v >= 7.5 ? "hi" : v >= 5 ? "mid" : "lo"; }
 function decKind(d) { return d.kind; }
 function decLabel(d) {
@@ -253,8 +283,8 @@ function wireRail() {
     renderProfile(await invoke("profile_info", { name: st.prefs.profile }));
     savePrefs();
   };
-  $("btnNewProfile").onclick = () => {
-    const n = prompt("Tên loại sự kiện mới (ví dụ: Cưới, Hội nghị, Sân khấu):");
+  $("btnNewProfile").onclick = async () => {
+    const n = await ask("Ví dụ: Cưới, Hội nghị, Sân khấu. AI học riêng cho từng loại sự kiện.", { value: "", title: "Thêm loại sự kiện", ok: "Thêm" });
     if (!n || !n.trim()) return;
     st.prefs.profile = n.trim();
     st.info.profiles.unshift(st.prefs.profile);
@@ -305,7 +335,7 @@ async function newSession() {
 
 async function closeSession(id) {
   const m = meta(id);
-  if (m && m.source && !confirm(`Đóng phiên «${m.name}»? Ảnh và kết quả đã xuất không bị ảnh hưởng.`)) return;
+  if (m && m.source && !(await ask(`Ảnh và kết quả đã xuất không bị ảnh hưởng.`, { title: `Đóng phiên «${m.name}»?`, ok: "Đóng phiên" }))) return;
   await invoke("close_session", { id });
   st.metas = st.metas.filter((x) => x.id !== id);
   delete st.views[id];
@@ -563,7 +593,7 @@ async function doExport() {
   const msg = mv
     ? `CHUYỂN ${what} (kèm file RAW) sang:\n${target}\n\nẢnh gốc sẽ bị xoá khỏi thư mục cũ, chỉ sau khi bản mới đã kiểm tra khớp từng byte.`
     : `Chép ${what} (kèm file RAW, giữ nguyên chất lượng) vào:\n${target}\n\nẢnh gốc giữ nguyên.`;
-  if (!confirm(msg)) return;
+  if (!(await ask(msg, { title: mv ? "Chuyển ảnh sang thư mục mới" : "Xuất ảnh", ok: mv ? "Chuyển ảnh" : "Chép ảnh" }))) return;
   st.info.export_parent = parent;
   m.phase = "exporting";
   st.progress[id] = { done: 0, total: 0, stage: "Đang xuất ảnh" };
@@ -597,7 +627,7 @@ async function doExport() {
 async function doGather() {
   const id = st.sid, m = meta(id);
   if (!m || m.phase !== "ready") return;
-  const sub = prompt(`Chuyển ${st.summary.selected} ảnh đã chọn (kèm file RAW, JPEG, XMP cùng tên) vào thư mục con trong:\n${m.source}\n\nTên thư mục con:`, "Anh-da-chon");
+  const sub = await ask(`Chuyển ${st.summary.selected} ảnh đã chọn (kèm file RAW, JPEG, XMP cùng tên) vào thư mục con trong:\n${m.source}\n\nFile chỉ được đổi chỗ, không chép lại, giữ nguyên chất lượng. Tên thư mục con:`, { value: "Anh-da-chon", title: "Gom ảnh đã chọn", ok: "Gom ảnh" });
   if (!sub || !sub.trim()) return;
   try {
     const r = await invoke("gather_selected", { id, sub: sub.trim() });
@@ -935,8 +965,8 @@ function renderWeb(w) {
   const set = (args) => invoke("web_set", args).then(renderWeb).catch((x) => toast(esc(String(x))));
   $("webLan").onchange = () => set({ lan: $("webLan").checked });
   $("webRemote").onchange = () => set({ remote: $("webRemote").checked });
-  $("webNewPass").onclick = () => {
-    if (confirm("Tạo mật khẩu mới? Mọi trình duyệt đang vào bản web sẽ phải đăng nhập lại.")) set({ newPassword: true });
+  $("webNewPass").onclick = async () => {
+    if (await ask("Mọi trình duyệt đang vào bản web sẽ phải đăng nhập lại.", { title: "Tạo mật khẩu mới?", ok: "Tạo mật khẩu mới" })) set({ newPassword: true });
   };
   $("webSaveFixed").onclick = () => set({ tunnelHost: $("webHost").value.trim(), tunnelToken: $("webToken").value.trim() || null });
 }
