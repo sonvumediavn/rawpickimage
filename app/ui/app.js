@@ -692,7 +692,7 @@ async function renderDetail() {
 
 // ---------------------------------------------------------------- zoom & pan
 
-const zoom = { idx: -1, s: 1, tx: 0, ty: 0, full: false, fullLoading: null, drag: null, seq: 0 };
+const zoom = { idx: -1, s: 1, tx: 0, ty: 0, bw: 1, bh: 1, full: false, fullLoading: null, drag: null, seq: 0 };
 const Z_MAX = 8;
 
 function loadPhoto(i) {
@@ -709,7 +709,7 @@ function loadPhoto(i) {
   }
 }
 
-/** Load the preview at its native size once the user zooms past the 1800 px version. */
+/** Load the preview at its native size once the user zooms past the 2560 px version. */
 function ensureFull() {
   if (zoom.full || zoom.fullLoading || zoom.idx < 0 || st.session.photos[zoom.idx].error) return zoom.fullLoading || Promise.resolve();
   const seq = zoom.seq, img = $("dimg");
@@ -726,9 +726,14 @@ function ensureFull() {
   return zoom.fullLoading;
 }
 
+/** Width of the image when it fits the stage (zoom 1). */
+function baseWidth() {
+  return zoom.s > 1.001 ? zoom.bw : ($("dimg").offsetWidth || 1);
+}
+
 /** Scale at which one image pixel = one screen pixel. */
 function scale100() {
-  const img = $("dimg"), base = img.offsetWidth || 1;
+  const img = $("dimg"), base = baseWidth();
   const p = st.session.photos[zoom.idx];
   const long = Math.max(img.naturalWidth, img.naturalHeight) || 1;
   // Before the full-size preview arrives, estimate it from the camera's pixel size.
@@ -737,43 +742,59 @@ function scale100() {
   return Math.max(1, natural / base / (window.devicePixelRatio || 1));
 }
 
+/**
+ * Zoomed, the image is laid out at its real zoomed size and only moved with translate().
+ * Scaling it with transform: scale() looks smooth but WebKit (macOS) then enlarges a bitmap
+ * drawn at fit size, which is exactly the blur we must not show when checking focus.
+ */
 function showZoom() {
-  const f = $("dframe");
-  f.style.transform = `translate(${zoom.tx}px, ${zoom.ty}px) scale(${zoom.s})`;
-  f.style.setProperty("--zs", zoom.s);
-  $("dstage").classList.toggle("zoomed", zoom.s > 1.001);
+  const f = $("dframe"), img = $("dimg");
+  const zoomed = zoom.s > 1.001;
+  if (zoomed) {
+    const w = Math.round(zoom.bw * zoom.s), h = Math.round(zoom.bh * zoom.s);
+    f.style.cssText = `position:absolute;left:0;top:0;width:${w}px;height:${h}px;max-width:none;max-height:none;transform:translate(${Math.round(zoom.tx)}px,${Math.round(zoom.ty)}px)`;
+    img.style.cssText = "width:100%;height:100%;max-width:none;max-height:none";
+  } else {
+    f.style.cssText = "";
+    img.style.cssText = "";
+  }
+  f.style.setProperty("--zs", 1);
+  $("dstage").classList.toggle("zoomed", zoomed);
   if (zoom.fullLoading) return;
-  $("zPct").textContent = zoom.s <= 1.001 ? "Vừa khung" : Math.round((zoom.s / scale100()) * 100) + "%";
+  $("zPct").textContent = !zoomed ? "Vừa khung" : Math.round((zoom.s / scale100()) * 100) + "%";
 }
 
-/** Zoom to scale `s` keeping the screen point (cx, cy) fixed; null = image centre. */
+/** Zoom to scale `s` keeping the screen point (cx, cy) fixed; null = centre of the view. */
 function zoomTo(s, at) {
-  const f = $("dframe");
+  const f = $("dframe"), stage = $("dstage").getBoundingClientRect();
+  if (zoom.s <= 1.001) {
+    // Leaving the fitted view: remember where and how big the image sits.
+    const r = f.getBoundingClientRect();
+    zoom.bw = r.width || 1; zoom.bh = r.height || 1;
+    zoom.tx = r.left - stage.left; zoom.ty = r.top - stage.top;
+  }
   s = Math.min(Math.max(s, 1), Z_MAX * Math.max(1, scale100()));
   if (s <= 1.001) {
     zoom.s = 1; zoom.tx = 0; zoom.ty = 0;
     return showZoom();
   }
-  const r = f.getBoundingClientRect();
-  const bx = r.left - zoom.tx, by = r.top - zoom.ty; // untransformed origin
-  const cx = at ? at[0] : r.left + r.width / 2, cy = at ? at[1] : r.top + r.height / 2;
-  const ux = (cx - bx - zoom.tx) / zoom.s, uy = (cy - by - zoom.ty) / zoom.s;
-  zoom.tx = cx - bx - ux * s;
-  zoom.ty = cy - by - uy * s;
+  const px = at ? at[0] - stage.left : stage.width / 2, py = at ? at[1] - stage.top : stage.height / 2;
+  const ux = (px - zoom.tx) / zoom.s, uy = (py - zoom.ty) / zoom.s; // point on the fitted image
+  zoom.tx = px - ux * s;
+  zoom.ty = py - uy * s;
   zoom.s = s;
   clampPan();
   showZoom();
-  if (!zoom.full && zoom.s * $("dimg").offsetWidth > $("dimg").naturalWidth * 0.95) ensureFull();
+  const dpr = window.devicePixelRatio || 1;
+  if (!zoom.full && zoom.s * zoom.bw * dpr > $("dimg").naturalWidth * 0.95) ensureFull();
 }
 
-/** Keep at least part of the image on screen. */
+/** Keep at least part of the image on screen (coordinates inside the stage). */
 function clampPan() {
-  const f = $("dframe"), stage = $("dstage").getBoundingClientRect();
-  const w = f.offsetWidth * zoom.s, h = f.offsetHeight * zoom.s;
-  const r = f.getBoundingClientRect();
-  const bx = r.left - zoom.tx, by = r.top - zoom.ty;
-  const minX = stage.right - 80 - bx - w, maxX = stage.left + 80 - bx;
-  const minY = stage.bottom - 80 - by - h, maxY = stage.top + 80 - by;
+  const stage = $("dstage").getBoundingClientRect();
+  const w = zoom.bw * zoom.s, h = zoom.bh * zoom.s;
+  const minX = stage.width - 80 - w, maxX = 80;
+  const minY = stage.height - 80 - h, maxY = 80;
   zoom.tx = Math.min(Math.max(zoom.tx, Math.min(minX, maxX)), Math.max(minX, maxX));
   zoom.ty = Math.min(Math.max(zoom.ty, Math.min(minY, maxY)), Math.max(minY, maxY));
 }

@@ -18,6 +18,8 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 mod web;
 
+/// Long side of the preview shown at fit size.
+const BIG_LONG: u32 = 2560;
 const FACE_MODEL: &str = "face_detection_yunet_2023mar.onnx";
 
 /// Settings of one session. New sessions start from the last settings used.
@@ -879,15 +881,16 @@ fn op_big_preview(app: &Arc<App>, id: u32, idx: usize, full: Option<bool>) -> Re
             (s.items.get(idx).ok_or("Sai ảnh")?.path.clone(), pipeline::work_dir(&app.data_dir, s.source.as_ref().ok_or("Phiên chưa có thư mục")?))
         };
         let key = rawpick_core::analyze::file_key(&path);
-        let out = work.join("big").join(if full { format!("{key}-full.jpg") } else { format!("{key}.jpg") });
+        // 2560 px fills a Retina screen at fit size; `full` is every pixel the file holds.
+        let out = work.join("big").join(if full { format!("{key}-full.jpg") } else { format!("{key}-2560.jpg") });
         if !out.exists() {
-            let long = if full { u32::MAX } else { 1800 };
+            let long = if full { u32::MAX } else { BIG_LONG };
             let pv = preview::load(&path, long).map_err(|e| format!("{e:#}"))?;
-            let img = if full { pv.rgb } else { metrics::resize_long(&pv.rgb, 1800) };
+            let img = if full || pv.rgb.width().max(pv.rgb.height()) <= BIG_LONG { pv.rgb } else { metrics::resize_long(&pv.rgb, BIG_LONG) };
             std::fs::create_dir_all(out.parent().unwrap()).map_err(|e| e.to_string())?;
             let tmp = out.with_extension("tmp");
             let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp).map_err(|e| e.to_string())?);
-            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut f, 92).encode_image(&img).map_err(|e| e.to_string())?;
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut f, if full { 97 } else { 92 }).encode_image(&img).map_err(|e| e.to_string())?;
             drop(f);
             std::fs::rename(&tmp, &out).map_err(|e| e.to_string())?;
         }

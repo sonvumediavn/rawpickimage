@@ -246,7 +246,7 @@ pub fn load(path: &Path, min_long: u32) -> Result<Preview> {
         let img = image::load_from_memory(&bytes).context("định dạng ảnh không hỗ trợ")?.to_rgb8();
         let (nw, nh) = img.dimensions();
         let long = nw.max(nh);
-        let img = if long > min_long * 2 {
+        let img = if long > min_long.saturating_mul(2) {
             let f = min_long as f32 / long as f32;
             imageops::resize(&img, (nw as f32 * f) as u32, (nh as f32 * f) as u32, imageops::FilterType::Triangle)
         } else {
