@@ -399,21 +399,28 @@ fn cancel(app: State<'_, Arc<App>>) {
 }
 
 /// A larger preview for the detail view, cached next to the thumbnails.
+/// `full` = the preview at its native size (for checking focus at 100 %).
 #[tauri::command]
-async fn big_preview(handle: AppHandle, idx: usize) -> Result<String, String> {
+async fn big_preview(handle: AppHandle, idx: usize, full: Option<bool>) -> Result<String, String> {
     let app = handle.state::<Arc<App>>().inner().clone();
+    let full = full.unwrap_or(false);
     tauri::async_runtime::spawn_blocking(move || {
         let (path, work) = {
             let g = app.session.lock().unwrap();
             let s = g.as_ref().ok_or("Chưa mở thư mục nào")?;
             (s.items.get(idx).ok_or("Sai ảnh")?.path.clone(), pipeline::work_dir(&app.data_dir, &s.source))
         };
-        let out = work.join("big").join(format!("{idx:06}.jpg"));
+        let out = work.join("big").join(if full { format!("{idx:06}-full.jpg") } else { format!("{idx:06}.jpg") });
         if !out.exists() {
-            let pv = preview::load(&path, 1800).map_err(|e| format!("{e:#}"))?;
-            let img = metrics::resize_long(&pv.rgb, 1800);
+            let long = if full { u32::MAX } else { 1800 };
+            let pv = preview::load(&path, long).map_err(|e| format!("{e:#}"))?;
+            let img = if full { pv.rgb } else { metrics::resize_long(&pv.rgb, 1800) };
             std::fs::create_dir_all(out.parent().unwrap()).map_err(|e| e.to_string())?;
-            img.save_with_format(&out, image::ImageFormat::Jpeg).map_err(|e| e.to_string())?;
+            let tmp = out.with_extension("tmp");
+            let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp).map_err(|e| e.to_string())?);
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut f, 92).encode_image(&img).map_err(|e| e.to_string())?;
+            drop(f);
+            std::fs::rename(&tmp, &out).map_err(|e| e.to_string())?;
         }
         Ok(out.display().to_string())
     })

@@ -115,7 +115,16 @@
 
 <div class="detail" id="detail" hidden role="dialog" aria-modal="true">
   <div class="dview">
-    <div class="dimg"><div class="frame" id="dframe"><img id="dimg" alt=""></div></div>
+    <div class="dimg" id="dstage">
+      <div class="frame" id="dframe"><img id="dimg" alt="" draggable="false"></div>
+      <div class="zoombar" role="toolbar" aria-label="Phóng to thu nhỏ">
+        <button class="btn sm" id="zOut" title="Thu nhỏ (phím −)">−</button>
+        <span id="zPct">Vừa khung</span>
+        <button class="btn sm" id="zIn" title="Phóng to (phím +)">+</button>
+        <button class="btn sm" id="zFit" title="Vừa khung (phím 0)">Vừa khung</button>
+        <button class="btn sm" id="z100" title="Xem 100% điểm ảnh để kiểm tra nét (phím 1 hoặc nhấp đúp)">100%</button>
+      </div>
+    </div>
     <div class="dside">
       <div class="dhead">
         <div>
@@ -132,7 +141,7 @@
         <button class="btn" data-d="ai" title="Phím U">Theo AI <kbd>U</kbd></button>
       </div>
       <div id="dcrit"></div>
-      <p class="note">← → để chuyển ảnh · Esc để đóng</p>
+      <p class="note">Cuộn chuột hoặc chụm hai ngón để phóng to, kéo để di chuyển, nhấp đúp để xem 100% · ← → chuyển ảnh · Esc đóng</p>
     </div>
   </div>
 </div>

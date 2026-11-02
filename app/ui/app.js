@@ -424,11 +424,7 @@ async function renderDetail() {
   const i = st.cur, p = st.session.photos[i], v = st.verdicts[i];
   $("dname").textContent = p.name;
   $("dmeta").textContent = [p.camera, p.width ? `${p.width}×${p.height}` : "", v.time != null ? fmtTime(v.time) : "", p.files.length > 1 ? `${p.files.length} file` : ""].filter(Boolean).join(" · ");
-  const img = $("dimg");
-  img.src = p.thumb ? fileSrc(p.thumb) : "";
-  if (!p.error) {
-    invoke("big_preview", { idx: i }).then((src) => { if (st.cur === i) img.src = fileSrc(src); }).catch(() => {});
-  }
+  if (zoom.idx !== i) loadPhoto(i);
   const frame = $("dframe");
   for (const b of frame.querySelectorAll(".fbox")) b.remove();
   for (const f of p.faces) {
@@ -460,6 +456,136 @@ async function renderDetail() {
     : "";
 }
 
+// ---------------------------------------------------------------- zoom & pan
+
+const zoom = { idx: -1, s: 1, tx: 0, ty: 0, full: false, fullLoading: null, drag: null, seq: 0 };
+const Z_MAX = 8;
+
+function loadPhoto(i) {
+  const p = st.session.photos[i];
+  const img = $("dimg");
+  zoom.idx = i;
+  zoom.full = false;
+  zoom.fullLoading = null;
+  const seq = ++zoom.seq;
+  zoomTo(1, null);
+  img.src = p.thumb ? fileSrc(p.thumb) : "";
+  if (!p.error) {
+    invoke("big_preview", { idx: i }).then((src) => { if (zoom.seq === seq && !zoom.full) img.src = fileSrc(src); }).catch(() => {});
+  }
+}
+
+/** Load the preview at its native size once the user zooms past the 1800 px version. */
+function ensureFull() {
+  if (zoom.full || zoom.fullLoading || zoom.idx < 0 || st.session.photos[zoom.idx].error) return zoom.fullLoading || Promise.resolve();
+  const seq = zoom.seq, img = $("dimg");
+  $("zPct").textContent = "Đang tải…";
+  zoom.fullLoading = invoke("big_preview", { idx: zoom.idx, full: true })
+    .then((src) => new Promise((ok) => {
+      if (zoom.seq !== seq) return ok();
+      img.onload = () => { img.onload = null; zoom.full = true; showZoom(); ok(); };
+      img.onerror = () => { img.onerror = null; ok(); };
+      img.src = fileSrc(src);
+    }))
+    .catch(() => {})
+    .finally(() => { zoom.fullLoading = null; showZoom(); });
+  return zoom.fullLoading;
+}
+
+/** Scale at which one image pixel = one screen pixel. */
+function scale100() {
+  const img = $("dimg"), base = img.offsetWidth || 1;
+  const p = st.session.photos[zoom.idx];
+  const long = Math.max(img.naturalWidth, img.naturalHeight) || 1;
+  // Before the full-size preview arrives, estimate it from the camera's pixel size.
+  const fullLong = zoom.full ? long : Math.max(long, p ? Math.max(p.width, p.height) : 0);
+  const natural = img.naturalWidth * (fullLong / long);
+  return Math.max(1, natural / base / (window.devicePixelRatio || 1));
+}
+
+function showZoom() {
+  const f = $("dframe");
+  f.style.transform = `translate(${zoom.tx}px, ${zoom.ty}px) scale(${zoom.s})`;
+  f.style.setProperty("--zs", zoom.s);
+  $("dstage").classList.toggle("zoomed", zoom.s > 1.001);
+  if (zoom.fullLoading) return;
+  $("zPct").textContent = zoom.s <= 1.001 ? "Vừa khung" : Math.round((zoom.s / scale100()) * 100) + "%";
+}
+
+/** Zoom to scale `s` keeping the screen point (cx, cy) fixed; null = image centre. */
+function zoomTo(s, at) {
+  const f = $("dframe");
+  s = Math.min(Math.max(s, 1), Z_MAX * Math.max(1, scale100()));
+  if (s <= 1.001) {
+    zoom.s = 1; zoom.tx = 0; zoom.ty = 0;
+    return showZoom();
+  }
+  const r = f.getBoundingClientRect();
+  const bx = r.left - zoom.tx, by = r.top - zoom.ty; // untransformed origin
+  const cx = at ? at[0] : r.left + r.width / 2, cy = at ? at[1] : r.top + r.height / 2;
+  const ux = (cx - bx - zoom.tx) / zoom.s, uy = (cy - by - zoom.ty) / zoom.s;
+  zoom.tx = cx - bx - ux * s;
+  zoom.ty = cy - by - uy * s;
+  zoom.s = s;
+  clampPan();
+  showZoom();
+  if (!zoom.full && zoom.s * $("dimg").offsetWidth > $("dimg").naturalWidth * 0.95) ensureFull();
+}
+
+/** Keep at least part of the image on screen. */
+function clampPan() {
+  const f = $("dframe"), stage = $("dstage").getBoundingClientRect();
+  const w = f.offsetWidth * zoom.s, h = f.offsetHeight * zoom.s;
+  const r = f.getBoundingClientRect();
+  const bx = r.left - zoom.tx, by = r.top - zoom.ty;
+  const minX = stage.right - 80 - bx - w, maxX = stage.left + 80 - bx;
+  const minY = stage.bottom - 80 - by - h, maxY = stage.top + 80 - by;
+  zoom.tx = Math.min(Math.max(zoom.tx, Math.min(minX, maxX)), Math.max(minX, maxX));
+  zoom.ty = Math.min(Math.max(zoom.ty, Math.min(minY, maxY)), Math.max(minY, maxY));
+}
+
+async function zoom100(at) {
+  if (zoom.s > 1.001 && Math.abs(zoom.s - scale100()) < 0.05) return zoomTo(1, null);
+  await ensureFull();
+  zoomTo(scale100(), at);
+}
+
+function wireZoom() {
+  const stage = $("dstage");
+  stage.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    if (!e.ctrlKey && Math.abs(e.deltaX) > Math.abs(e.deltaY) * 0.5 && zoom.s > 1) {
+      // Two-finger sideways / diagonal swipe on a trackpad: pan.
+      zoom.tx -= e.deltaX; zoom.ty -= e.deltaY;
+      clampPan(); showZoom();
+      return;
+    }
+    const k = Math.exp(-e.deltaY * (e.ctrlKey ? 0.01 : 0.002));
+    zoomTo(zoom.s * k, [e.clientX, e.clientY]);
+  }, { passive: false });
+  stage.addEventListener("pointerdown", (e) => {
+    if (zoom.s <= 1.001 || e.button !== 0 || e.target.closest(".zoombar")) return;
+    zoom.drag = { x: e.clientX, y: e.clientY, tx: zoom.tx, ty: zoom.ty };
+    stage.setPointerCapture(e.pointerId);
+    stage.classList.add("dragging");
+  });
+  stage.addEventListener("pointermove", (e) => {
+    if (!zoom.drag) return;
+    zoom.tx = zoom.drag.tx + e.clientX - zoom.drag.x;
+    zoom.ty = zoom.drag.ty + e.clientY - zoom.drag.y;
+    clampPan(); showZoom();
+  });
+  const end = () => { zoom.drag = null; stage.classList.remove("dragging"); };
+  stage.addEventListener("pointerup", end);
+  stage.addEventListener("pointercancel", end);
+  stage.addEventListener("dblclick", (e) => { if (!e.target.closest(".zoombar")) zoom100([e.clientX, e.clientY]); });
+  $("zIn").onclick = () => zoomTo(Math.max(zoom.s, 1) * 1.5, null);
+  $("zOut").onclick = () => zoomTo(zoom.s / 1.5, null);
+  $("zFit").onclick = () => zoomTo(1, null);
+  $("z100").onclick = () => zoom100(null);
+  window.addEventListener("resize", () => { if (!$("detail").hidden) zoomTo(1, null); });
+}
+
 async function decide(kind) {
   const i = st.cur;
   if (i < 0) return;
@@ -480,7 +606,7 @@ function step(d) {
 }
 
 function wireDetail() {
-  $("dclose").onclick = () => { $("detail").hidden = true; st.cur = -1; };
+  $("dclose").onclick = () => { $("detail").hidden = true; st.cur = -1; zoom.idx = -1; };
   for (const b of document.querySelectorAll(".dact button")) b.onclick = () => decide(b.dataset.d === "ai" ? null : b.dataset.d);
   document.addEventListener("keydown", (e) => {
     if ($("detail").hidden || e.target.matches("input,select,textarea")) return;
@@ -491,6 +617,10 @@ function wireDetail() {
     else if (k === "p") decide("selected");
     else if (k === "x") decide("rejected");
     else if (k === "u") decide(null);
+    else if (k === "+" || k === "=") $("zIn").click();
+    else if (k === "-" || k === "_") $("zOut").click();
+    else if (k === "0") $("zFit").click();
+    else if (k === "1" || k === "z") $("z100").click();
   });
 }
 
@@ -509,4 +639,5 @@ function wireDetail() {
   wireIn();
   wireResults();
   wireDetail();
+  wireZoom();
 })();
