@@ -3,21 +3,22 @@
 
 use rawpick_core::analyze::{Analyzer, Scores};
 use rawpick_core::cull::{self, Decision, Settings, Summary, Verdict};
-use rawpick_core::export::{self, ExportOptions, ExportReport};
+use rawpick_core::export::{ExportOptions, ExportReport};
 use rawpick_core::ingest::{self, CopyReport};
 use rawpick_core::learn::{self, Store};
 use rawpick_core::options::{self, FeatureInfo, Suggestion};
 use rawpick_core::pipeline::{self, Item, Progress, Timing};
 use rawpick_core::{metrics, preview};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 const FACE_MODEL: &str = "face_detection_yunet_2023mar.onnx";
 
+/// Settings of one session. New sessions start from the last settings used.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 struct Prefs {
@@ -35,24 +36,86 @@ impl Default for Prefs {
     }
 }
 
+/// App-wide settings file.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct Global {
+    /// Defaults for a new session.
+    prefs: Prefs,
+    /// Folder last chosen for exports.
+    export_parent: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum Phase {
+    Empty,
+    Waiting,
+    Analyzing,
+    Ready,
+    Exporting,
+    Failed,
+}
+
 struct Session {
-    source: PathBuf,
+    id: u32,
+    name: String,
+    source: Option<PathBuf>,
+    prefs: Prefs,
+    phase: Phase,
+    error: Option<String>,
     items: Vec<Item>,
     verdicts: Vec<Verdict>,
     overrides: HashMap<String, Decision>,
     suggestions: Vec<Suggestion>,
-    timing: Timing,
+    timing: Option<Timing>,
     applied: Vec<String>,
+    last_export: Option<PathBuf>,
+    cancel: Arc<AtomicBool>,
+}
+
+/// What survives a restart: the folder, its settings and Sơn's manual choices.
+#[derive(Serialize, Deserialize)]
+struct SavedSession {
+    id: u32,
+    name: String,
+    source: Option<PathBuf>,
+    prefs: Prefs,
+    overrides: HashMap<String, Decision>,
+    last_export: Option<PathBuf>,
+}
+
+impl Session {
+    fn new(id: u32, prefs: Prefs) -> Self {
+        Self {
+            id,
+            name: format!("Phiên {id}"),
+            source: None,
+            prefs,
+            phase: Phase::Empty,
+            error: None,
+            items: vec![],
+            verdicts: vec![],
+            overrides: HashMap::new(),
+            suggestions: vec![],
+            timing: None,
+            applied: vec![],
+            last_export: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
 }
 
 struct App {
     data_dir: PathBuf,
+    /// One analysis at a time (old CPUs): waiting on this lock is the queue.
     analyzer: Mutex<Analyzer>,
     face_warning: Option<String>,
-    session: Mutex<Option<Session>>,
-    prefs: Mutex<Prefs>,
-    cancel: AtomicBool,
-    busy: AtomicBool,
+    sessions: Mutex<BTreeMap<u32, Session>>,
+    next_id: AtomicU32,
+    global: Mutex<Global>,
+    card_cancel: AtomicBool,
+    card_busy: AtomicBool,
 }
 
 impl App {
@@ -60,9 +123,25 @@ impl App {
         Store::new(learn::default_dir(&self.data_dir))
     }
 
-    fn save_prefs(&self, p: &Prefs) {
+    fn save_global(&self) {
+        let g = self.global.lock().unwrap().clone();
         let _ = std::fs::create_dir_all(&self.data_dir);
-        let _ = std::fs::write(self.data_dir.join("settings.json"), serde_json::to_vec_pretty(p).unwrap_or_default());
+        let _ = std::fs::write(self.data_dir.join("settings.json"), serde_json::to_vec_pretty(&g).unwrap_or_default());
+    }
+
+    fn save_sessions(&self, map: &BTreeMap<u32, Session>) {
+        let saved: Vec<SavedSession> = map
+            .values()
+            .map(|s| SavedSession {
+                id: s.id,
+                name: s.name.clone(),
+                source: s.source.clone(),
+                prefs: s.prefs.clone(),
+                overrides: s.overrides.clone(),
+                last_export: s.last_export.clone(),
+            })
+            .collect();
+        let _ = std::fs::write(self.data_dir.join("sessions.json"), serde_json::to_vec_pretty(&saved).unwrap_or_default());
     }
 
     fn profile_view(&self, name: &str) -> ProfileView {
@@ -78,33 +157,17 @@ impl App {
         }
     }
 
-    /// Re-decide with the current settings and keep Sơn's manual choices.
+    /// Re-decide with the session's settings and keep Sơn's manual choices.
     fn recull(&self, s: &mut Session) {
-        let prefs = self.prefs.lock().unwrap().clone();
-        let prof = self.store().load(&prefs.profile);
-        s.verdicts = pipeline::decide(&s.items, &prefs.settings, Some(&prof));
+        let prof = self.store().load(&s.prefs.profile);
+        s.verdicts = pipeline::decide(&s.items, &s.prefs.settings, Some(&prof));
         pipeline::apply_overrides(&mut s.verdicts, &s.items, &s.overrides);
-    }
-}
-
-/// Guard so two long jobs never run at once.
-struct Busy<'a>(&'a AtomicBool);
-impl<'a> Busy<'a> {
-    fn take(b: &'a AtomicBool) -> Result<Self, String> {
-        if b.swap(true, Ordering::SeqCst) {
-            return Err("Đang có việc khác chạy, đợi xong hoặc bấm Dừng".into());
-        }
-        Ok(Self(b))
-    }
-}
-impl Drop for Busy<'_> {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
     }
 }
 
 #[derive(Serialize, Clone)]
 struct ProgressEvent {
+    session: Option<u32>,
     done: usize,
     total: usize,
     stage: String,
@@ -153,18 +216,42 @@ struct VerdictsView {
     summary: Summary,
 }
 
+/// Small description of a session for the tab bar.
+#[derive(Serialize)]
+struct SessionMeta {
+    id: u32,
+    name: String,
+    source: Option<String>,
+    phase: Phase,
+    error: Option<String>,
+    summary: Option<Summary>,
+    prefs: Prefs,
+    last_export: Option<String>,
+}
+
 #[derive(Serialize)]
 struct SessionView {
-    source: String,
-    out_dir: String,
+    meta: SessionMeta,
     photos: Vec<PhotoView>,
     verdicts: Vec<Verdict>,
     summary: Summary,
     suggestions: Vec<Suggestion>,
     applied: Vec<String>,
-    timing: Timing,
+    timing: Option<Timing>,
     profile: ProfileView,
-    prefs: Prefs,
+}
+
+fn meta(s: &Session) -> SessionMeta {
+    SessionMeta {
+        id: s.id,
+        name: s.name.clone(),
+        source: s.source.as_ref().map(|p| p.display().to_string()),
+        phase: s.phase,
+        error: s.error.clone(),
+        summary: (s.phase == Phase::Ready || s.phase == Phase::Exporting).then(|| cull::summarize(&s.verdicts)),
+        prefs: s.prefs.clone(),
+        last_export: s.last_export.as_ref().map(|p| p.display().to_string()),
+    }
 }
 
 fn photo_view(idx: usize, it: &Item) -> PhotoView {
@@ -200,25 +287,30 @@ fn photo_view(idx: usize, it: &Item) -> PhotoView {
 }
 
 fn session_view(app: &App, s: &Session) -> SessionView {
-    let prefs = app.prefs.lock().unwrap().clone();
     SessionView {
-        source: s.source.display().to_string(),
-        out_dir: export::default_out_dir(&s.source).display().to_string(),
+        meta: meta(s),
         photos: s.items.iter().enumerate().map(|(i, it)| photo_view(i, it)).collect(),
         verdicts: s.verdicts.clone(),
         summary: cull::summarize(&s.verdicts),
         suggestions: s.suggestions.clone(),
         applied: s.applied.clone(),
         timing: s.timing.clone(),
-        profile: app.profile_view(&prefs.profile),
-        prefs,
+        profile: app.profile_view(&s.prefs.profile),
     }
 }
 
-fn emitter(app: &AppHandle) -> impl Fn(usize, usize, &str) + Sync + '_ {
+fn emitter(app: &AppHandle, session: Option<u32>) -> impl Fn(usize, usize, &str) + Sync + '_ {
     move |done, total, stage| {
-        let _ = app.emit("progress", ProgressEvent { done, total, stage: stage.to_string() });
+        let _ = app.emit("progress", ProgressEvent { session, done, total, stage: stage.to_string() });
     }
+}
+
+fn sessions_changed(app: &AppHandle) {
+    let _ = app.emit("sessions-changed", ());
+}
+
+fn folder_name(p: &Path) -> String {
+    p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| p.display().to_string())
 }
 
 #[derive(Serialize)]
@@ -230,17 +322,24 @@ struct AppInfo {
     face_warning: Option<String>,
     catalog: Vec<FeatureInfo>,
     criteria: Vec<&'static str>,
-    prefs: Prefs,
+    defaults: Prefs,
     profiles: Vec<String>,
-    profile: ProfileView,
+    export_parent: Option<String>,
+    sessions: Vec<SessionMeta>,
 }
 
 #[tauri::command]
 fn app_info(app: State<'_, Arc<App>>) -> AppInfo {
-    let prefs = app.prefs.lock().unwrap().clone();
+    let g = app.global.lock().unwrap().clone();
+    let sessions: Vec<SessionMeta> = app.sessions.lock().unwrap().values().map(meta).collect();
     let mut profiles = app.store().list();
-    if !profiles.contains(&prefs.profile) {
-        profiles.insert(0, prefs.profile.clone());
+    for s in &sessions {
+        if !profiles.contains(&s.prefs.profile) {
+            profiles.push(s.prefs.profile.clone());
+        }
+    }
+    if !profiles.contains(&g.prefs.profile) {
+        profiles.insert(0, g.prefs.profile.clone());
     }
     AppInfo {
         version: env!("CARGO_PKG_VERSION").into(),
@@ -250,21 +349,69 @@ fn app_info(app: State<'_, Arc<App>>) -> AppInfo {
         face_warning: app.face_warning.clone(),
         catalog: options::catalog(),
         criteria: rawpick_core::analyze::CRITERIA.to_vec(),
-        profile: app.profile_view(&prefs.profile),
-        prefs,
+        defaults: g.prefs,
         profiles,
+        export_parent: g.export_parent.map(|p| p.display().to_string()),
+        sessions,
     }
 }
 
-/// Save settings; if a folder is open, re-decide instantly (no re-analysis).
 #[tauri::command]
-fn save_prefs(app: State<'_, Arc<App>>, prefs: Prefs) -> Option<VerdictsView> {
-    app.save_prefs(&prefs);
-    *app.prefs.lock().unwrap() = prefs;
-    let mut g = app.session.lock().unwrap();
-    let s = g.as_mut()?;
-    app.recull(s);
-    Some(VerdictsView { verdicts: s.verdicts.clone(), summary: cull::summarize(&s.verdicts) })
+fn new_session(handle: AppHandle) -> SessionMeta {
+    let app = handle.state::<Arc<App>>();
+    let id = app.next_id.fetch_add(1, Ordering::SeqCst);
+    let prefs = app.global.lock().unwrap().prefs.clone();
+    let mut map = app.sessions.lock().unwrap();
+    let s = Session::new(id, prefs);
+    let m = meta(&s);
+    map.insert(id, s);
+    app.save_sessions(&map);
+    drop(map);
+    sessions_changed(&handle);
+    m
+}
+
+#[tauri::command]
+fn close_session(handle: AppHandle, id: u32) {
+    let app = handle.state::<Arc<App>>();
+    let mut map = app.sessions.lock().unwrap();
+    if let Some(s) = map.remove(&id) {
+        s.cancel.store(true, Ordering::SeqCst);
+    }
+    app.save_sessions(&map);
+    drop(map);
+    sessions_changed(&handle);
+}
+
+#[tauri::command]
+fn list_sessions(app: State<'_, Arc<App>>) -> Vec<SessionMeta> {
+    app.sessions.lock().unwrap().values().map(meta).collect()
+}
+
+#[tauri::command]
+fn get_session(app: State<'_, Arc<App>>, id: u32) -> Result<SessionView, String> {
+    let map = app.sessions.lock().unwrap();
+    let s = map.get(&id).ok_or("Phiên đã đóng")?;
+    Ok(session_view(&app, s))
+}
+
+/// Save a session's settings (they also become the defaults for new sessions)
+/// and re-decide instantly; no re-analysis needed.
+#[tauri::command]
+fn save_prefs(app: State<'_, Arc<App>>, id: Option<u32>, prefs: Prefs) -> Option<VerdictsView> {
+    app.global.lock().unwrap().prefs = prefs.clone();
+    app.save_global();
+    let mut map = app.sessions.lock().unwrap();
+    let s = map.get_mut(&id?)?;
+    s.prefs = prefs;
+    let out = if s.phase == Phase::Ready {
+        app.recull(s);
+        Some(VerdictsView { verdicts: s.verdicts.clone(), summary: cull::summarize(&s.verdicts) })
+    } else {
+        None
+    };
+    app.save_sessions(&map);
+    out
 }
 
 #[tauri::command]
@@ -272,41 +419,98 @@ fn profile_info(app: State<'_, Arc<App>>, name: String) -> ProfileView {
     app.profile_view(&name)
 }
 
+/// Analyse a folder in a session. With `source` = None the session's saved folder is reopened
+/// (instant thanks to the cache). Several calls queue up and run one after another.
 #[tauri::command]
-async fn analyze(handle: AppHandle, source: String) -> Result<SessionView, String> {
+async fn analyze(handle: AppHandle, id: u32, source: Option<String>) -> Result<SessionView, String> {
     let app = handle.state::<Arc<App>>().inner().clone();
     let h2 = handle.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let _busy = Busy::take(&app.busy)?;
-        app.cancel.store(false, Ordering::SeqCst);
-        let source = PathBuf::from(source);
-        if !source.is_dir() {
-            return Err(format!("Không tìm thấy thư mục {}", source.display()));
-        }
-        let mut prefs = app.prefs.lock().unwrap().clone();
+        let (source, prefs, cancel) = {
+            let mut map = app.sessions.lock().unwrap();
+            let s = map.get_mut(&id).ok_or("Phiên đã đóng")?;
+            if matches!(s.phase, Phase::Waiting | Phase::Analyzing | Phase::Exporting) {
+                return Err("Phiên này đang chạy, đợi xong hoặc bấm Dừng".to_string());
+            }
+            let src = match source {
+                Some(p) => PathBuf::from(p),
+                None => s.source.clone().ok_or("Phiên chưa có thư mục")?,
+            };
+            if !src.is_dir() {
+                s.phase = if s.items.is_empty() { Phase::Failed } else { Phase::Ready };
+                s.error = Some(format!("Không tìm thấy thư mục {}", src.display()));
+                return Err(s.error.clone().unwrap());
+            }
+            if s.source.as_ref() != Some(&src) {
+                s.overrides.clear();
+            }
+            s.name = folder_name(&src);
+            s.source = Some(src.clone());
+            s.phase = Phase::Waiting;
+            s.error = None;
+            s.cancel.store(false, Ordering::SeqCst);
+            let out = (src, s.prefs.clone(), s.cancel.clone());
+            app.save_sessions(&map);
+            out
+        };
+        sessions_changed(&h2);
+        let on_step = emitter(&h2, Some(id));
+        on_step(0, 0, "Đang chờ phiên khác phân tích xong");
+
         let work = pipeline::work_dir(&app.data_dir, &source);
-        let thumbs = work.join("thumbs");
-        std::fs::create_dir_all(&thumbs).map_err(|e| e.to_string())?;
-        let on_step = emitter(&h2);
-        let p = Progress { on_step: &on_step, cancel: &app.cancel };
-        let (items, timing) = {
+        let result = (|| {
+            let thumbs = work.join("thumbs");
+            std::fs::create_dir_all(&thumbs).map_err(|e| e.to_string())?;
             let mut an = app.analyzer.lock().unwrap();
+            if cancel.load(Ordering::SeqCst) {
+                return Err("Đã dừng".to_string());
+            }
+            if let Some(s) = app.sessions.lock().unwrap().get_mut(&id) {
+                s.phase = Phase::Analyzing;
+            }
+            sessions_changed(&h2);
             an.thumbs_dir = Some(thumbs);
-            pipeline::analyze_all(&source, prefs.recursive, &an, Some(&work), &p).map_err(|e| format!("{e:#}"))?
+            let p = Progress { on_step: &on_step, cancel: &cancel };
+            pipeline::analyze_all(&source, prefs.recursive, &an, Some(&work), &p).map_err(|e| format!("{e:#}"))
+        })();
+
+        let mut map = app.sessions.lock().unwrap();
+        let s = map.get_mut(&id).ok_or("Phiên đã đóng")?;
+        let (items, timing) = match result {
+            Ok(r) if cancel.load(Ordering::SeqCst) => {
+                drop(r);
+                s.phase = if s.items.is_empty() { Phase::Empty } else { Phase::Ready };
+                drop(map);
+                sessions_changed(&h2);
+                return Err("Đã dừng".into());
+            }
+            Ok(r) => r,
+            Err(e) => {
+                s.phase = Phase::Failed;
+                s.error = Some(e.clone());
+                drop(map);
+                sessions_changed(&h2);
+                return Err(e);
+            }
         };
         if items.is_empty() {
-            return Err("Thư mục không có ảnh RAW hoặc JPEG nào".into());
+            s.phase = Phase::Failed;
+            s.error = Some("Thư mục không có ảnh RAW hoặc JPEG nào".into());
+            let e = s.error.clone().unwrap();
+            drop(map);
+            sessions_changed(&h2);
+            return Err(e);
         }
-        let suggestions = pipeline::suggestions(&items, &source);
-        let applied = options::auto_apply(&mut prefs.settings.options, &suggestions);
-        if !applied.is_empty() {
-            app.save_prefs(&prefs);
-            *app.prefs.lock().unwrap() = prefs;
-        }
-        let mut s = Session { source, items, verdicts: vec![], overrides: HashMap::new(), suggestions, timing, applied };
-        app.recull(&mut s);
-        let view = session_view(&app, &s);
-        *app.session.lock().unwrap() = Some(s);
+        s.suggestions = pipeline::suggestions(&items, &source);
+        s.applied = options::auto_apply(&mut s.prefs.settings.options, &s.suggestions);
+        s.items = items;
+        s.timing = Some(timing);
+        s.phase = Phase::Ready;
+        app.recull(s);
+        let view = session_view(&app, s);
+        app.save_sessions(&map);
+        drop(map);
+        sessions_changed(&h2);
         Ok(view)
     })
     .await
@@ -315,9 +519,9 @@ async fn analyze(handle: AppHandle, source: String) -> Result<SessionView, Strin
 
 /// Sơn's manual choice for one photo; `None` returns it to the AI's decision.
 #[tauri::command]
-fn set_decision(app: State<'_, Arc<App>>, idx: usize, decision: Option<Decision>) -> Result<VerdictsView, String> {
-    let mut g = app.session.lock().unwrap();
-    let s = g.as_mut().ok_or("Chưa mở thư mục nào")?;
+fn set_decision(app: State<'_, Arc<App>>, id: u32, idx: usize, decision: Option<Decision>) -> Result<VerdictsView, String> {
+    let mut map = app.sessions.lock().unwrap();
+    let s = map.get_mut(&id).ok_or("Phiên đã đóng")?;
     let key = s.items.get(idx).ok_or("Sai ảnh")?.path.display().to_string();
     match decision {
         Some(d) => {
@@ -328,25 +532,26 @@ fn set_decision(app: State<'_, Arc<App>>, idx: usize, decision: Option<Decision>
         }
     }
     app.recull(s);
-    Ok(VerdictsView { verdicts: s.verdicts.clone(), summary: cull::summarize(&s.verdicts) })
+    let v = VerdictsView { verdicts: s.verdicts.clone(), summary: cull::summarize(&s.verdicts) };
+    app.save_sessions(&map);
+    Ok(v)
 }
 
-/// Teach the current event type's profile from this folder's final choices.
-fn learn_from_session(app: &App, s: &Session) -> ProfileView {
-    let name = app.prefs.lock().unwrap().profile.clone();
+/// Teach the session's event-type profile from its final choices.
+fn learn_from(app: &App, profile: &str, items: &[Item], verdicts: &[Verdict]) -> ProfileView {
     let store = app.store();
-    let mut p = store.load(&name);
-    p.add(pipeline::training_samples(&s.items, &s.verdicts));
+    let mut p = store.load(profile);
+    p.add(pipeline::training_samples(items, verdicts));
     p.train();
     let _ = store.save(&p);
-    app.profile_view(&name)
+    app.profile_view(profile)
 }
 
 #[tauri::command]
-fn train(app: State<'_, Arc<App>>) -> Result<ProfileView, String> {
-    let g = app.session.lock().unwrap();
-    let s = g.as_ref().ok_or("Chưa mở thư mục nào")?;
-    Ok(learn_from_session(&app, s))
+fn train(app: State<'_, Arc<App>>, id: u32) -> Result<ProfileView, String> {
+    let map = app.sessions.lock().unwrap();
+    let s = map.get(&id).ok_or("Phiên đã đóng")?;
+    Ok(learn_from(&app, &s.prefs.profile, &s.items, &s.verdicts))
 }
 
 #[derive(Serialize)]
@@ -355,23 +560,62 @@ struct ExportResult {
     profile: ProfileView,
 }
 
+/// The folder an export into `parent` will create.
 #[tauri::command]
-async fn export_folder(handle: AppHandle, out_dir: Option<String>) -> Result<ExportResult, String> {
+fn export_target(app: State<'_, Arc<App>>, id: u32, parent: String) -> Result<String, String> {
+    let map = app.sessions.lock().unwrap();
+    let s = map.get(&id).ok_or("Phiên đã đóng")?;
+    let src = s.source.as_ref().ok_or("Phiên chưa có thư mục")?;
+    Ok(Path::new(&parent).join(format!("{}_da-loc", folder_name(src))).display().to_string())
+}
+
+/// Export into `<parent>/<folder name>_da-loc`, `parent` chosen by Sơn.
+#[tauri::command]
+async fn export_folder(handle: AppHandle, id: u32, parent: String) -> Result<ExportResult, String> {
     let app = handle.state::<Arc<App>>().inner().clone();
     let h2 = handle.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let _busy = Busy::take(&app.busy)?;
-        app.cancel.store(false, Ordering::SeqCst);
-        let g = app.session.lock().unwrap();
-        let s = g.as_ref().ok_or("Chưa mở thư mục nào")?;
-        let mut opts = app.prefs.lock().unwrap().export.clone();
-        opts.report = opts.report && app.prefs.lock().unwrap().settings.options.report;
-        let out = out_dir.map(PathBuf::from).unwrap_or_else(|| export::default_out_dir(&s.source));
-        let on_step = emitter(&h2);
-        let p = Progress { on_step: &on_step, cancel: &app.cancel };
-        let report = pipeline::export_all(&s.source, &s.items, &s.verdicts, &out, &opts, &p).map_err(|e| format!("{e:#}"))?;
+        let parent = PathBuf::from(parent);
+        if !parent.is_dir() {
+            return Err(format!("Không tìm thấy thư mục {}", parent.display()));
+        }
+        // Snapshot the session so it stays usable (and other sessions run) while copying.
+        let (source, items, verdicts, opts, profile, cancel) = {
+            let mut map = app.sessions.lock().unwrap();
+            let s = map.get_mut(&id).ok_or("Phiên đã đóng")?;
+            if s.phase != Phase::Ready {
+                return Err("Phiên này chưa phân tích xong".into());
+            }
+            s.phase = Phase::Exporting;
+            s.cancel.store(false, Ordering::SeqCst);
+            let mut opts = s.prefs.export.clone();
+            opts.report = opts.report && s.prefs.settings.options.report;
+            (s.source.clone().unwrap(), s.items.clone(), s.verdicts.clone(), opts, s.prefs.profile.clone(), s.cancel.clone())
+        };
+        sessions_changed(&h2);
+        let out = parent.join(format!("{}_da-loc", folder_name(&source)));
+        let on_step = emitter(&h2, Some(id));
+        let p = Progress { on_step: &on_step, cancel: &cancel };
+        let res = pipeline::export_all(&source, &items, &verdicts, &out, &opts, &p).map_err(|e| format!("{e:#}"));
+        {
+            let mut map = app.sessions.lock().unwrap();
+            if let Some(s) = map.get_mut(&id) {
+                s.phase = Phase::Ready;
+                if res.is_ok() {
+                    s.last_export = Some(out.clone());
+                }
+            }
+            app.save_sessions(&map);
+        }
+        {
+            let mut g = app.global.lock().unwrap();
+            g.export_parent = Some(parent);
+        }
+        app.save_global();
+        sessions_changed(&h2);
+        let report = res?;
         // Every export teaches the AI what Sơn finally kept.
-        let profile = learn_from_session(&app, s);
+        let profile = learn_from(&app, &profile, &items, &verdicts);
         Ok(ExportResult { report, profile })
     })
     .await
@@ -383,32 +627,44 @@ async fn copy_card(handle: AppHandle, card: String, dest: String, backup: Option
     let app = handle.state::<Arc<App>>().inner().clone();
     let h2 = handle.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let _busy = Busy::take(&app.busy)?;
-        app.cancel.store(false, Ordering::SeqCst);
-        let on_step = emitter(&h2);
-        ingest::safe_copy(Path::new(&card), Path::new(&dest), backup.as_deref().map(Path::new), &|n, t| on_step(n, t, "Đang chép thẻ"), &app.cancel)
-            .map_err(|e| format!("{e:#}"))
+        if app.card_busy.swap(true, Ordering::SeqCst) {
+            return Err("Đang chép một thẻ khác".to_string());
+        }
+        app.card_cancel.store(false, Ordering::SeqCst);
+        let on_step = emitter(&h2, None);
+        let r = ingest::safe_copy(Path::new(&card), Path::new(&dest), backup.as_deref().map(Path::new), &|n, t| on_step(n, t, "Đang chép thẻ"), &app.card_cancel)
+            .map_err(|e| format!("{e:#}"));
+        app.card_busy.store(false, Ordering::SeqCst);
+        r
     })
     .await
     .map_err(|e| e.to_string())?
 }
 
+/// Stop a session's analysis/export, or the card copy when `id` is None.
 #[tauri::command]
-fn cancel(app: State<'_, Arc<App>>) {
-    app.cancel.store(true, Ordering::SeqCst);
+fn cancel(app: State<'_, Arc<App>>, id: Option<u32>) {
+    match id {
+        Some(id) => {
+            if let Some(s) = app.sessions.lock().unwrap().get(&id) {
+                s.cancel.store(true, Ordering::SeqCst);
+            }
+        }
+        None => app.card_cancel.store(true, Ordering::SeqCst),
+    }
 }
 
 /// A larger preview for the detail view, cached next to the thumbnails.
 /// `full` = the preview at its native size (for checking focus at 100 %).
 #[tauri::command]
-async fn big_preview(handle: AppHandle, idx: usize, full: Option<bool>) -> Result<String, String> {
+async fn big_preview(handle: AppHandle, id: u32, idx: usize, full: Option<bool>) -> Result<String, String> {
     let app = handle.state::<Arc<App>>().inner().clone();
     let full = full.unwrap_or(false);
     tauri::async_runtime::spawn_blocking(move || {
         let (path, work) = {
-            let g = app.session.lock().unwrap();
-            let s = g.as_ref().ok_or("Chưa mở thư mục nào")?;
-            (s.items.get(idx).ok_or("Sai ảnh")?.path.clone(), pipeline::work_dir(&app.data_dir, &s.source))
+            let map = app.sessions.lock().unwrap();
+            let s = map.get(&id).ok_or("Phiên đã đóng")?;
+            (s.items.get(idx).ok_or("Sai ảnh")?.path.clone(), pipeline::work_dir(&app.data_dir, s.source.as_ref().ok_or("Phiên chưa có thư mục")?))
         };
         let out = work.join("big").join(if full { format!("{idx:06}-full.jpg") } else { format!("{idx:06}.jpg") });
         if !out.exists() {
@@ -426,11 +682,6 @@ async fn big_preview(handle: AppHandle, idx: usize, full: Option<bool>) -> Resul
     })
     .await
     .map_err(|e| e.to_string())?
-}
-
-#[tauri::command]
-fn default_out_dir(source: String) -> String {
-    export::default_out_dir(Path::new(&source)).display().to_string()
 }
 
 fn find_model(handle: &AppHandle, data_dir: &Path) -> Option<PathBuf> {
@@ -456,32 +707,48 @@ fn main() {
         .setup(|app| {
             let data_dir = app.path().app_local_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
-            let prefs: Prefs = std::fs::read(data_dir.join("settings.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+            let global: Global = std::fs::read(data_dir.join("settings.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+            let saved: Vec<SavedSession> = std::fs::read(data_dir.join("sessions.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+            let mut sessions = BTreeMap::new();
+            for s in saved {
+                let mut x = Session::new(s.id, s.prefs);
+                x.name = s.name;
+                x.source = s.source;
+                x.overrides = s.overrides;
+                x.last_export = s.last_export;
+                sessions.insert(x.id, x);
+            }
+            let next = sessions.keys().max().map(|m| m + 1).unwrap_or(1);
             let model = find_model(app.handle(), &data_dir);
             let (analyzer, face_warning) = Analyzer::new(model.as_deref(), None);
             app.manage(Arc::new(App {
                 data_dir,
                 analyzer: Mutex::new(analyzer),
                 face_warning,
-                session: Mutex::new(None),
-                prefs: Mutex::new(prefs),
-                cancel: AtomicBool::new(false),
-                busy: AtomicBool::new(false),
+                sessions: Mutex::new(sessions),
+                next_id: AtomicU32::new(next),
+                global: Mutex::new(global),
+                card_cancel: AtomicBool::new(false),
+                card_busy: AtomicBool::new(false),
             }));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             app_info,
+            new_session,
+            close_session,
+            list_sessions,
+            get_session,
             save_prefs,
             profile_info,
             analyze,
             set_decision,
             train,
+            export_target,
             export_folder,
             copy_card,
             cancel,
-            big_preview,
-            default_out_dir
+            big_preview
         ])
         .run(tauri::generate_context!())
         .expect("không khởi động được SonVu Raw Pick");

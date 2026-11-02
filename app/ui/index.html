@@ -17,7 +17,7 @@
     <section class="sec">
       <div class="drop" id="drop" tabindex="0" role="button">
         <strong>Thả thư mục ảnh vào đây</strong>
-        <small>hoặc bấm để chọn thư mục · RAW (CR3, NEF, ARW, RAF, DNG…) và JPEG</small>
+        <small>hoặc bấm để chọn · mỗi thư mục một phiên · RAW (CR3, NEF, ARW, RAF, DNG…) và JPEG</small>
       </div>
       <div class="row2">
         <button class="btn" id="btnCard">Chép từ thẻ nhớ…</button>
@@ -71,21 +71,37 @@
 
     <section class="sec">
       <h2>Khi xuất</h2>
-      <div class="opts">
-        <label class="chk"><input type="checkbox" id="expReview"> Chép ảnh «Cần xem lại»</label>
-        <label class="chk"><input type="checkbox" id="expRejected"> Chép ảnh bị loại (chia theo lý do)</label>
+      <div class="seg" id="expMode" role="radiogroup" aria-label="Cách xuất">
+        <button data-m="copy" role="radio">Chép (giữ ảnh gốc)</button>
+        <button data-m="move" role="radio">Chuyển sang thư mục mới</button>
       </div>
-      <p class="note">Ảnh gốc không bao giờ bị di chuyển hay xoá. Mỗi file chép đều được kiểm tra checksum.</p>
+      <div class="opts">
+        <label class="chk"><input type="checkbox" id="expReview"> Gồm cả ảnh «Cần xem lại»</label>
+        <label class="chk"><input type="checkbox" id="expRejected"> Gồm cả ảnh bị loại (chia theo lý do)</label>
+      </div>
+      <p class="note" id="expNote"></p>
     </section>
   </aside>
 
   <main>
+    <nav class="stabs" id="stabs" aria-label="Các phiên làm việc"></nav>
+
     <div class="empty" id="empty">
       <div>
-        <p class="big">Thả thư mục ảnh sự kiện vào bên trái.</p>
+        <p class="big">Thả thư mục ảnh sự kiện vào đây.</p>
+        <p class="note err" id="emptyErr" hidden></p>
+        <p><button class="btn primary" id="btnPickMain">Chọn thư mục cho phiên này…</button></p>
+        <p>Mỗi phiên lọc một thư mục. Bấm <b>+ Phiên mới</b> để mở thêm thư mục khác, hoặc kéo nhiều thư mục vào cùng lúc. Các phiên được phân tích lần lượt để máy không bị chậm, và tự mở lại khi bật ứng dụng.</p>
         <p>SonVu Raw Pick đọc ảnh xem trước nhúng trong file RAW nên chạy nhanh cả trên máy không có card đồ hoạ. Ảnh được chấm điểm theo phơi sáng, độ nét, bố cục, màu, nhiễu và người (mắt nhắm, mặt mờ), rồi chia vào <b>Đã chọn</b>, <b>Cần xem lại</b> và <b>Bị loại</b>.</p>
         <p class="note" id="faceWarn" hidden></p>
       </div>
+    </div>
+
+    <div class="sprog" id="sprog" hidden>
+      <p id="sprogText"></p>
+      <div class="bar"><i id="sprogBar"></i></div>
+      <p class="meta" id="sprogCount"></p>
+      <button class="btn" id="sprogStop">Dừng</button>
     </div>
 
     <div id="results" hidden>
@@ -105,7 +121,7 @@
             <option value="score">Điểm cao trước</option>
             <option value="name">Theo tên file</option>
           </select>
-          <button class="btn primary" id="btnExport">Xuất thư mục đã lọc</button>
+          <button class="btn primary" id="btnExport">Xuất ảnh ra thư mục…</button>
         </div>
       </div>
       <div class="grid" id="grid"></div>

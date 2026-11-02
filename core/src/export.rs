@@ -20,11 +20,14 @@ pub struct ExportOptions {
     pub copy_review: bool,
     /// Write the shoot summary (`tong-ket.txt`).
     pub report: bool,
+    /// Move instead of copy: each original is removed only after its new copy is verified
+    /// (or renamed in one step when source and destination are on the same drive).
+    pub move_files: bool,
 }
 
 impl Default for ExportOptions {
     fn default() -> Self {
-        Self { copy_rejected: true, copy_review: true, report: true }
+        Self { copy_rejected: true, copy_review: true, report: true, move_files: false }
     }
 }
 
@@ -33,6 +36,7 @@ pub struct ExportReport {
     pub out_dir: PathBuf,
     pub copied: usize,
     pub skipped_same: usize,
+    pub moved: usize,
     pub bytes: u64,
     pub errors: Vec<String>,
 }
@@ -142,12 +146,36 @@ pub fn export(
                 k += 1;
             }
             used.insert(dst.clone());
-            match copy_verified(f, &dst) {
-                Ok(Some(b)) => {
-                    rep.copied += 1;
-                    rep.bytes += b;
+            if opts.move_files && !dst.exists() {
+                if let Some(d) = dst.parent() {
+                    std::fs::create_dir_all(d)?;
                 }
-                Ok(None) => rep.skipped_same += 1,
+                // Same drive: a rename moves the file without touching a single byte.
+                if let Ok(len) = std::fs::metadata(f).map(|m| m.len()) {
+                    if std::fs::rename(f, &dst).is_ok() {
+                        rep.moved += 1;
+                        rep.bytes += len;
+                        continue;
+                    }
+                }
+            }
+            match copy_verified(f, &dst) {
+                Ok(r) => {
+                    match r {
+                        Some(b) => {
+                            rep.copied += 1;
+                            rep.bytes += b;
+                        }
+                        None => rep.skipped_same += 1,
+                    }
+                    // Only now, with a verified identical copy in place, remove the original.
+                    if opts.move_files {
+                        match std::fs::remove_file(f) {
+                            Ok(()) => rep.moved += 1,
+                            Err(e) => rep.errors.push(format!("Đã chép nhưng không xoá được bản gốc {}: {e}", f.display())),
+                        }
+                    }
+                }
                 Err(err) => rep.errors.push(format!("{err:#}")),
             }
         }
@@ -240,7 +268,11 @@ pub fn summary_text(entries: &[Entry], rep: &ExportReport) -> String {
     if manual > 0 {
         t += &format!("\nSơn đã sửa tay {manual} quyết định của AI ({:.0}% đồng ý với AI).\n", 100.0 - pct(manual));
     }
-    t += &format!("\nĐã chép {} file ({:.1} GB), bỏ qua {} file đã có sẵn.\n", rep.copied, rep.bytes as f64 / 1e9, rep.skipped_same);
+    if rep.moved > 0 {
+        t += &format!("\nĐã chuyển {} file ({:.1} GB) sang thư mục này, ảnh gốc giữ nguyên chất lượng.\n", rep.moved, rep.bytes as f64 / 1e9);
+    } else {
+        t += &format!("\nĐã chép {} file ({:.1} GB), bỏ qua {} file đã có sẵn.\n", rep.copied, rep.bytes as f64 / 1e9, rep.skipped_same);
+    }
     if !rep.errors.is_empty() {
         t += "\nLỖI:\n";
         for e in &rep.errors {
@@ -302,5 +334,24 @@ mod tests {
         // Running again skips identical files.
         let rep2 = export(&entries, &out, &ExportOptions::default(), &|_, _| {}, &AtomicBool::new(false)).unwrap();
         assert_eq!((rep2.copied, rep2.skipped_same), (0, 3));
+    }
+
+    #[test]
+    fn move_keeps_bytes_and_removes_originals() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("Su-kien");
+        std::fs::create_dir_all(&src).unwrap();
+        let raw: Vec<u8> = (0..200_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let a = src.join("DSC_1.NEF");
+        std::fs::write(&a, &raw).unwrap();
+        let fa = vec![a.clone()];
+        let va = verdict(Decision::Selected);
+        let entries = vec![Entry { files: &fa, analysis: None, verdict: &va, rel_dir: PathBuf::new() }];
+        let out = dir.path().join("Xuat");
+        let opts = ExportOptions { move_files: true, ..Default::default() };
+        let rep = export(&entries, &out, &opts, &|_, _| {}, &AtomicBool::new(false)).unwrap();
+        assert_eq!(rep.moved, 1, "{:?}", rep.errors);
+        assert!(!a.exists());
+        assert_eq!(std::fs::read(out.join("1_Da-chon/DSC_1.NEF")).unwrap(), raw);
     }
 }

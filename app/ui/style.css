@@ -152,3 +152,22 @@ kbd { font-family: var(--f-mono); font-size: 10.5px; color: var(--dim); margin-l
 
 .toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--raised); border: 1px solid var(--line); border-radius: 10px; padding: 10px 16px; z-index: 20; max-width: 80vw; font-size: 13px; }
 .toast a { color: var(--mid); cursor: pointer; text-decoration: underline; }
+
+/* sessions */
+.stabs { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-bottom: 16px; border-bottom: 1px solid var(--line); padding-bottom: 10px; }
+.stab { display: flex; align-items: center; gap: 8px; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 5px 6px 5px 11px; cursor: pointer; max-width: 260px; font-size: 13px; }
+.stab:hover { border-color: var(--muted); }
+.stab.on { border-color: var(--pencil); background: var(--pencil-soft); }
+.stab .nm { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.stab .st { font-family: var(--f-mono); font-size: 11px; color: var(--muted); white-space: nowrap; }
+.stab.ph-analyzing .st, .stab.ph-exporting .st, .stab.ph-waiting .st { color: var(--mid); }
+.stab.ph-failed .st { color: var(--lo); }
+.stab .x { border: 0; background: none; color: var(--dim); cursor: pointer; font-size: 15px; line-height: 1; padding: 0 4px; border-radius: 4px; }
+.stab .x:hover { color: var(--fg); background: var(--raised); }
+.sprog { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; margin-bottom: 16px; max-width: 640px; }
+.sprog p { margin: 0; }
+.sprog .bar { height: 6px; background: var(--raised); border-radius: 3px; overflow: hidden; margin: 10px 0 6px; }
+.sprog .bar i { display: block; height: 100%; width: 0; background: var(--pencil); transition: width .2s; }
+.sprog .btn { margin-top: 8px; }
+.err { color: var(--lo); }
+.empty { height: auto; min-height: 60vh; }

@@ -24,9 +24,13 @@ const CORE_OPTS = [
 ];
 
 const st = {
-  info: null, prefs: null, session: null, verdicts: [], summary: null,
+  info: null, prefs: null, profile: null,
+  // Sessions: one folder each. `views` caches the full data of analysed sessions.
+  sid: null, metas: [], views: {}, progress: {},
+  session: null, verdicts: [], summary: null,
   tab: "all", reason: "", sort: "time", view: [], cur: -1,
 };
+const meta = (id = st.sid) => st.metas.find((m) => m.id === id);
 
 // ---------------------------------------------------------------- helpers
 
@@ -53,6 +57,7 @@ function fmtTime(t) {
   return d.toISOString().slice(11, 19);
 }
 
+// Modal progress, only for the memory-card copy; sessions show progress in their own tab.
 let busyOn = false;
 function busy(on, text) {
   busyOn = on;
@@ -62,13 +67,24 @@ function busy(on, text) {
   $("busyCount").textContent = "";
 }
 T.event.listen("progress", (e) => {
-  if (!busyOn) return;
-  const { done, total, stage } = e.payload;
-  $("busyText").textContent = stage + "…";
-  $("busyBar").style.width = total ? (100 * done) / total + "%" : "0%";
-  $("busyCount").textContent = `${done} / ${total}`;
+  const { session, done, total, stage } = e.payload;
+  if (session == null) {
+    if (!busyOn) return;
+    $("busyText").textContent = stage + "…";
+    $("busyBar").style.width = total ? (100 * done) / total + "%" : "0%";
+    $("busyCount").textContent = `${done} / ${total}`;
+    return;
+  }
+  st.progress[session] = { done, total, stage };
+  renderTabs();
+  if (session === st.sid) renderProgress();
 });
-$("btnCancel").onclick = () => invoke("cancel");
+T.event.listen("sessions-changed", async () => {
+  st.metas = await invoke("list_sessions");
+  renderTabs();
+  renderMain();
+});
+$("btnCancel").onclick = () => invoke("cancel", { id: null });
 
 // ---------------------------------------------------------------- settings rail
 
@@ -116,6 +132,7 @@ function renderRules() {
   $("optAuto").checked = s.options.auto_apply;
   $("expReview").checked = st.prefs.export.copy_review;
   $("expRejected").checked = st.prefs.export.copy_rejected;
+  renderExpMode();
 }
 
 function suggestionFor(key) {
@@ -174,8 +191,9 @@ function renderCams() {
 }
 
 function renderProfile(p) {
-  if (p) st.info.profile = p;
-  p = st.info.profile;
+  if (p) st.profile = p;
+  p = st.profile;
+  if (!p) return;
   const sel = $("profileSel");
   if (!st.info.profiles.includes(st.prefs.profile)) st.info.profiles.unshift(st.prefs.profile);
   sel.innerHTML = st.info.profiles.map((n) => `<option ${n === st.prefs.profile ? "selected" : ""}>${esc(n)}</option>`).join("");
@@ -183,15 +201,25 @@ function renderProfile(p) {
   $("profileBox").innerHTML = p.ready
     ? `Đã học từ <b>${p.samples}</b> ảnh · AI đồng ý với bạn <b>${pct(p.agreement)}</b> · tái hiện đúng <b>${pct(p.accuracy)}</b> lựa chọn<ul>${p.explain.map((e) => `<li>${esc(e)}</li>`).join("")}</ul>`
     : `Chưa đủ dữ liệu: <b>${p.samples}</b> / ${p.min_samples} ảnh. Mỗi lần xuất thư mục, AI học từ những ảnh bạn giữ hoặc bỏ.`;
-  $("btnTrain").disabled = !st.session;
+  $("btnTrain").disabled = !(st.session && meta()?.phase === "ready");
+}
+
+function renderExpMode() {
+  const mv = !!st.prefs.export.move_files;
+  for (const b of $("expMode").children) b.setAttribute("aria-checked", String((b.dataset.m === "move") === mv)), b.setAttribute("aria-pressed", String((b.dataset.m === "move") === mv));
+  $("expNote").textContent = mv
+    ? "Ảnh được chuyển sang thư mục bạn chọn khi bấm Xuất. Bản gốc chỉ bị xoá sau khi bản mới đã kiểm tra khớp từng byte; cùng ổ đĩa thì chỉ đổi chỗ, không ghi lại file."
+    : "Ảnh gốc giữ nguyên. File RAW và JPEG được chép nguyên bản, kiểm tra checksum từng file.";
 }
 
 let saveTimer = 0;
 function savePrefs() {
   clearTimeout(saveTimer);
   saveTimer = setTimeout(async () => {
-    const v = await invoke("save_prefs", { prefs: st.prefs });
-    if (v) applyVerdicts(v);
+    const v = await invoke("save_prefs", { id: st.sid, prefs: st.prefs });
+    const m = meta();
+    if (m) m.prefs = JSON.parse(JSON.stringify(st.prefs));
+    if (v && st.session) applyVerdicts(v);
   }, 120);
 }
 
@@ -216,6 +244,9 @@ function wireRail() {
   $("optAuto").onchange = () => { st.prefs.settings.options.auto_apply = $("optAuto").checked; savePrefs(); };
   $("expReview").onchange = () => { st.prefs.export.copy_review = $("expReview").checked; savePrefs(); };
   $("expRejected").onchange = () => { st.prefs.export.copy_rejected = $("expRejected").checked; savePrefs(); };
+  for (const b of $("expMode").children) {
+    b.onclick = () => { st.prefs.export.move_files = b.dataset.m === "move"; renderExpMode(); savePrefs(); };
+  }
   $("profileSel").onchange = async () => {
     st.prefs.profile = $("profileSel").value;
     renderProfile(await invoke("profile_info", { name: st.prefs.profile }));
@@ -231,7 +262,7 @@ function wireRail() {
   };
   $("btnTrain").onclick = async () => {
     try {
-      const p = await invoke("train");
+      const p = await invoke("train", { id: st.sid });
       renderProfile(p);
       toast(p.ready ? `AI đã học xong, tái hiện đúng ${Math.round(p.accuracy * 100)}% lựa chọn của bạn.` : `Đã lưu ${p.samples} lựa chọn. Cần ${p.min_samples} ảnh có cả giữ và bỏ để AI bắt đầu học.`);
     } catch (e) { toast(esc(e)); }
@@ -240,25 +271,147 @@ function wireRail() {
 
 // ---------------------------------------------------------------- folder in
 
-async function openFolder(path) {
+// ---------------------------------------------------------------- sessions
+
+function sessionLabel(m) {
+  const pr = st.progress[m.id];
+  if (m.phase === "waiting") return "đang chờ";
+  if (m.phase === "analyzing" || m.phase === "exporting") return pr && pr.total ? Math.round((100 * pr.done) / pr.total) + "%" : "…";
+  if (m.phase === "failed") return "lỗi";
+  if (m.summary) return `${m.summary.selected}/${m.summary.total}`;
+  return "trống";
+}
+
+function renderTabs() {
+  const box = $("stabs");
+  box.innerHTML =
+    st.metas
+      .map((m) => `<div class="stab ${m.id === st.sid ? "on" : ""} ph-${m.phase}" data-id="${m.id}" title="${esc(m.source || "Chưa có thư mục")}">
+        <span class="nm">${esc(m.source ? m.name : "Phiên mới")}</span><span class="st">${sessionLabel(m)}</span>
+        <button class="x" data-close="${m.id}" aria-label="Đóng phiên">×</button></div>`)
+      .join("") + `<button class="btn sm" id="btnNewSession" title="Mở thêm một thư mục khác">+ Phiên mới</button>`;
+  for (const t of box.querySelectorAll(".stab")) t.onclick = (e) => { if (!e.target.dataset.close) selectSession(+t.dataset.id); };
+  for (const x of box.querySelectorAll("[data-close]")) x.onclick = () => closeSession(+x.dataset.close);
+  $("btnNewSession").onclick = async () => selectSession((await newSession()).id);
+}
+
+async function newSession() {
+  const m = await invoke("new_session");
+  if (!st.metas.find((x) => x.id === m.id)) st.metas.push(m);
+  renderTabs();
+  return m;
+}
+
+async function closeSession(id) {
+  const m = meta(id);
+  if (m && m.source && !confirm(`Đóng phiên «${m.name}»? Ảnh và kết quả đã xuất không bị ảnh hưởng.`)) return;
+  await invoke("close_session", { id });
+  st.metas = st.metas.filter((x) => x.id !== id);
+  delete st.views[id];
+  if (!st.metas.length) await newSession();
+  if (st.sid === id || !meta()) selectSession(st.metas[st.metas.length - 1].id);
+  else renderTabs();
+}
+
+async function selectSession(id) {
+  st.sid = id;
+  st.cur = -1;
+  $("detail").hidden = true;
+  const m = meta(id);
+  st.prefs = JSON.parse(JSON.stringify(m ? m.prefs : st.info.defaults));
+  if (m && m.phase === "ready" && !st.views[id]) {
+    try { st.views[id] = await invoke("get_session", { id }); } catch (e) { /* closed meanwhile */ }
+  }
+  renderTabs();
+  renderPresets();
+  renderWeights();
+  renderRules();
+  renderOptions();
+  invoke("profile_info", { name: st.prefs.profile }).then(renderProfile);
+  renderMain();
+}
+
+/** Show the right panel for the current session's phase. */
+function renderMain() {
+  const m = meta();
+  if (!m) return;
+  const view = st.views[m.id];
+  const ready = (m.phase === "ready" || m.phase === "exporting") && view;
+  $("empty").hidden = !(m.phase === "empty" || (m.phase === "failed" && !view));
+  $("emptyErr").hidden = m.phase !== "failed";
+  $("emptyErr").textContent = m.error || "";
+  $("results").hidden = !ready;
+  renderProgress();
+  if (ready) {
+    if (st.session !== view) {
+      st.session = view;
+      st.verdicts = view.verdicts;
+      st.summary = view.summary;
+      st.reason = "";
+      renderSummary();
+      renderGrid();
+    }
+  } else {
+    st.session = null;
+  }
+  $("btnExport").disabled = m.phase !== "ready";
+  $("btnTrain").disabled = m.phase !== "ready";
+}
+
+function renderProgress() {
+  const m = meta();
+  const run = m && ["waiting", "analyzing", "exporting"].includes(m.phase);
+  $("sprog").hidden = !run;
+  if (!run) return;
+  const pr = st.progress[m.id] || { done: 0, total: 0, stage: "" };
+  $("sprogText").textContent = m.phase === "waiting" ? "Đang chờ phiên khác phân tích xong (máy chạy từng thư mục một để không bị chậm)…" : (pr.stage || "Đang đọc thư mục") + "…";
+  $("sprogBar").style.width = pr.total ? (100 * pr.done) / pr.total + "%" : "0%";
+  $("sprogCount").textContent = pr.total ? `${pr.done} / ${pr.total} · ${esc(m.source || "")}` : esc(m.source || "");
+}
+
+/** Analyse `path` in session `id` (a new session if omitted and the current one is busy). */
+async function openFolder(path, id) {
   if (!path) return;
-  busy(true, "Đang đọc thư mục…");
+  if (id == null) {
+    const cur = meta();
+    id = cur && cur.phase === "empty" ? cur.id : (await newSession()).id;
+  }
+  if (st.sid !== id) await selectSession(id);
+  const m = meta(id);
+  if (m) { m.phase = "waiting"; m.source = path; m.name = path.split(/[\\/]/).filter(Boolean).pop() || path; }
+  renderTabs();
+  renderMain();
   try {
-    const s = await invoke("analyze", { source: path });
-    st.session = s;
-    st.prefs = s.prefs;
-    st.cur = -1;
-    applyVerdicts(s);
-    renderRules();
-    renderOptions();
-    renderProfile(s.profile);
-    $("empty").hidden = true;
-    $("results").hidden = false;
-    if (s.applied.length) toast("AI đã tự bật: " + s.applied.map(esc).join(", "));
+    const v = await invoke("analyze", { id, source: path });
+    st.views[id] = v;
+    Object.assign(meta(id) || {}, v.meta);
+    if (st.sid === id) {
+      st.prefs = JSON.parse(JSON.stringify(v.meta.prefs));
+      renderRules();
+      renderOptions();
+      renderProfile(v.profile);
+      renderMain();
+      if (v.applied.length) toast("AI đã tự bật: " + v.applied.map(esc).join(", "));
+    }
+    renderTabs();
   } catch (e) {
-    toast(esc(e));
-  } finally {
-    busy(false);
+    if (String(e) !== "Đã dừng") toast(esc(e));
+    st.metas = await invoke("list_sessions");
+    renderTabs();
+    renderMain();
+  }
+}
+
+/** Reopen saved sessions after a restart (from the cache, one after another). */
+async function restoreSessions() {
+  for (const m of st.metas.filter((x) => x.source)) {
+    try {
+      const v = await invoke("analyze", { id: m.id, source: null });
+      st.views[m.id] = v;
+      Object.assign(meta(m.id) || {}, v.meta);
+      if (st.sid === m.id) renderMain();
+      renderTabs();
+    } catch (e) { /* folder moved or deleted: the tab shows the error */ }
   }
 }
 
@@ -269,12 +422,19 @@ async function pickFolder(title) {
 function wireIn() {
   const drop = $("drop");
   drop.onclick = async () => openFolder(await pickFolder("Chọn thư mục ảnh"));
+  $("btnPickMain").onclick = async () => openFolder(await pickFolder("Chọn thư mục ảnh cho phiên này"), st.sid);
+  $("sprogStop").onclick = () => invoke("cancel", { id: st.sid });
   drop.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") drop.click(); };
   T.webview.getCurrentWebview().onDragDropEvent((e) => {
     const t = e.payload.type;
     if (t === "over" || t === "enter") drop.classList.add("over");
     else drop.classList.remove("over");
-    if (t === "drop" && e.payload.paths?.length) openFolder(e.payload.paths[0]);
+    if (t === "drop" && e.payload.paths?.length) {
+      // Several folders dropped at once: one session each.
+      const [first, ...rest] = e.payload.paths;
+      openFolder(first);
+      for (const p of rest) newSession().then((m) => openFolder(p, m.id));
+    }
   });
 
   $("btnCard").onclick = () => { $("cardDlg").hidden = false; };
@@ -308,20 +468,23 @@ function wireIn() {
 function applyVerdicts(v) {
   st.verdicts = v.verdicts;
   st.summary = v.summary;
+  if (st.session) { st.session.verdicts = v.verdicts; st.session.summary = v.summary; }
+  const m = meta();
+  if (m) { m.summary = v.summary; renderTabs(); }
   renderSummary();
   renderGrid();
   if (st.cur >= 0) renderDetail();
 }
 
 function renderSummary() {
-  const s = st.summary, t = st.session.timing;
+  const s = st.summary, t = st.session.timing || { seconds: 0, per_photo_ms: 0, from_cache: 0 };
   const secs = t.seconds < 60 ? `${t.seconds.toFixed(1)} giây` : `${(t.seconds / 60).toFixed(1)} phút`;
   $("summary").innerHTML = `
     <div class="stat pick"><b>${s.selected}</b><span>đã chọn</span></div>
     <div class="stat"><b>${s.review}</b><span>cần xem lại</span></div>
     <div class="stat"><b>${s.rejected}</b><span>bị loại</span></div>
     <div class="stat"><b>${s.total}</b><span>ảnh${s.moments > 1 ? ` · ${s.moments} khoảnh khắc` : ""}</span></div>
-    <p class="meta">${esc(st.session.source)} · phân tích trong ${secs} (${Math.round(t.per_photo_ms)} ms/ảnh${t.from_cache ? `, ${t.from_cache} ảnh lấy lại từ lần trước` : ""})</p>`;
+    <p class="meta">${esc(st.session.meta.source)} · phân tích trong ${secs} (${Math.round(t.per_photo_ms)} ms/ảnh${t.from_cache ? `, ${t.from_cache} ảnh lấy lại từ lần trước` : ""})</p>`;
   const sel = $("reasonSel");
   const cur = sel.value;
   sel.innerHTML = `<option value="">Mọi lý do</option>` + s.by_reason.map(([r, n]) => `<option value="${esc(r)}">${esc(r)} (${n})</option>`).join("");
@@ -385,31 +548,46 @@ function wireResults() {
 }
 
 async function doExport() {
-  const def = await invoke("default_out_dir", { source: st.session.source });
-  const ok = confirm(`Xuất ảnh vào:\n${def}\n\nẢnh gốc giữ nguyên. Bấm Huỷ để chọn thư mục khác.`);
-  let out = def;
-  if (!ok) {
-    out = await pickFolder("Chọn nơi xuất ảnh");
-    if (!out) return;
-  }
-  busy(true, "Đang xuất ảnh…");
+  const id = st.sid, m = meta(id);
+  if (!m || m.phase !== "ready") return;
+  const src = m.source || "";
+  const defParent = st.info.export_parent || src.replace(/[\\/][^\\/]+[\\/]?$/, "");
+  const parent = await T.dialog.open({ directory: true, multiple: false, title: "Chọn thư mục để xuất ảnh đã lọc", defaultPath: defParent || undefined });
+  if (!parent) return;
+  const target = await invoke("export_target", { id, parent });
+  const mv = st.prefs.export.move_files;
+  const what = [`${st.summary.selected} ảnh đã chọn`, st.prefs.export.copy_review ? `${st.summary.review} ảnh cần xem lại` : "", st.prefs.export.copy_rejected ? `${st.summary.rejected} ảnh bị loại` : ""].filter(Boolean).join(", ");
+  const msg = mv
+    ? `CHUYỂN ${what} (kèm file RAW) sang:\n${target}\n\nẢnh gốc sẽ bị xoá khỏi thư mục cũ, chỉ sau khi bản mới đã kiểm tra khớp từng byte.`
+    : `Chép ${what} (kèm file RAW, giữ nguyên chất lượng) vào:\n${target}\n\nẢnh gốc giữ nguyên.`;
+  if (!confirm(msg)) return;
+  st.info.export_parent = parent;
+  m.phase = "exporting";
+  st.progress[id] = { done: 0, total: 0, stage: "Đang xuất ảnh" };
+  renderTabs();
+  renderMain();
   try {
-    const r = await invoke("export_folder", { outDir: out });
-    busy(false);
+    const r = await invoke("export_folder", { id, parent });
+    m.phase = "ready";
     renderProfile(r.profile);
     const rep = r.report;
+    const n = rep.moved || rep.copied;
     toast(
-      `Đã xuất ${rep.copied} file vào thư mục đã lọc` +
+      `${mv ? "Đã chuyển" : "Đã chép"} ${n} file (${(rep.bytes / 1e9).toFixed(2)} GB) vào ${esc(target)}` +
+        (rep.skipped_same ? `, bỏ qua ${rep.skipped_same} file đã có` : "") +
         (rep.errors.length ? `, <b>${rep.errors.length} lỗi</b>: ${esc(rep.errors[0])}` : "") +
         ` · <a id="openOut">Mở thư mục</a>`,
-      12000
+      15000
     );
     const a = document.getElementById("openOut");
     if (a) a.onclick = () => T.opener.openPath(rep.out_dir);
   } catch (e) {
-    busy(false);
+    m.phase = "ready";
     toast(esc(e));
   }
+  st.metas = await invoke("list_sessions");
+  renderTabs();
+  renderMain();
 }
 
 // ---------------------------------------------------------------- detail view
@@ -471,7 +649,7 @@ function loadPhoto(i) {
   zoomTo(1, null);
   img.src = p.thumb ? fileSrc(p.thumb) : "";
   if (!p.error) {
-    invoke("big_preview", { idx: i }).then((src) => { if (zoom.seq === seq && !zoom.full) img.src = fileSrc(src); }).catch(() => {});
+    invoke("big_preview", { id: st.sid, idx: i }).then((src) => { if (zoom.seq === seq && !zoom.full) img.src = fileSrc(src); }).catch(() => {});
   }
 }
 
@@ -480,7 +658,7 @@ function ensureFull() {
   if (zoom.full || zoom.fullLoading || zoom.idx < 0 || st.session.photos[zoom.idx].error) return zoom.fullLoading || Promise.resolve();
   const seq = zoom.seq, img = $("dimg");
   $("zPct").textContent = "Đang tải…";
-  zoom.fullLoading = invoke("big_preview", { idx: zoom.idx, full: true })
+  zoom.fullLoading = invoke("big_preview", { id: st.sid, idx: zoom.idx, full: true })
     .then((src) => new Promise((ok) => {
       if (zoom.seq !== seq) return ok();
       img.onload = () => { img.onload = null; zoom.full = true; showZoom(); ok(); };
@@ -596,7 +774,7 @@ async function decide(kind) {
     const cur = st.verdicts[i];
     decision = { kind: "rejected", reason: cur.ai_decision.kind === "rejected" ? cur.ai_decision.reason : "low-score" };
   }
-  applyVerdicts(await invoke("set_decision", { idx: i, decision }));
+  applyVerdicts(await invoke("set_decision", { id: st.sid, idx: i, decision }));
 }
 
 function step(d) {
@@ -628,16 +806,15 @@ function wireDetail() {
 
 (async function boot() {
   st.info = await invoke("app_info");
-  st.prefs = st.info.prefs;
+  st.prefs = JSON.parse(JSON.stringify(st.info.defaults));
+  st.metas = st.info.sessions;
   renderMeta();
-  renderPresets();
-  renderWeights();
-  renderRules();
-  renderOptions();
-  renderProfile();
   wireRail();
   wireIn();
   wireResults();
   wireDetail();
   wireZoom();
+  if (!st.metas.length) await newSession();
+  await selectSession(st.metas[0].id);
+  restoreSessions();
 })();
