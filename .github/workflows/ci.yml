@@ -1,0 +1,31 @@
+name: Kiểm thử
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Thư viện hệ thống cho Tauri
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Tải mô hình khuôn mặt
+        run: scripts/fetch-models.sh
+      - name: Kiểm thử lõi (gồm AI khuôn mặt trên ảnh thật)
+        env:
+          RAWPICK_REQUIRE_MODEL: "1"
+        run: cargo test -p rawpick-core
+      - name: Build ứng dụng
+        run: cargo build -p rawpick-app

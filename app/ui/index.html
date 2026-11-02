@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RawPick</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="shell">
+  <aside id="rail">
+    <header class="brand">
+      <h1>RAW<span>PICK</span></h1>
+      <p class="meta" id="meta">Đang khởi động…</p>
+    </header>
+
+    <section class="sec">
+      <div class="drop" id="drop" tabindex="0" role="button">
+        <strong>Thả thư mục ảnh vào đây</strong>
+        <small>hoặc bấm để chọn thư mục · RAW (CR3, NEF, ARW, RAF, DNG…) và JPEG</small>
+      </div>
+      <div class="row2">
+        <button class="btn" id="btnCard">Chép từ thẻ nhớ…</button>
+        <label class="chk"><input type="checkbox" id="optRecursive"> Gồm thư mục con</label>
+      </div>
+    </section>
+
+    <section class="sec">
+      <h2>AI học theo bạn</h2>
+      <label class="field">Loại sự kiện
+        <span class="inline">
+          <select id="profileSel"></select>
+          <button class="btn sm" id="btnNewProfile" title="Thêm loại sự kiện">+</button>
+        </span>
+      </label>
+      <div class="profile" id="profileBox"></div>
+      <button class="btn" id="btnTrain" disabled>Huấn luyện AI từ lựa chọn hiện tại</button>
+    </section>
+
+    <section class="sec">
+      <h2>Cách chấm điểm</h2>
+      <div class="seg" id="presets">
+        <button data-p="event">Sự kiện</button>
+        <button data-p="balanced">Cân bằng</button>
+        <button data-p="portrait">Chân dung</button>
+        <button data-p="landscape">Phong cảnh</button>
+      </div>
+      <div id="weights"></div>
+    </section>
+
+    <section class="sec">
+      <h2>Ngưỡng chọn</h2>
+      <div class="rule">
+        <label>Điểm để chọn <output id="thrOut"></output></label>
+        <input type="range" id="thr" min="5" max="9.5" step="0.1">
+        <label>Vùng «cần xem lại» dưới ngưỡng <output id="marOut"></output></label>
+        <input type="range" id="mar" min="0" max="3" step="0.1">
+        <label>Giới hạn số ảnh chọn <input type="number" id="maxSel" min="0" placeholder="không"></label>
+        <label>Ảnh giống nhau trong vòng (giây) <input type="number" id="dupSec" min="0" step="1"></label>
+        <label>Giữ mỗi loạt chụp <input type="number" id="keepSeries" min="1" max="5" step="1"></label>
+      </div>
+    </section>
+
+    <section class="sec">
+      <h2>Tuỳ chọn</h2>
+      <div class="opts" id="coreOpts"></div>
+      <div class="opts" id="featOpts"></div>
+      <label class="chk ai"><input type="checkbox" id="optAuto"> Để AI tự bật tuỳ chọn gợi ý (chỉ việc chạy trên máy, không bao giờ tự đăng hay chia sẻ)</label>
+      <div id="cams"></div>
+    </section>
+
+    <section class="sec">
+      <h2>Khi xuất</h2>
+      <div class="opts">
+        <label class="chk"><input type="checkbox" id="expReview"> Chép ảnh «Cần xem lại»</label>
+        <label class="chk"><input type="checkbox" id="expRejected"> Chép ảnh bị loại (chia theo lý do)</label>
+      </div>
+      <p class="note">Ảnh gốc không bao giờ bị di chuyển hay xoá. Mỗi file chép đều được kiểm tra checksum.</p>
+    </section>
+  </aside>
+
+  <main>
+    <div class="empty" id="empty">
+      <div>
+        <p class="big">Thả thư mục ảnh sự kiện vào bên trái.</p>
+        <p>RawPick đọc ảnh xem trước nhúng trong file RAW nên chạy nhanh cả trên máy không có card đồ hoạ. Ảnh được chấm điểm theo phơi sáng, độ nét, bố cục, màu, nhiễu và người (mắt nhắm, mặt mờ), rồi chia vào <b>Đã chọn</b>, <b>Cần xem lại</b> và <b>Bị loại</b>.</p>
+        <p class="note" id="faceWarn" hidden></p>
+      </div>
+    </div>
+
+    <div id="results" hidden>
+      <div class="summary" id="summary"></div>
+      <div class="suggest" id="suggest" hidden></div>
+      <div class="toolbar">
+        <div class="tabs" id="tabs">
+          <button data-t="all">Tất cả</button>
+          <button data-t="selected">Đã chọn</button>
+          <button data-t="review">Cần xem lại</button>
+          <button data-t="rejected">Bị loại</button>
+        </div>
+        <div class="tools">
+          <select id="reasonSel"><option value="">Mọi lý do</option></select>
+          <select id="sortSel">
+            <option value="time">Theo thời gian</option>
+            <option value="score">Điểm cao trước</option>
+            <option value="name">Theo tên file</option>
+          </select>
+          <button class="btn primary" id="btnExport">Xuất thư mục đã lọc</button>
+        </div>
+      </div>
+      <div class="grid" id="grid"></div>
+    </div>
+  </main>
+</div>
+
+<div class="detail" id="detail" hidden role="dialog" aria-modal="true">
+  <div class="dview">
+    <div class="dimg"><div class="frame" id="dframe"><img id="dimg" alt=""></div></div>
+    <div class="dside">
+      <div class="dhead">
+        <div>
+          <h3 id="dname"></h3>
+          <p class="meta" id="dmeta"></p>
+        </div>
+        <button class="btn sm" id="dclose" aria-label="Đóng">✕</button>
+      </div>
+      <div class="dscore" id="dscore"></div>
+      <div class="dact">
+        <button class="btn" data-d="selected" title="Phím P">Chọn <kbd>P</kbd></button>
+        <button class="btn" data-d="review">Xem lại</button>
+        <button class="btn" data-d="rejected" title="Phím X">Loại <kbd>X</kbd></button>
+        <button class="btn" data-d="ai" title="Phím U">Theo AI <kbd>U</kbd></button>
+      </div>
+      <div id="dcrit"></div>
+      <p class="note">← → để chuyển ảnh · Esc để đóng</p>
+    </div>
+  </div>
+</div>
+
+<div class="modal" id="cardDlg" hidden role="dialog" aria-modal="true">
+  <div class="box">
+    <h3>Chép an toàn từ thẻ nhớ</h3>
+    <p class="note">Chép mọi ảnh RAW/JPEG từ thẻ sang máy (và ổ sao lưu nếu có), kiểm tra checksum từng file. Chép lại lần sau sẽ bỏ qua file đã có.</p>
+    <label class="field">Thẻ nhớ <span class="pick"><input id="cardSrc" readonly><button class="btn sm" data-pick="cardSrc">Chọn…</button></span></label>
+    <label class="field">Chép vào <span class="pick"><input id="cardDst" readonly><button class="btn sm" data-pick="cardDst">Chọn…</button></span></label>
+    <label class="field">Sao lưu thêm (không bắt buộc) <span class="pick"><input id="cardBak" readonly><button class="btn sm" data-pick="cardBak">Chọn…</button></span></label>
+    <label class="chk"><input type="checkbox" id="cardThen" checked> Chép xong thì lọc luôn</label>
+    <div class="row2 end">
+      <button class="btn" id="cardCancel">Huỷ</button>
+      <button class="btn primary" id="cardGo">Bắt đầu chép</button>
+    </div>
+  </div>
+</div>
+
+<div class="busy" id="busy" hidden>
+  <div class="box">
+    <p id="busyText">Đang làm…</p>
+    <div class="bar"><i id="busyBar"></i></div>
+    <p class="meta" id="busyCount"></p>
+    <button class="btn" id="btnCancel">Dừng</button>
+  </div>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+
+<script src="app.js"></script>
+</body>
+</html>
