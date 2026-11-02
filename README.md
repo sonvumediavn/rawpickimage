@@ -1,4 +1,4 @@
-# RawPick: lọc ảnh sự kiện tự động
+# SonVu Raw Pick: lọc ảnh sự kiện tự động
 
 Ứng dụng cài trên máy (Windows 10/11 và macOS) cho dân media: thả thư mục ảnh RAW/JPEG của một sự kiện
 vào, ứng dụng tự chấm điểm từng ảnh trên thang 10, loại ảnh hỏng và xuất ra thư mục đã lọc. Chạy hoàn
@@ -6,7 +6,7 @@ toàn bằng CPU, không cần card đồ hoạ, không gửi ảnh đi đâu.
 
 ## Dùng thế nào
 
-1. Mở RawPick, kéo thư mục ảnh vào ô bên trái (hoặc bấm để chọn). Có thẻ nhớ thì bấm **Chép từ thẻ nhớ…**
+1. Mở SonVu Raw Pick, kéo thư mục ảnh vào ô bên trái (hoặc bấm để chọn). Có thẻ nhớ thì bấm **Chép từ thẻ nhớ…**
    để chép an toàn trước (kiểm tra checksum, có thể sao lưu thêm một ổ).
 2. Ứng dụng phân tích và chia ảnh thành **Đã chọn**, **Cần xem lại**, **Bị loại** kèm lý do.
 3. Bấm vào ảnh để xem điểm từng tiêu chí, khung khuôn mặt, mắt nhắm. Phím `P` chọn, `X` loại,
@@ -79,7 +79,7 @@ tự bật những việc chạy trên máy; việc chia sẻ, đăng bài luôn
 ## Cài đặt
 
 Bộ cài được build tự động bằng GitHub Actions (tab **Actions** → **Đóng gói Windows và Mac** → tải
-`RawPick-windows` hoặc `RawPick-macos`). Gắn tag `v0.1.0` thì bộ cài lên mục **Releases**.
+`SonVu-Raw-Pick-windows` hoặc `SonVu-Raw-Pick-macos`). Gắn tag `v0.1.0` thì bộ cài lên mục **Releases**.
 
 - Windows 10/11: chạy file `.exe`. Bộ cài chưa ký số nên Windows có thể hiện «Windows protected your PC»:
   bấm **More info** → **Run anyway**. Bộ cài tự cài WebView2 nếu máy chưa có.

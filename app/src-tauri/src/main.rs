@@ -477,5 +477,5 @@ fn main() {
             default_out_dir
         ])
         .run(tauri::generate_context!())
-        .expect("không khởi động được RawPick");
+        .expect("không khởi động được SonVu Raw Pick");
 }

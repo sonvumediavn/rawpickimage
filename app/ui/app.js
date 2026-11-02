@@ -1,4 +1,4 @@
-// RawPick UI. Talks to the Rust side through Tauri commands; all heavy work happens there.
+// SonVu Raw Pick UI. Talks to the Rust side through Tauri commands; all heavy work happens there.
 "use strict";
 
 const T = window.__TAURI__;

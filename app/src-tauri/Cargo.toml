@@ -3,7 +3,7 @@ name = "rawpick-app"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "RawPick: lọc ảnh sự kiện tự động"
+description = "SonVu Raw Pick: lọc ảnh sự kiện tự động"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

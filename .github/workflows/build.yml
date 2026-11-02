@@ -46,7 +46,7 @@ jobs:
         run: npx --yes @tauri-apps/cli@2 build ${{ matrix.args }}
       - uses: actions/upload-artifact@v4
         with:
-          name: RawPick-${{ matrix.name }}
+          name: SonVu-Raw-Pick-${{ matrix.name }}
           path: ${{ matrix.out }}
           if-no-files-found: error
       - name: Đăng lên Releases (khi gắn tag v*)
