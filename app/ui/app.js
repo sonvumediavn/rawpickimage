@@ -637,6 +637,10 @@ async function doGather() {
     renderMain();
     renderTabs();
     const rep = r.report;
+    if (!rep.files && rep.errors.length) {
+      toast(`<b>Chưa chuyển được ảnh nào.</b> ${esc(rep.errors[0])}`, 30000);
+      return;
+    }
     toast(`Đã chuyển ${rep.photos} ảnh (${rep.files} file) vào ${esc(rep.dir)}. File chỉ được đổi chỗ, giữ nguyên chất lượng.` +
       (rep.errors.length ? ` <b>${rep.errors.length} lỗi</b>: ${esc(rep.errors[0])}` : "") + ` · <a id="openOut">Mở thư mục</a>`, 15000);
     const a = document.getElementById("openOut");

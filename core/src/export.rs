@@ -63,6 +63,69 @@ pub fn crc_file(p: &Path) -> std::io::Result<(u32, u64)> {
     Ok((h.finalize(), n))
 }
 
+/// Plain-language reason for a file that can't be moved or deleted.
+pub fn explain_io(e: &std::io::Error) -> String {
+    match (e.kind(), e.raw_os_error()) {
+        (_, Some(32)) | (_, Some(33)) => "file đang được chương trình khác mở (Lightroom, Photoshop, Photo Mechanic, trình xem ảnh…), đóng chương trình đó rồi thử lại".into(),
+        (std::io::ErrorKind::PermissionDenied, _) => "Windows không cho đổi chỗ file. Thường do file đang mở trong chương trình khác (Lightroom, Photoshop, trình xem ảnh), hoặc phần mềm diệt virus / «Controlled folder access» của Windows Security đang chặn SonVu Raw Pick".into(),
+        _ => e.to_string(),
+    }
+}
+
+fn set_readonly(p: &Path, on: bool) -> std::io::Result<()> {
+    let mut perm = std::fs::metadata(p)?.permissions();
+    if perm.readonly() != on {
+        #[allow(clippy::permissions_set_readonly_false)]
+        perm.set_readonly(on);
+        std::fs::set_permissions(p, perm)?;
+    }
+    Ok(())
+}
+
+/// Move one file without changing a byte. A rename when the drive allows it; otherwise a
+/// checksum-verified copy, and only then the original is removed. Read-only files (cameras mark
+/// "protected" shots that way) keep that mark at the new place. On failure nothing is lost:
+/// the original stays where it was.
+pub fn move_verified(src: &Path, dst: &Path) -> Result<()> {
+    let readonly = std::fs::metadata(src).map(|m| m.permissions().readonly()).unwrap_or(false);
+    if readonly {
+        let _ = set_readonly(src, false);
+    }
+    let restore = |p: &Path| {
+        if readonly {
+            let _ = set_readonly(p, true);
+        }
+    };
+    let mut last = None;
+    for attempt in 0..3u64 {
+        match std::fs::rename(src, dst) {
+            Ok(()) => {
+                restore(dst);
+                return Ok(());
+            }
+            Err(e) => {
+                // A virus scanner or the thumbnail indexer can hold the file for a moment.
+                last = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(150 * (attempt + 1)));
+            }
+        }
+    }
+    // Rename refused (other drive, or Windows says no): copy, verify, then remove the original.
+    if let Err(e) = copy_verified(src, dst) {
+        restore(src);
+        let why = last.as_ref().map(explain_io).unwrap_or_default();
+        bail!("Không chuyển được {}: {why} ({e:#})", src.display());
+    }
+    if let Err(e) = std::fs::remove_file(src) {
+        // Keep one copy only, at the original place.
+        let _ = std::fs::remove_file(dst);
+        restore(src);
+        bail!("Không chuyển được {}: {}", src.display(), explain_io(&e));
+    }
+    restore(dst);
+    Ok(())
+}
+
 /// Copy with CRC check of the written file. Returns bytes copied, or None if an identical file
 /// already existed at `dst`.
 pub fn copy_verified(src: &Path, dst: &Path) -> Result<Option<u64>> {
@@ -170,9 +233,10 @@ pub fn export(
                     }
                     // Only now, with a verified identical copy in place, remove the original.
                     if opts.move_files {
+                            let _ = set_readonly(f, false);
                         match std::fs::remove_file(f) {
                             Ok(()) => rep.moved += 1,
-                            Err(e) => rep.errors.push(format!("Đã chép nhưng không xoá được bản gốc {}: {e}", f.display())),
+                            Err(e) => rep.errors.push(format!("Đã chép nhưng không xoá được bản gốc {}: {}", f.display(), explain_io(&e))),
                         }
                     }
                 }

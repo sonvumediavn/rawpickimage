@@ -181,6 +181,9 @@ pub fn gather_selected(source: &Path, items: &mut [Item], verdicts: &[Verdict], 
     std::fs::create_dir_all(&dir)?;
     let mut rep = GatherReport { dir: dir.clone(), ..Default::default() };
     for (it, v) in items.iter_mut().zip(verdicts) {
+        if rep.files == 0 && rep.errors.len() >= 6 {
+            break;
+        }
         if v.decision != Decision::Selected || it.path.starts_with(&dir) {
             continue;
         }
@@ -198,7 +201,7 @@ pub fn gather_selected(source: &Path, items: &mut [Item], verdicts: &[Verdict], 
                 dst = target.join(format!("{stem}_{k}{ext}"));
                 k += 1;
             }
-            match std::fs::rename(f, &dst) {
+            match export::move_verified(f, &dst) {
                 Ok(()) => {
                     rep.files += 1;
                     moved_any = true;
@@ -208,10 +211,18 @@ pub fn gather_selected(source: &Path, items: &mut [Item], verdicts: &[Verdict], 
                     new_files.push(dst);
                 }
                 Err(e) => {
-                    rep.errors.push(format!("Không chuyển được {}: {e}", f.display()));
+                    rep.errors.push(format!("{e:#}"));
                     new_files.push(f.clone());
+                    // Same reason for every file (another program, antivirus): stop early.
+                    if rep.files == 0 && rep.errors.len() >= 6 {
+                        rep.errors.push("Đã dừng sau nhiều lỗi giống nhau, chưa chuyển file nào.".into());
+                        break;
+                    }
                 }
             }
+        }
+        if new_files.len() < it.files.len() {
+            new_files.extend_from_slice(&it.files[new_files.len()..]);
         }
         it.files = new_files;
         if let Some(a) = it.analysis.as_mut() {
@@ -251,5 +262,21 @@ mod tests {
         assert!(!raw.exists() && other.exists());
         assert_eq!(items[0].path, src.join("Da-chon/Cam2/DSC_1.JPG"));
         assert!(gather_selected(&src, &mut items, &v, "../x").is_err());
+    }
+
+    #[test]
+    fn moves_read_only_files_and_keeps_the_mark() {
+        let t = tempfile::tempdir().unwrap();
+        let a = t.path().join("a.JPG");
+        std::fs::write(&a, b"protected shot").unwrap();
+        let mut p = std::fs::metadata(&a).unwrap().permissions();
+        p.set_readonly(true);
+        std::fs::set_permissions(&a, p).unwrap();
+        std::fs::create_dir(t.path().join("sub")).unwrap();
+        let b = t.path().join("sub/a.JPG");
+        export::move_verified(&a, &b).unwrap();
+        assert!(!a.exists());
+        assert_eq!(std::fs::read(&b).unwrap(), b"protected shot");
+        assert!(std::fs::metadata(&b).unwrap().permissions().readonly());
     }
 }
