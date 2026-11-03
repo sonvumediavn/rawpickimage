@@ -691,22 +691,121 @@ fn op_gather_selected(app: &Arc<App>, id: u32, sub: String) -> Result<GatherResu
 /// Run Claude Code (signed in with the user's own Claude account) in print mode.
 /// Unix: through a login shell so the user's PATH (Homebrew, ~/.local/bin, nvm…) applies,
 /// since apps started from the Dock/Finder don't get it.
-fn claude_command(args: &str) -> std::process::Command {
+/// Where Claude Code is installed and the PATH it needs (npm installs need `node` next to it).
+#[derive(Clone)]
+struct ClaudeBin {
+    exe: std::path::PathBuf,
+    path: std::ffi::OsString,
+}
+
+static CLAUDE_BIN: std::sync::Mutex<Option<ClaudeBin>> = std::sync::Mutex::new(None);
+
+/// Find Claude Code. Apps opened from Finder / the Start menu don't get the PATH a terminal has,
+/// so look where the installers put it and ask the user's shell for its PATH.
+fn locate_claude() -> Option<ClaudeBin> {
+    let mut dirs: Vec<std::path::PathBuf> = vec![];
+    let home = dirs_home();
+    #[cfg(not(windows))]
+    {
+        // PATH as an interactive login shell sees it (.zprofile and .zshrc both loaded).
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+        let mut c = std::process::Command::new(shell);
+        c.arg("-ilc").arg("printf '\\n__RP__%s__RP__\\n' \"$PATH\"");
+        if let Ok(o) = run_with_timeout(c, None, 10) {
+            let out = String::from_utf8_lossy(&o.stdout).to_string();
+            if let Some(p) = out.split("__RP__").nth(1) {
+                dirs.extend(std::env::split_paths(p));
+            }
+        }
+        for d in [".local/bin", ".claude/local", ".npm-global/bin", ".volta/bin", ".bun/bin", "bin"] {
+            dirs.push(home.join(d));
+        }
+        dirs.push("/opt/homebrew/bin".into());
+        dirs.push("/usr/local/bin".into());
+        if let Ok(rd) = std::fs::read_dir(home.join(".nvm/versions/node")) {
+            dirs.extend(rd.flatten().map(|e| e.path().join("bin")));
+        }
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        let mut c = std::process::Command::new("cmd");
-        c.arg("/C").arg(format!("claude {args}"));
-        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-        c
+        dirs.push(home.join(".local").join("bin"));
+        if let Ok(a) = std::env::var("APPDATA") {
+            dirs.push(std::path::Path::new(&a).join("npm"));
+        }
+        // The user PATH as saved in the registry: an installer may have changed it after the app started.
+        let mut c = std::process::Command::new("reg");
+        c.args(["query", "HKCU\\Environment", "/v", "Path"]).creation_flags(0x0800_0000);
+        if let Ok(o) = run_with_timeout(c, None, 10) {
+            let out = String::from_utf8_lossy(&o.stdout).to_string();
+            if let Some(line) = out.lines().find(|l| l.trim_start().starts_with("Path")) {
+                if let Some(v) = line.split("REG_").nth(1).and_then(|r| r.split_once("    ")).map(|(_, v)| v.trim().to_string()) {
+                    let mut v = v.replace("%USERPROFILE%", &home.to_string_lossy());
+                    for k in ["LOCALAPPDATA", "APPDATA"] {
+                        if let Ok(x) = std::env::var(k) {
+                            v = v.replace(&format!("%{k}%"), &x);
+                        }
+                    }
+                    dirs.extend(std::env::split_paths(&v));
+                }
+            }
+        }
     }
-    #[cfg(not(windows))]
-    {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
-        let mut c = std::process::Command::new(shell);
-        let home = std::env::var("HOME").unwrap_or_default();
-        c.arg("-lc").arg(format!("PATH=\"$PATH:{home}/.local/bin:{home}/.claude/local:/opt/homebrew/bin:/usr/local/bin\" exec claude {args}"));
-        c
+    if let Some(p) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&p));
+    }
+    let mut seen = std::collections::HashSet::new();
+    dirs.retain(|d| !d.as_os_str().is_empty() && seen.insert(d.clone()));
+    let names: &[&str] = if cfg!(windows) { &["claude.exe", "claude.cmd"] } else { &["claude"] };
+    let exe = dirs.iter().flat_map(|d| names.iter().map(move |n| d.join(n))).find(|p| p.is_file())?;
+    let path = std::env::join_paths(std::iter::once(exe.parent().unwrap().to_path_buf()).chain(dirs)).ok()?;
+    Some(ClaudeBin { exe, path })
+}
+
+fn dirs_home() -> std::path::PathBuf {
+    std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(Into::into).unwrap_or_default()
+}
+
+fn claude_command(args: &[&str]) -> std::process::Command {
+    let cached = CLAUDE_BIN.lock().unwrap().clone();
+    let found = cached.or_else(|| {
+        let b = locate_claude();
+        *CLAUDE_BIN.lock().unwrap() = b.clone();
+        b
+    });
+    match found {
+        Some(b) => {
+            #[cfg(windows)]
+            let mut c = {
+                use std::os::windows::process::CommandExt;
+                // Rust runs .cmd files through cmd.exe itself, with safe quoting.
+                let mut c = std::process::Command::new(&b.exe);
+                c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+                c
+            };
+            #[cfg(not(windows))]
+            let mut c = std::process::Command::new(&b.exe);
+            c.args(args).env("PATH", &b.path);
+            c
+        }
+        None => {
+            // Not found: let the shell try, so the error says what went wrong.
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                let mut c = std::process::Command::new("cmd");
+                c.arg("/C").arg("claude").args(args);
+                c.creation_flags(0x0800_0000);
+                c
+            }
+            #[cfg(not(windows))]
+            {
+                let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+                let mut c = std::process::Command::new(shell);
+                c.arg("-ilc").arg(format!("exec claude {}", args.join(" ")));
+                c
+            }
+        }
     }
 }
 
@@ -743,7 +842,9 @@ struct ClaudeStatus {
 }
 
 fn op_claude_status() -> ClaudeStatus {
-    match run_with_timeout(claude_command("--version"), None, 20) {
+    // Look again every time: Claude Code may have been installed while the app was open.
+    *CLAUDE_BIN.lock().unwrap() = locate_claude();
+    match run_with_timeout(claude_command(&["--version"]), None, 20) {
         Ok(o) if o.status.success() => ClaudeStatus {
             found: true,
             version: Some(String::from_utf8_lossy(&o.stdout).trim().to_string()),
@@ -752,7 +853,7 @@ fn op_claude_status() -> ClaudeStatus {
         _ => ClaudeStatus {
             found: false,
             version: None,
-            hint: "Chưa thấy Claude Code trên máy này. Cài từ claude.com/claude-code, mở Terminal gõ «claude» và đăng nhập một lần, rồi mở lại ứng dụng.".into(),
+            hint: "Chưa thấy Claude Code trên máy này. Cài Claude Code, mở Terminal gõ «claude» và đăng nhập một lần, rồi bấm «Kiểm tra lại». Không có Claude thì AI trong máy vẫn dùng bình thường.".into(),
         },
     }
 }
@@ -827,7 +928,7 @@ fn op_chat(app: &Arc<App>, id: Option<u32>, message: String, use_claude: bool) -
             let dir = app.data_dir.join("claude-chat");
             let _ = std::fs::create_dir_all(&dir);
             // Answer-only: no shell, no file edits, no web. Runs in an empty folder.
-            let mut cmd = claude_command("-p --output-format json --disallowedTools Bash Edit Write NotebookEdit WebFetch WebSearch");
+            let mut cmd = claude_command(&["-p", "--output-format", "json", "--disallowedTools", "Bash", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch"]);
             cmd.current_dir(&dir);
             let out = run_with_timeout(cmd, Some(prompt), 180)?;
             let stdout = String::from_utf8_lossy(&out.stdout).to_string();

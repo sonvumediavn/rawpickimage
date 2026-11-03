@@ -1046,13 +1046,25 @@ function wireChat() {
     try { localStorage.setItem("useClaude", $("chatClaude").checked ? "1" : "0"); } catch (e) { /* storage off */ }
   };
   chatAdd("ai", "Bạn muốn chọn ảnh theo kiểu nào? Nói tự nhiên, ví dụ «ưu tiên ảnh có người cười, chỉ giữ 300 ảnh». Tôi chỉnh cách chấm và chọn lại ngay cho phiên đang mở.\n\nAI cũng học gu của bạn mỗi lần bạn xuất ảnh hoặc sửa tay.<span class=\"by\">AI trong máy</span>");
-  invoke("claude_status").then((c) => {
-    $("chatClaude").disabled = !c.found;
-    $("chatHint").textContent = c.found ? `${c.hint} · ${c.version || ""}` : c.hint;
-    let pref = "0";
-    try { pref = localStorage.getItem("useClaude") || "0"; } catch (e) { /* storage off */ }
-    if (c.found && pref === "1") { $("chatClaude").checked = true; $("chatClaude").onchange(); }
-  });
+  checkClaude(false);
+}
+
+/** Look for Claude Code on this computer; `asked` = the user pressed «Kiểm tra lại». */
+async function checkClaude(asked) {
+  const hint = $("chatHint");
+  if (asked) hint.textContent = "Đang tìm Claude Code trên máy…";
+  let c;
+  try { c = await invoke("claude_status"); } catch (e) { c = { found: false, hint: String(e) }; }
+  $("chatClaude").disabled = !c.found;
+  if (c.found) {
+    hint.textContent = `${c.hint} · ${c.version || ""}`;
+    let pref = asked ? "1" : "0";
+    try { pref = asked ? "1" : localStorage.getItem("useClaude") || "0"; } catch (e) { /* storage off */ }
+    if (pref === "1") { $("chatClaude").checked = true; $("chatClaude").onchange(); }
+  } else {
+    hint.innerHTML = `${esc(c.hint)} <button type="button" class="btn sm" id="chatRecheck">Kiểm tra lại</button>`;
+    $("chatRecheck").onclick = () => checkClaude(true);
+  }
 }
 
 // ---------------------------------------------------------------- web version
