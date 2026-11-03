@@ -311,7 +311,7 @@ fn learned_override(d: Decision, p: f32, trust: f32, score: f32, s: &Settings, n
         return d;
     }
     match d {
-        Decision::Rejected(r) if !matches!(r, Reason::ClosedEyes | Reason::Broken | Reason::Blurry | Reason::Duplicate) && p >= 0.75 => {
+        Decision::Rejected(r) if !matches!(r, Reason::ClosedEyes | Reason::Broken | Reason::Duplicate) && p >= 0.75 => {
             notes.push(format!("AI đã học: bạn hay giữ kiểu ảnh này ({:.0}%), nên không loại vì «{}»", p * 100.0, r.label()));
             if score >= s.threshold && p >= 0.85 {
                 Decision::Selected
@@ -319,7 +319,7 @@ fn learned_override(d: Decision, p: f32, trust: f32, score: f32, s: &Settings, n
                 Decision::Review
             }
         }
-        Decision::Selected if p <= 0.15 => {
+        Decision::Selected if p <= 0.25 => {
             notes.push(format!("AI đã học: bạn thường bỏ kiểu ảnh này (chỉ {:.0}% giữ)", p * 100.0));
             Decision::Review
         }

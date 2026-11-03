@@ -194,14 +194,15 @@ impl Profile {
         self.samples.iter().filter(|s| s.manual).count()
     }
 
-    /// How much the learned taste weighs against the fixed rules: grows with Sơn's hand-made
-    /// choices and with how well the model reproduces them.
+    /// How much the learned taste weighs against the fixed rules. Sơn's own taste is meant to
+    /// lead (his words, 2026-11-03): it starts at half the score once 20 choices are in and grows
+    /// with his hand-made choices and with how well the model reproduces them, up to 95 %.
     pub fn trust(&self, base: f32) -> f32 {
         if !self.ready() {
             return 0.0;
         }
-        let grow = (self.manual_count() as f32 / 150.0).min(1.0) * 0.45;
-        ((base + grow) * (0.5 + 0.5 * self.accuracy)).clamp(0.0, 0.85)
+        let grow = (self.manual_count() as f32 / 80.0).min(1.0) * 0.45;
+        ((base.max(0.5) + grow) * (0.6 + 0.4 * self.accuracy)).clamp(0.0, 0.95)
     }
 
     /// Probability that Sơn keeps this photo, once the profile is trained.
@@ -327,6 +328,6 @@ mod tests {
         let mut calm = NEUTRAL;
         calm[11] = 0.5;
         assert!(p.predict(&talk).unwrap() < 0.3 && p.predict(&calm).unwrap() > 0.7);
-        assert!(p.trust(0.35) > 0.35 && p.trust(0.35) <= 0.85);
+        assert!(p.trust(0.35) > 0.5 && p.trust(0.35) <= 0.95);
     }
 }

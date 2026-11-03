@@ -69,8 +69,8 @@ Cần đo lại trên máy Windows cũ của Sơn với thư mục RAW thật.
 Mỗi lần bạn bấm **Chọn (P)** hoặc **Loại (X)** trên một ảnh, AI học ngay lựa chọn đó vào hồ sơ của
 **loại sự kiện** đang chọn (Cưới, Hội nghị, Sân khấu…) và chấm lại cả thư mục. Đủ 20 lựa chọn (ít nhất
 5 giữ, 5 bỏ) là AI bắt đầu chấm theo gu của bạn. Lựa chọn bằng tay được tính nặng gấp 3 ảnh để AI tự
-quyết; càng nhiều lựa chọn và AI càng tái hiện đúng thì gu của bạn càng chiếm nhiều phần điểm (tới 85%),
-và có thể giữ lại cả những ảnh mà luật cứng định loại (trừ mắt nhắm của nhân vật chính, ảnh mờ, ảnh hỏng,
+quyết; càng nhiều lựa chọn và AI càng tái hiện đúng thì gu của bạn càng chiếm nhiều phần điểm (từ 50% khi đủ 20 lựa chọn, tới 95%),
+và có thể giữ lại cả những ảnh mà luật cứng định loại (trừ mắt nhắm của nhân vật chính, ảnh hỏng,
 ảnh trùng). Mỗi lần xuất, AI cũng học từ toàn bộ thư mục.
 
 AI học từ: phơi sáng, độ nét, bố cục, vị trí và cỡ nhân vật chính, chủ thể sát mép, màu, nhiễu, mắt,
