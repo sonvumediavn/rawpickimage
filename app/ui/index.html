@@ -127,7 +127,7 @@
             <option value="score">Điểm cao trước</option>
             <option value="name">Theo tên file</option>
           </select>
-          <button class="btn" id="btnGather" title="Chuyển ảnh đã chọn vào một thư mục con ngay trong thư mục gốc, không cần xuất">Gom ảnh đã chọn vào thư mục con…</button>
+          <button class="btn" id="btnGather" title="Chép ảnh đã chọn sang một thư mục con ngay trong thư mục gốc; ảnh gốc giữ nguyên">Chép ảnh đã chọn vào thư mục con…</button>
           <button class="btn primary" id="btnExport">Xuất ảnh ra thư mục…</button>
         </div>
       </div>
@@ -148,6 +148,7 @@
   <label class="chk claude"><input type="checkbox" id="chatClaude" disabled> Dùng Claude (tài khoản Claude Code của bạn) cho câu hỏi tự do</label>
   <p class="note" id="chatHint"></p>
   <div class="msgs" id="chatMsgs" aria-live="polite"></div>
+  <div class="ctabs" id="chatTabs" role="tablist" aria-label="Nhóm gợi ý"></div>
   <div class="chips" id="chatChips"></div>
   <form class="cin" id="chatForm">
     <textarea id="chatInput" rows="2" placeholder="Ví dụ: ưu tiên ảnh có người cười, chỉ giữ 300 ảnh"></textarea>

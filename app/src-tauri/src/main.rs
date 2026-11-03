@@ -660,29 +660,30 @@ struct GatherResult {
     view: SessionView,
 }
 
-/// Move the selected photos into a sub-folder of the source folder (no export).
+/// Copy the selected photos into a sub-folder of the source folder (originals untouched).
 fn op_gather_selected(app: &Arc<App>, id: u32, sub: String) -> Result<GatherResult, String> {
+    // Snapshot, so the session stays usable (and other sessions run) while copying.
+    let (source, items, verdicts, cancel) = {
+        let mut map = app.sessions.lock().unwrap();
+        let s = map.get_mut(&id).ok_or("Phiên đã đóng")?;
+        if s.phase != Phase::Ready {
+            return Err("Phiên này chưa phân tích xong".into());
+        }
+        s.phase = Phase::Exporting;
+        s.cancel.store(false, Ordering::SeqCst);
+        (s.source.clone().ok_or("Phiên chưa có thư mục")?, s.items.clone(), s.verdicts.clone(), s.cancel.clone())
+    };
+    sessions_changed(app);
+    let on_step = emitter(app, Some(id));
+    let p = Progress { on_step: &on_step, cancel: &cancel };
+    let res = pipeline::gather_selected(&source, &items, &verdicts, &sub, &p).map_err(|e| format!("{e:#}"));
     let mut map = app.sessions.lock().unwrap();
     let s = map.get_mut(&id).ok_or("Phiên đã đóng")?;
-    if s.phase != Phase::Ready {
-        return Err("Phiên này chưa phân tích xong".into());
-    }
-    let source = s.source.clone().ok_or("Phiên chưa có thư mục")?;
-    let old: Vec<String> = s.items.iter().map(|i| i.path.display().to_string()).collect();
-    let report = pipeline::gather_selected(&source, &mut s.items, &s.verdicts, &sub).map_err(|e| format!("{e:#}"))?;
-    // Manual choices follow the files to their new place.
-    for (i, o) in old.iter().enumerate() {
-        let new = s.items[i].path.display().to_string();
-        if *o != new {
-            if let Some(d) = s.overrides.remove(o) {
-                s.overrides.insert(new, d);
-            }
-        }
-    }
-    app.recull(s);
-    let view = session_view(&app, s);
-    app.save_sessions(&map);
-    Ok(GatherResult { report, view })
+    s.phase = Phase::Ready;
+    let view = session_view(app, s);
+    drop(map);
+    sessions_changed(app);
+    Ok(GatherResult { report: res?, view })
 }
 
 // ---------------------------------------------------------------- chat
@@ -814,6 +815,12 @@ fn op_chat(app: &Arc<App>, id: Option<u32>, message: String, use_claude: bool) -
                 None => (app.global.lock().unwrap().prefs.clone(), None),
             }
         };
+        // Questions about the folder or the AI are answered from the data, even with Claude on.
+        let local = chat::understand(&message, &prefs.settings.weights);
+        if let Some(q) = local.question {
+            let reply = chat_answer(&app, q, &prefs, ctx.as_ref());
+            return Ok(ChatResult { reply, changes: vec![], by: "local", prefs: None, verdicts: None, before: None, after: None });
+        }
         let (patch, mut notes, by) = if use_claude {
             let ready = app.store().load(&prefs.profile).ready();
             let prompt = chat::claude_prompt(&message, &prefs.settings, &prefs.preset, ctx.as_ref(), ready);
@@ -831,11 +838,10 @@ fn op_chat(app: &Arc<App>, id: Option<u32>, message: String, use_claude: bool) -
             let ans = chat::parse_claude_answer(&stdout).map_err(|e| format!("{e}. Nếu chưa đăng nhập, mở Terminal gõ «claude» để đăng nhập."))?;
             (ans.patch, vec![ans.reply], "claude")
         } else {
-            let u = chat::understand(&message, &prefs.settings.weights);
-            (u.patch, u.notes, "local")
+            (local.patch, local.notes, "local")
         };
         if patch.is_empty() {
-            let reply = if by == "local" { chat::HELP.to_string() } else { notes.join("\n") };
+            let reply = if by == "local" && notes.is_empty() { chat::HELP.to_string() } else { notes.join("\n") };
             return Ok(ChatResult { reply, changes: vec![], by, prefs: None, verdicts: None, before: None, after: None });
         }
         let changes = patch.apply(&mut prefs.settings, &mut prefs.preset);
@@ -876,6 +882,120 @@ fn op_chat(app: &Arc<App>, id: Option<u32>, message: String, use_claude: bool) -
         }
         Ok(ChatResult { reply, changes, by, prefs: Some(prefs), verdicts, before, after })
     })()
+}
+
+/// Answer a question about the open folder, the settings or what the AI learned, in Vietnamese.
+fn chat_answer(app: &App, q: rawpick_core::chat::Question, prefs: &Prefs, ctx: Option<&rawpick_core::chat::Context>) -> String {
+    use rawpick_core::chat::Question;
+    const LABEL: [&str; 6] = ["Phơi sáng", "Độ nét", "Bố cục", "Màu sắc", "Nhiễu", "Người"];
+    let pct = |n: usize, t: usize| if t > 0 { n * 100 / t } else { 0 };
+    match q {
+        Question::Summary | Question::Reasons => {
+            let Some(c) = ctx else {
+                return "Chưa có thư mục nào được phân tích trong phiên này. Mở một thư mục ảnh rồi hỏi lại nhé.".into();
+            };
+            let m = &c.summary;
+            let mut out = if q == Question::Summary {
+                let mut t = format!(
+                    "Thư mục có {} ảnh: chọn {} ({}%), cần xem lại {}, bị loại {}.",
+                    m.total,
+                    m.selected,
+                    pct(m.selected, m.total),
+                    m.review,
+                    m.rejected
+                );
+                if m.series > 0 {
+                    t += &format!(" Có {} loạt chụp liên tiếp, {} khoảnh khắc.", m.series, m.moments);
+                }
+                if c.with_people > 0 {
+                    t += &format!(" {} ảnh có người.", c.with_people);
+                }
+                t
+            } else {
+                String::new()
+            };
+            if m.by_reason.is_empty() {
+                out += if q == Question::Reasons { "Chưa có ảnh nào bị loại." } else { "" };
+                return out.trim().to_string();
+            }
+            let mut by = m.by_reason.clone();
+            by.sort_by(|a, b| b.1.cmp(&a.1));
+            out += if q == Question::Summary { "\nLý do loại nhiều nhất:" } else { "Ảnh bị loại vì:" };
+            for (r, n) in by.iter().take(6) {
+                out += &format!("\n- {r}: {n} ảnh");
+            }
+            let top = by[0].0.as_str();
+            let tip = if top.starts_with("Trùng") {
+                Some("Muốn giữ nhiều hơn mỗi loạt, nói «mỗi loạt giữ 2 ảnh».")
+            } else if top.starts_with("Điểm thấp") {
+                Some("Nếu thấy loại oan, nói «chọn nhiều hơn» hoặc «ngưỡng 7».")
+            } else if top.starts_with("Nhắm") {
+                Some("Nếu đây là ảnh thể thao hay sân khấu, nói «giữ ảnh nhắm mắt».")
+            } else if top.starts_with("Thiếu") || top.starts_with("Cháy") {
+                Some("Nếu ánh sáng như vậy là cố ý, nói «tôi thích ảnh tông tối» hoặc bật «Sửa thay vì loại».")
+            } else {
+                None
+            };
+            if let Some(t) = tip {
+                out += "\n";
+                out += t;
+            }
+            out.trim().to_string()
+        }
+        Question::Learned => {
+            let p = app.profile_view(&prefs.profile);
+            if p.samples == 0 {
+                return "AI chưa học được gì từ bạn. Mỗi lần bạn đổi «Chọn / Xem lại / Loại» trên một ảnh, AI học ngay ảnh đó; khi xuất ảnh, cả thư mục được ghi lại.".into();
+            }
+            let mut out = format!("Hồ sơ «{}»: đã học {} ảnh, trong đó {} ảnh bạn sửa tay.", p.name, p.samples, p.manual);
+            if p.ready {
+                out += &format!(" Gu của bạn đang chiếm khoảng {:.0}% điểm.", p.trust * 100.0);
+                if let Some(a) = p.accuracy {
+                    out += &format!(" AI đoán đúng lựa chọn của bạn khoảng {:.0}%.", a * 100.0);
+                }
+            } else {
+                out += &format!(" Cần ít nhất {} ảnh (có cả ảnh giữ và ảnh bỏ) để bắt đầu áp dụng.", p.min_samples);
+            }
+            if !p.explain.is_empty() {
+                out += "\nĐiều AI thấy bạn hay để ý:";
+                for e in p.explain.iter().take(5) {
+                    out += &format!("\n- {e}");
+                }
+            }
+            if !prefs.settings.options.use_learned {
+                out += "\nLưu ý: đang tắt «Dùng điều AI đã học», nói «chọn theo phong cách của tôi» để bật lại.";
+            }
+            out
+        }
+        Question::Settings => {
+            let s = &prefs.settings;
+            let total: f32 = s.weights.iter().sum::<f32>().max(1.0);
+            let mut w: Vec<(usize, f32)> = s.weights.iter().copied().enumerate().filter(|x| x.1 > 0.0).collect();
+            w.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let mut out = format!(
+                "Đang chấm theo: {}.",
+                w.iter().map(|(i, v)| format!("{} {:.0}%", LABEL[*i], v / total * 100.0)).collect::<Vec<_>>().join(", ")
+            );
+            out += &format!("\nĐiểm để chọn: {:.1}, vùng xem lại {:.1} điểm dưới ngưỡng.", s.threshold, s.review_margin);
+            out += &format!(
+                "\nMỗi loạt giữ {} ảnh{}.",
+                s.keep_per_series,
+                s.max_selected.map(|n| format!(", tối đa {n} ảnh")).unwrap_or_default()
+            );
+            let o = &s.options;
+            let on = |b: bool| if b { "bật" } else { "tắt" };
+            out += &format!(
+                "\nLoại nhắm mắt: {}. Soi khẩu hình: {}. Sửa thay vì loại: {}. Đủ khoảnh khắc: {}. Theo gu của bạn: {} ({:.0}%).",
+                on(o.reject_closed_eyes),
+                on(o.review_open_mouth),
+                on(o.fix_instead_of_reject),
+                on(o.moments),
+                on(o.use_learned),
+                s.learned_weight * 100.0
+            );
+            out
+        }
+    }
 }
 
 fn op_copy_card(app: &Arc<App>, card: String, dest: String, backup: Option<String>) -> Result<CopyReport, String> {

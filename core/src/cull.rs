@@ -369,6 +369,10 @@ fn first_decision(a: &Analysis, score: f32, s: &Settings, notes: &mut Vec<String
         }
         return Decision::Rejected(Reason::Noise);
     }
+    if score >= s.threshold && s.options.review_open_mouth && lead_mouth_open(a) {
+        notes.push("Nhân vật chính đang há miệng, khẩu hình chưa đẹp: để bạn xem lại".into());
+        return Decision::Review;
+    }
     if score >= s.threshold {
         if !fixes.is_empty() {
             notes.push("Đạt điểm chọn nhưng cần sửa nhẹ trước khi giao".into());
@@ -380,6 +384,13 @@ fn first_decision(a: &Analysis, score: f32, s: &Settings, notes: &mut Vec<String
     } else {
         Decision::Rejected(Reason::LowScore)
     }
+}
+
+/// Whether one of the two largest main faces has the mouth wide open.
+fn lead_mouth_open(a: &Analysis) -> bool {
+    let mut main: Vec<_> = a.people.faces.iter().filter(|f| f.main && !f.small).collect();
+    main.sort_by(|x, y| (y.bbox[2] * y.bbox[3]).total_cmp(&(x.bbox[2] * x.bbox[3])));
+    main.iter().take(2).any(|f| f.mouth_open > 0.3)
 }
 
 /// Group consecutive near-identical photos; keep the best `keep_per_series`.

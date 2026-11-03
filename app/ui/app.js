@@ -20,6 +20,7 @@ const REASONS = {
 };
 const CORE_OPTS = [
   ["reject_closed_eyes", "Loại ảnh có người nhắm mắt"],
+  ["review_open_mouth", "Ảnh nhân vật chính đang há miệng đưa vào «Cần xem lại»"],
   ["dedupe", "Lọc ảnh trùng, giữ ảnh đẹp nhất mỗi loạt"],
   ["use_learned", "Dùng điều AI đã học từ lựa chọn của bạn"],
 ];
@@ -628,31 +629,37 @@ async function doExport() {
   renderMain();
 }
 
-/** Move the selected shots into a sub-folder of the source folder: no copy, no export. */
+/** Copy the selected shots into a sub-folder of the source folder; originals stay as they are. */
 async function doGather() {
   const id = st.sid, m = meta(id);
   if (!m || m.phase !== "ready") return;
-  const sub = await ask(`Chuyển ${st.summary.selected} ảnh đã chọn (kèm file RAW, JPEG, XMP cùng tên) vào thư mục con trong:\n${m.source}\n\nFile chỉ được đổi chỗ, không chép lại, giữ nguyên chất lượng. Tên thư mục con:`, { value: "Anh-da-chon", title: "Gom ảnh đã chọn", ok: "Gom ảnh" });
+  const sub = await ask(`Chép ${st.summary.selected} ảnh đã chọn (kèm file RAW, JPEG, XMP cùng tên) sang thư mục con trong:\n${m.source}\n\nẢnh gốc giữ nguyên tại chỗ. Bản chép giống hệt từng byte, có kiểm tra checksum. Tên thư mục con:`, { value: "Anh-da-chon", title: "Chép ảnh đã chọn vào thư mục con", ok: "Chép ảnh" });
   if (!sub || !sub.trim()) return;
+  m.phase = "exporting";
+  st.progress[id] = { done: 0, total: 0, stage: "Đang chép ảnh đã chọn vào thư mục con" };
+  renderTabs();
+  renderMain();
   try {
     const r = await invoke("gather_selected", { id, sub: sub.trim() });
     st.views[id] = r.view;
     Object.assign(m, r.view.meta);
-    st.session = null; // force a full re-render with the new paths
-    renderMain();
-    renderTabs();
     const rep = r.report;
-    if (!rep.files && rep.errors.length) {
-      toast(`<b>Chưa chuyển được ảnh nào.</b> ${esc(rep.errors[0])}`, 30000);
-      return;
+    if (!rep.files && !rep.skipped && rep.errors.length) {
+      toast(`<b>Chưa chép được ảnh nào.</b> ${esc(rep.errors[0])}`, 30000);
+    } else {
+      toast(`Đã chép ${rep.photos} ảnh (${rep.files} file, ${(rep.bytes / 1e9).toFixed(2)} GB) vào ${esc(rep.dir)}` +
+        (rep.skipped ? `, ${rep.skipped} file đã có sẵn nên bỏ qua` : "") + `. Ảnh gốc giữ nguyên.` +
+        (rep.errors.length ? ` <b>${rep.errors.length} lỗi</b>: ${esc(rep.errors[0])}` : "") + ` · <a id="openOut">Mở thư mục</a>`, 15000);
+      const a = document.getElementById("openOut");
+      if (a) a.onclick = () => T.opener.openPath(rep.dir);
     }
-    toast(`Đã chuyển ${rep.photos} ảnh (${rep.files} file) vào ${esc(rep.dir)}. File chỉ được đổi chỗ, giữ nguyên chất lượng.` +
-      (rep.errors.length ? ` <b>${rep.errors.length} lỗi</b>: ${esc(rep.errors[0])}` : "") + ` · <a id="openOut">Mở thư mục</a>`, 15000);
-    const a = document.getElementById("openOut");
-    if (a) a.onclick = () => T.opener.openPath(rep.dir);
   } catch (e) {
     toast(esc(e));
   }
+  m.phase = "ready";
+  st.metas = await invoke("list_sessions");
+  renderTabs();
+  renderMain();
 }
 
 // ---------------------------------------------------------------- detail view
@@ -935,8 +942,51 @@ function wireDetail() {
 
 // ---------------------------------------------------------------- chat with the AI
 
-const CHAT_EXAMPLES = ["Ưu tiên ảnh có người cười", "Độ nét quan trọng nhất", "Chỉ giữ 300 ảnh", "Tôi thích ảnh tông tối", "Chọn theo phong cách của tôi", "Khắt khe hơn"];
+// Quick requests, grouped. Each one is just text the chat understands; typing works the same.
+const CHAT_GROUPS = [
+  ["Loại sự kiện", ["Đây là đám cưới", "Hội nghị – hội thảo", "Sân khấu – biểu diễn", "Tiệc – gala", "Kỷ yếu – ảnh nhóm", "Thể thao"]],
+  ["Người & khuôn mặt", ["Mắt nhân vật chính phải mở", "Loại ảnh há miệng, khẩu hình xấu", "Mặt nghiêng đẹp vẫn giữ", "Ưu tiên nhân vật chính, cận mặt", "Ưu tiên ảnh có người cười", "Giữ ảnh nhắm mắt"]],
+  ["Bố cục & kỹ thuật", ["Bố cục, góc chụp quan trọng nhất", "Độ nét quan trọng nhất", "Tôi thích ảnh tông tối", "Không quan tâm màu sắc", "Bỏ qua nhiễu hạt", "Sửa thay vì loại"]],
+  ["Số lượng", ["Chỉ giữ 300 ảnh", "Chọn nhiều hơn", "Khắt khe hơn", "Mỗi loạt giữ 2 ảnh", "Đủ khoảnh khắc", "Bỏ giới hạn số ảnh"]],
+  ["Gu của tôi", ["Chọn theo phong cách của tôi", "Tin gu của tôi nhiều hơn", "AI đã học được gì từ tôi?", "Chỉ dùng tiêu chí máy, tắt gu"]],
+  ["Hỏi & hoàn tác", ["Tóm tắt phiên này", "Vì sao nhiều ảnh bị loại?", "Đang chấm theo thiết lập nào?", "Hoàn tác", "Đặt lại mặc định"]],
+];
+let chatGroup = 0;
 let chatBusy = false;
+/** Settings before each chat change, newest last, so «Hoàn tác» can step back. */
+const chatUndo = [];
+const isUndo = (t) => /^(hoàn tác|hoan tac|undo|quay lại như cũ|quay lai nhu cu|trả lại như cũ|tra lai nhu cu)/i.test(t.trim());
+
+function renderChips() {
+  $("chatTabs").innerHTML = CHAT_GROUPS.map(([g], i) => `<button type="button" class="${i === chatGroup ? "on" : ""}" data-i="${i}">${esc(g)}</button>`).join("");
+  for (const b of $("chatTabs").children) b.onclick = () => { chatGroup = +b.dataset.i; renderChips(); };
+  $("chatChips").innerHTML = CHAT_GROUPS[chatGroup][1].map((x) => `<button type="button">${esc(x)}</button>`).join("");
+  for (const b of $("chatChips").children) b.onclick = () => sendChat(b.textContent);
+}
+
+function showPrefs(prefs) {
+  st.prefs = prefs;
+  const m = meta();
+  if (m) m.prefs = JSON.parse(JSON.stringify(prefs));
+  renderPresets();
+  renderWeights();
+  renderRules();
+  renderOptions();
+}
+
+async function undoChat() {
+  const prev = chatUndo.pop();
+  if (!prev) {
+    chatAdd("ai", `Chưa có thay đổi nào từ trò chuyện để hoàn tác.<span class="by">AI trong máy</span>`);
+    return;
+  }
+  const before = st.session && st.verdicts ? st.verdicts.filter((v) => v.decision.kind === "selected").length : null;
+  const v = await invoke("save_prefs", { id: st.sid, prefs: prev });
+  showPrefs(prev);
+  if (v && st.session) applyVerdicts(v);
+  const after = v ? v.verdicts.filter((x) => x.decision.kind === "selected").length : null;
+  chatAdd("ai", `Đã trả thiết lập về như trước lần chỉnh vừa rồi.${before != null && after != null ? `\nẢnh đã chọn: ${before} → ${after}.` : ""}<span class="by">AI trong máy</span>`);
+}
 
 function chatAdd(kind, html) {
   const d = document.createElement("div");
@@ -953,6 +1003,12 @@ async function sendChat(text) {
   chatBusy = true;
   $("chatInput").value = "";
   chatAdd("me", esc(text));
+  if (isUndo(text)) {
+    try { await undoChat(); } catch (e) { chatAdd("ai", esc(e) + `<span class="by">lỗi</span>`); }
+    chatBusy = false;
+    return;
+  }
+  const before = JSON.parse(JSON.stringify(st.prefs));
   const claude = $("chatClaude").checked;
   const wait = chatAdd("ai wait", claude ? "Đang hỏi Claude…" : "Đang xử lý…");
   try {
@@ -960,13 +1016,9 @@ async function sendChat(text) {
     wait.remove();
     chatAdd("ai", esc(r.reply) + (r.changes.length ? `<ul>${r.changes.map((c) => `<li>${esc(c)}</li>`).join("")}</ul>` : "") + `<span class="by">${r.by === "claude" ? "Claude" : "AI trong máy"}</span>`);
     if (r.prefs) {
-      st.prefs = r.prefs;
-      const m = meta();
-      if (m) m.prefs = JSON.parse(JSON.stringify(r.prefs));
-      renderPresets();
-      renderWeights();
-      renderRules();
-      renderOptions();
+      chatUndo.push(before);
+      if (chatUndo.length > 20) chatUndo.shift();
+      showPrefs(r.prefs);
     }
     if (r.verdicts && st.session) applyVerdicts(r.verdicts);
   } catch (e) {
@@ -986,8 +1038,7 @@ function wireChat() {
   };
   $("chatFab").onclick = () => open(true);
   $("chatClose").onclick = () => open(false);
-  $("chatChips").innerHTML = CHAT_EXAMPLES.map((x) => `<button type="button">${esc(x)}</button>`).join("");
-  for (const b of $("chatChips").children) b.onclick = () => sendChat(b.textContent);
+  renderChips();
   $("chatForm").onsubmit = (e) => { e.preventDefault(); sendChat($("chatInput").value); };
   $("chatInput").onkeydown = (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendChat($("chatInput").value); } };
   $("chatClaude").onchange = () => {

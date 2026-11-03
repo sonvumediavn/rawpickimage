@@ -29,10 +29,13 @@ pub struct Patch {
     pub dedupe_seconds: Option<f64>,
     pub dedupe: Option<bool>,
     pub reject_closed_eyes: Option<bool>,
+    pub review_open_mouth: Option<bool>,
     pub moments: Option<bool>,
     pub fix_instead_of_reject: Option<bool>,
     pub use_learned: Option<bool>,
     pub learned_weight: Option<f32>,
+    /// Back to the default settings (camera offsets and the extras stay as they are).
+    pub reset: Option<bool>,
 }
 
 impl Patch {
@@ -44,6 +47,20 @@ impl Patch {
     /// updated when the preset changes or weights are edited by hand ("custom").
     pub fn apply(&self, s: &mut Settings, preset: &mut String) -> Vec<String> {
         let mut out = vec![];
+        if self.reset == Some(true) {
+            let d = Settings::default();
+            let keep = std::mem::take(&mut s.camera_offsets);
+            let mut o = s.options.clone();
+            o.reject_closed_eyes = d.options.reject_closed_eyes;
+            o.review_open_mouth = d.options.review_open_mouth;
+            o.dedupe = d.options.dedupe;
+            o.use_learned = d.options.use_learned;
+            o.fix_instead_of_reject = d.options.fix_instead_of_reject;
+            o.moments = d.options.moments;
+            *s = Settings { camera_offsets: keep, options: o, ..d };
+            *preset = "event".into();
+            out.push("Đặt lại cách chấm và chọn về mặc định (kiểu «Sự kiện», ngưỡng 7,5)".into());
+        }
         if let Some(p) = &self.preset {
             let (pr, name) = match p.as_str() {
                 "balanced" => (Preset::Balanced, "Cân bằng"),
@@ -97,6 +114,12 @@ impl Patch {
         let o = &mut s.options;
         flag(&mut o.dedupe, self.dedupe, "Bật lọc ảnh trùng", "Tắt lọc ảnh trùng, giữ mọi ảnh trong loạt");
         flag(&mut o.reject_closed_eyes, self.reject_closed_eyes, "Loại ảnh có người nhắm mắt", "Không loại ảnh nhắm mắt nữa (vẫn bị trừ điểm)");
+        flag(
+            &mut o.review_open_mouth,
+            self.review_open_mouth,
+            "Ảnh nhân vật chính đang há miệng đưa vào «Cần xem lại»",
+            "Không soi khẩu hình nữa (ảnh há miệng chỉ bị trừ nhẹ)",
+        );
         flag(&mut o.moments, self.moments, "Bật «Đủ khoảnh khắc»", "Tắt «Đủ khoảnh khắc»");
         flag(&mut o.fix_instead_of_reject, self.fix_instead_of_reject, "Bật «Sửa thay vì loại»", "Tắt «Sửa thay vì loại»");
         flag(&mut o.use_learned, self.use_learned, "Dùng điều AI đã học từ lựa chọn của bạn", "Không dùng điều AI đã học");
@@ -152,6 +175,75 @@ pub struct Understood {
     pub patch: Patch,
     /// Extra explanation for the reply (style notes, how learning works…).
     pub notes: Vec<String>,
+    /// A question about the open folder or the AI rather than a change.
+    pub question: Option<Question>,
+}
+
+/// Questions answered from the session's data instead of changing settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Question {
+    /// How many photos, selected, review, rejected.
+    Summary,
+    /// Why photos were rejected, by reason.
+    Reasons,
+    /// What the AI has learned from Sơn.
+    Learned,
+    /// The current settings in words.
+    Settings,
+}
+
+fn question(f: &str) -> Option<Question> {
+    if has(f, &["hoc duoc gi", "da hoc duoc", "ai da hoc", "hoc den dau", "hoc toi den dau", "hieu gu", "hieu toi"]) {
+        Some(Question::Learned)
+    } else if has(f, &["vi sao", "tai sao", "ly do", "sao lai"]) && has(f, &["loai", "bo "]) {
+        Some(Question::Reasons)
+    } else if has(f, &["tom tat", "thong ke", "bao nhieu anh", "tinh hinh", "ket qua phien"]) {
+        Some(Question::Summary)
+    } else if has(f, &["thiet lap hien tai", "dang cham", "cham the nao", "cham nhu the nao", "dang dung thiet lap", "cai dat hien tai", "tieu chi hien tai"]) {
+        Some(Question::Settings)
+    } else {
+        None
+    }
+}
+
+/// Starting points per kind of event: weights in `CRITERIA` order and the switches that suit it.
+struct EventStyle {
+    name: &'static str,
+    weights: [f32; 6],
+    closed_eyes: bool,
+    open_mouth: bool,
+    moments: bool,
+    fix: bool,
+    keep_per_series: usize,
+    dedupe_seconds: f64,
+    note: &'static str,
+}
+
+fn event_style(f: &str) -> Option<EventStyle> {
+    let e = |name, weights, closed_eyes, open_mouth, moments, fix, keep_per_series, dedupe_seconds, note| {
+        Some(EventStyle { name, weights, closed_eyes, open_mouth, moments, fix, keep_per_series, dedupe_seconds, note })
+    };
+    if has(f, &["dam cuoi", "tiec cuoi", "le cuoi", "an hoi", "dam hoi", "wedding", "co dau", "chu re"]) {
+        e("Đám cưới", [15.0, 25.0, 12.0, 8.0, 5.0, 35.0], true, true, true, true, 1, 8.0,
+          "Ưu tiên cô dâu, chú rể và gia đình: mắt mở, khẩu hình đẹp, đủ các nghi thức.")
+    } else if has(f, &["hoi nghi", "hoi thao", "toa dam", "ky ket", "le ky", "dien gia", "conference", "seminar"]) {
+        e("Hội nghị – hội thảo", [20.0, 25.0, 15.0, 10.0, 5.0, 25.0], true, true, true, true, 1, 10.0,
+          "Diễn giả đang nói dễ há miệng: những ảnh đó đưa vào «Cần xem lại». Màn chiếu cháy sáng phía sau không bị trừ nặng.")
+    } else if has(f, &["san khau", "bieu dien", "ca nhac", "concert", "live show", "ca si", "mua ", "nhay"]) {
+        e("Sân khấu – biểu diễn", [10.0, 30.0, 15.0, 15.0, 5.0, 25.0], false, false, true, true, 2, 4.0,
+          "Đèn sân khấu tối và gắt là bình thường nên trừ nhẹ phơi sáng. Ca sĩ hát há miệng vẫn giữ. Mỗi loạt giữ 2 ảnh vì động tác thay đổi nhanh.")
+    } else if has(f, &["tiec", "gala", "sinh nhat", "year end", "tat nien", "party", "liveshow"]) {
+        e("Tiệc – gala", [15.0, 25.0, 10.0, 10.0, 10.0, 30.0], true, false, true, true, 1, 8.0,
+          "Ưu tiên khoảnh khắc vui, người cười nói tự nhiên (há miệng cười vẫn giữ). Ánh sáng tiệc yếu nên nhiễu được tính thêm một chút.")
+    } else if has(f, &["ky yeu", "anh nhom", "chup nhom", "tap the", "team building", "doan the"]) {
+        e("Kỷ yếu – ảnh nhóm", [15.0, 25.0, 15.0, 5.0, 0.0, 40.0], true, true, false, true, 1, 15.0,
+          "Ảnh nhóm chỉ đạt khi mọi người chính đều mở mắt, nét mặt ổn. Các tấm chụp liên tiếp cùng đội hình chỉ giữ tấm đẹp nhất.")
+    } else if has(f, &["the thao", "chay bo", "marathon", "giai dau", "bong da", "tran dau", "sport"]) {
+        e("Thể thao", [15.0, 35.0, 20.0, 10.0, 5.0, 15.0], false, false, true, false, 2, 3.0,
+          "Độ nét và bố cục đứng đầu, biểu cảm gắng sức (nhắm mắt, há miệng) là chuyện thường nên không loại.")
+    } else {
+        None
+    }
 }
 
 /// Offline understanding of a request. `w` = current weights (to raise/lower relative to them).
@@ -159,6 +251,10 @@ pub fn understand(msg: &str, w: &[f32; 6]) -> Understood {
     let low = msg.to_lowercase();
     let mut p = Patch::default();
     let mut notes = vec![];
+    let whole = fold(&low);
+    if let Some(q) = question(&whole) {
+        return Understood { patch: p, notes, question: Some(q) };
+    }
 
     for clause in low.split(['.', ',', ';', '\n', '!', '?']).flat_map(|c| c.split(" và ")).filter(|c| !c.trim().is_empty()) {
         let raw = clause.trim();
@@ -176,6 +272,68 @@ pub fn understand(msg: &str, w: &[f32; 6]) -> Understood {
                 if dark_look { "tông tối" } else { "tông sáng" },
                 if dark_look { "tối" } else { "cháy" }
             ));
+            continue;
+        }
+
+        if has(&f, &["dat lai", "mac dinh", "reset", "lam lai tu dau"]) {
+            p.reset = Some(true);
+            continue;
+        }
+
+        // Kind of event: a whole starting setup at once.
+        if let Some(e) = event_style(&f) {
+            p.weights = CRITERIA.iter().zip(e.weights).map(|(k, v)| (k.to_string(), v)).collect();
+            p.reject_closed_eyes = Some(e.closed_eyes);
+            p.review_open_mouth = Some(e.open_mouth);
+            p.moments = Some(e.moments);
+            p.fix_instead_of_reject = Some(e.fix);
+            p.keep_per_series = Some(e.keep_per_series);
+            p.dedupe_seconds = Some(e.dedupe_seconds);
+            p.dedupe = Some(true);
+            notes.push(format!("Chuyển sang cách chọn cho «{}». {}", e.name, e.note));
+            continue;
+        }
+
+        // Mouth shape (khẩu hình).
+        if has(&f, &["ha mieng", "khau hinh", "meo mieng", "mieng dep", "dang noi", "nhep mieng"]) {
+            let allow = has(&f, &["giu", "khong loai", "dung loai", "cho phep", "chap nhan", "khong sao", "khong can", "bo qua", "khong quan tam"]);
+            p.review_open_mouth = Some(!allow);
+            if !allow {
+                p.weights.insert("people".into(), (w[5] * 1.3).max(w[5] + 5.0).min(50.0).round());
+                notes.push("Ảnh nhân vật chính đang há miệng, đang nói dở sẽ vào «Cần xem lại» để bạn quyết. Ảnh cười tươi vẫn được giữ nếu miệng không mở quá rộng.".into());
+            }
+            continue;
+        }
+
+        // Turned faces are fine: nothing to change, just say so.
+        if has(&f, &["mat nghieng", "goc nghieng", "nghieng mat", "quay mat", "mat quay", "goc mat", "khong can thang mat", "khong can nhin may"]) {
+            notes.push("Mặt nghiêng đã không bị trừ điểm: chỉ cần mắt nhân vật chính mở và mặt đủ nét. Khi bạn giữ những ảnh góc nghiêng đẹp, AI học theo và chấm kiểu ảnh đó cao hơn.".into());
+            continue;
+        }
+
+        // Eyes must be open.
+        if has(&f, &["mat mo", "mo mat", "mat phai mo", "mat nhan vat"]) && !f.contains("nham mat") {
+            p.reject_closed_eyes = Some(true);
+            continue;
+        }
+
+        // Main subject / close-ups.
+        if has(&f, &["nhan vat chinh", "can mat", "can canh", "chu the chinh", "nguoi chinh"]) {
+            p.weights.insert("people".into(), (w[5] * 1.4).max(w[5] + 8.0).min(50.0).round());
+            p.weights.insert("comp".into(), (w[2] * 1.3).max(w[2] + 5.0).min(50.0).round());
+            notes.push("Điểm người và bố cục tính theo khuôn mặt lớn nhất trong khung, người đứng xa phía sau không kéo điểm xuống.".into());
+            continue;
+        }
+
+        // How much Sơn's own taste counts.
+        if has(&f, &["tat gu", "khong dung gu", "chi dung tieu chi", "bo gu", "khong theo gu", "chi cham theo may"]) {
+            p.use_learned = Some(false);
+            continue;
+        }
+        if has(&f, &["tin gu", "theo gu nhieu hon", "gu cua toi nhieu hon", "hoc tu toi la chinh", "theo toi la chinh", "gu cua toi la chinh", "uu tien gu"]) {
+            p.use_learned = Some(true);
+            p.learned_weight = Some(0.7);
+            notes.push("Điểm sẽ nghiêng hẳn về gu của bạn (70%) khi AI đã học đủ. Càng sửa tay nhiều, AI càng tự tin làm theo bạn.".into());
             continue;
         }
 
@@ -240,7 +398,7 @@ pub fn understand(msg: &str, w: &[f32; 6]) -> Understood {
         let crit: [(&str, &[&str]); 6] = [
             ("exposure", &["phoi sang", "anh sang", "do sang", "anh du sang", "chay sang", "thieu sang"]),
             ("sharp", &["net", "sac", "mo ", "rung tay", "focus", "lay net"]),
-            ("comp", &["bo cuc", "khung hinh", "1/3", "can giua", "nghieng"]),
+            ("comp", &["bo cuc", "khung hinh", "1/3", "can giua", "nghieng", "goc anh", "goc chup", "goc may"]),
             ("color", &["mau", "tong mau", "white balance", "can bang trang"]),
             ("noise", &["nhieu hat", "hat ", "noise", "iso cao"]),
             ("people", &["nguoi", "khuon mat", "bieu cam", "cuoi", "guong mat", "co dau", "chu re", "nhan vat"]),
@@ -280,7 +438,7 @@ pub fn understand(msg: &str, w: &[f32; 6]) -> Understood {
             p.preset = Some("event".into());
         }
     }
-    Understood { patch: p, notes }
+    Understood { patch: p, notes, question: None }
 }
 
 pub const HELP: &str = "Tôi chưa hiểu yêu cầu này. Bạn có thể nói kiểu:\n\
@@ -288,7 +446,11 @@ pub const HELP: &str = "Tôi chưa hiểu yêu cầu này. Bạn có thể nói 
 - «độ nét quan trọng nhất», «không quan tâm màu sắc»\n\
 - «chỉ giữ 300 ảnh», «ngưỡng 7», «chọn nhiều hơn», «khắt khe hơn»\n\
 - «tôi thích ảnh tông tối», «giữ ảnh nhắm mắt», «mỗi loạt giữ 2 ảnh»\n\
-- «chọn theo phong cách của tôi», «đủ khoảnh khắc»";
+- «chọn theo phong cách của tôi», «tin gu của tôi nhiều hơn», «đủ khoảnh khắc»\n\
+- «đây là đám cưới», «hội nghị», «sân khấu», «tiệc», «ảnh nhóm», «thể thao»\n\
+- «loại ảnh há miệng», «mặt nghiêng vẫn giữ», «ưu tiên nhân vật chính»\n\
+- hỏi: «tóm tắt phiên này», «vì sao nhiều ảnh bị loại», «AI đã học được gì từ tôi»\n\
+- «hoàn tác», «đặt lại mặc định»";
 
 /// Facts about the open folder that help Claude answer.
 #[derive(Debug, Clone, Serialize)]
@@ -312,6 +474,7 @@ pub fn claude_prompt(msg: &str, s: &Settings, preset: &str, ctx: Option<&Context
         "dedupe_seconds": s.dedupe_seconds,
         "dedupe": s.options.dedupe,
         "reject_closed_eyes": s.options.reject_closed_eyes,
+        "review_open_mouth": s.options.review_open_mouth,
         "moments": s.options.moments,
         "fix_instead_of_reject": s.options.fix_instead_of_reject,
         "use_learned": s.options.use_learned,
@@ -335,7 +498,7 @@ Trả lời DUY NHẤT một đối tượng JSON, không kèm chữ nào khác:
 {{"reply": "câu trả lời ngắn bằng tiếng Việt, giải thích bạn chỉnh gì và vì sao",
  "patch": {{ chỉ các trường cần đổi trong: "preset" ("event"|"balanced"|"portrait"|"landscape"), "weights" {{"exposure"..."people": 0-50}},
    "threshold" (5-9.5), "review_margin" (0-3), "max_selected" (0 = không giới hạn), "keep_per_series" (1-5), "dedupe_seconds",
-   "dedupe", "reject_closed_eyes", "moments", "fix_instead_of_reject", "use_learned" (bool), "learned_weight" (0-0.8) }} }}
+   "dedupe", "reject_closed_eyes", "review_open_mouth" (ảnh nhân vật chính há miệng vào «Cần xem lại»), "moments", "fix_instead_of_reject", "use_learned" (bool), "learned_weight" (0-0.8) }} }}
 Nếu yêu cầu không liên quan tới chọn ảnh, trả "patch": {{}} và giải thích ngắn."#
     )
 }
@@ -395,6 +558,34 @@ mod tests {
         assert_eq!(u.patch.use_learned, Some(true));
 
         assert!(understand("hôm nay trời đẹp quá", &W).patch.is_empty());
+    }
+
+    #[test]
+    fn understands_events_faces_and_questions() {
+        let u = understand("Đây là đám cưới", &W);
+        assert_eq!(u.patch.review_open_mouth, Some(true));
+        assert_eq!(u.patch.weights.get("people"), Some(&35.0));
+        let u = understand("sân khấu ca nhạc", &W);
+        assert_eq!((u.patch.reject_closed_eyes, u.patch.keep_per_series), (Some(false), Some(2)));
+
+        assert_eq!(understand("loại ảnh há miệng", &W).patch.review_open_mouth, Some(true));
+        assert_eq!(understand("há miệng không sao, cứ giữ", &W).patch.review_open_mouth, Some(false));
+        let u = understand("mặt nghiêng đẹp vẫn giữ", &W);
+        assert!(u.patch.is_empty() && !u.notes.is_empty());
+        assert_eq!(understand("mắt nhân vật chính phải mở", &W).patch.reject_closed_eyes, Some(true));
+
+        let u = understand("tin gu của tôi nhiều hơn", &W);
+        assert_eq!(u.patch.learned_weight, Some(0.7));
+        assert_eq!(understand("chỉ dùng tiêu chí máy, tắt gu", &W).patch.use_learned, Some(false));
+
+        assert_eq!(understand("Vì sao nhiều ảnh bị loại?", &W).question, Some(Question::Reasons));
+        assert_eq!(understand("AI đã học được gì từ tôi?", &W).question, Some(Question::Learned));
+        assert_eq!(understand("tóm tắt phiên này", &W).question, Some(Question::Summary));
+
+        let mut s = Settings { threshold: 9.0, ..Default::default() };
+        let mut preset = "custom".to_string();
+        Patch { reset: Some(true), ..Default::default() }.apply(&mut s, &mut preset);
+        assert_eq!((s.threshold, preset.as_str()), (7.5, "event"));
     }
 
     #[test]

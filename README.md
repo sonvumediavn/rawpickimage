@@ -16,11 +16,16 @@ toàn bằng CPU, không cần card đồ hoạ, không gửi ảnh đi đâu.
    Phím `P` chọn, `X` loại, `U` trả về quyết định của AI, `←` `→` chuyển ảnh.
 4. Bấm **Trò chuyện với AI** để yêu cầu bằng lời: «ưu tiên ảnh có người cười», «chỉ giữ 300 ảnh»,
    «tôi thích ảnh tông tối», «chọn theo phong cách của tôi»… AI chỉnh cách chấm và chọn lại ngay.
+   Gợi ý bấm nhanh chia 6 nhóm: loại sự kiện (đám cưới, hội nghị, sân khấu, tiệc, ảnh nhóm, thể thao),
+   người & khuôn mặt (mắt mở, khẩu hình/há miệng, mặt nghiêng, nhân vật chính), bố cục & kỹ thuật,
+   số lượng, gu của tôi, hỏi & hoàn tác («tóm tắt phiên này», «vì sao nhiều ảnh bị loại»,
+   «AI đã học được gì từ tôi», «hoàn tác», «đặt lại mặc định»).
    AI trong máy hiểu các yêu cầu thường gặp, chạy offline. Máy nào đã cài **Claude Code** và đăng nhập tài
    khoản Claude thì bật «Dùng Claude» để hỏi tự do (dùng tài khoản của bạn, không cần API key).
 5. Lấy ảnh ra theo một trong hai cách:
-   - **Gom ảnh đã chọn vào thư mục con…**: chuyển ảnh đã chọn vào một thư mục con ngay trong thư mục gốc
-     (ví dụ `Anh-da-chon/`). Chỉ đổi chỗ file, không chép lại, xong ngay.
+   - **Chép ảnh đã chọn vào thư mục con…**: chép ảnh đã chọn sang một thư mục con ngay trong thư mục gốc
+     (ví dụ `Anh-da-chon/`). Ảnh gốc giữ nguyên tại chỗ; bản chép giống hệt từng byte, có kiểm tra checksum.
+     Chép lại lần nữa thì bỏ qua file đã có; thư mục con này không bị phân tích lại.
    - **Xuất ảnh ra thư mục…**: chọn thư mục đích trên máy, ứng dụng tạo thư mục cùng tên thư mục ảnh
      thêm chữ `- Anh chon` (ví dụ `261103_khai giang tesol - Anh chon`) và để ảnh đã chọn ngay trong đó.
      Chọn **Chép** (giữ ảnh gốc) hoặc **Chuyển** (bản gốc chỉ bị xoá sau khi bản mới đã kiểm tra khớp).

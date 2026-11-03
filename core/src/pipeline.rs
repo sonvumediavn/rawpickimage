@@ -171,71 +171,69 @@ pub fn export_all(source: &Path, items: &[Item], verdicts: &[Verdict], out_dir: 
 pub struct GatherReport {
     pub dir: PathBuf,
     pub photos: usize,
+    /// Files copied now.
     pub files: usize,
+    /// Files already there, identical (an earlier run).
+    pub skipped: usize,
+    pub bytes: u64,
     pub errors: Vec<String>,
 }
 
-/// Move the selected photos (RAW + JPEG twin + XMP) into a sub-folder of the source folder.
-/// Same drive, so each file is only renamed: not a byte is rewritten. Updates `items` in place
-/// so the session keeps working with the new locations.
-pub fn gather_selected(source: &Path, items: &mut [Item], verdicts: &[Verdict], sub: &str) -> Result<GatherReport> {
+/// Marker left in a copy folder so later scans of the source folder skip it.
+pub const COPY_MARKER: &str = ".sonvu-anh-chon";
+
+/// Copy the selected photos (RAW + JPEG twin + XMP, byte for byte, checksum-verified) into a
+/// sub-folder of the source folder. The originals are not touched.
+pub fn gather_selected(source: &Path, items: &[Item], verdicts: &[Verdict], sub: &str, p: &Progress) -> Result<GatherReport> {
     let sub = sub.trim().trim_matches(['/', '\\']);
     anyhow::ensure!(!sub.is_empty() && !sub.contains("..") && !sub.contains(['/', '\\', ':']), "Tên thư mục không hợp lệ");
     let dir = source.join(sub);
     std::fs::create_dir_all(&dir)?;
+    let _ = std::fs::write(dir.join(COPY_MARKER), "Thư mục ảnh chọn do SonVu Raw Pick chép ra, không phân tích lại.\n");
     let mut rep = GatherReport { dir: dir.clone(), ..Default::default() };
-    for (it, v) in items.iter_mut().zip(verdicts) {
-        if rep.files == 0 && rep.errors.len() >= 6 {
+    let chosen: Vec<&Item> = items.iter().zip(verdicts).filter(|(it, v)| v.decision == Decision::Selected && !it.path.starts_with(&dir)).map(|(it, _)| it).collect();
+    let total = chosen.len();
+    for (n, it) in chosen.into_iter().enumerate() {
+        if p.cancel.load(Ordering::Relaxed) {
+            rep.errors.push("Đã dừng theo yêu cầu".into());
             break;
         }
-        if v.decision != Decision::Selected || it.path.starts_with(&dir) {
-            continue;
-        }
+        (p.on_step)(n, total, "Đang chép ảnh đã chọn vào thư mục con");
         let rel = it.path.parent().and_then(|d| d.strip_prefix(source).ok()).map(Path::to_path_buf).unwrap_or_default();
         let target = dir.join(rel);
-        std::fs::create_dir_all(&target)?;
-        let mut moved_any = false;
-        let mut new_files = Vec::with_capacity(it.files.len());
+        let mut copied_any = false;
         for f in &it.files {
-            let mut dst = target.join(f.file_name().unwrap_or_default());
+            let name = f.file_name().unwrap_or_default();
+            let mut dst = target.join(name);
+            // Same name but a different file already there: keep both.
             let mut k = 2;
-            while dst.exists() {
+            while dst.exists() && !same_file_content(f, &dst) {
                 let stem = f.file_stem().unwrap_or_default().to_string_lossy();
                 let ext = f.extension().map(|x| format!(".{}", x.to_string_lossy())).unwrap_or_default();
                 dst = target.join(format!("{stem}_{k}{ext}"));
                 k += 1;
             }
-            match export::move_verified(f, &dst) {
-                Ok(()) => {
+            match export::copy_verified(f, &dst) {
+                Ok(Some(b)) => {
                     rep.files += 1;
-                    moved_any = true;
-                    if *f == it.path {
-                        it.path = dst.clone();
-                    }
-                    new_files.push(dst);
+                    rep.bytes += b;
+                    copied_any = true;
                 }
-                Err(e) => {
-                    rep.errors.push(format!("{e:#}"));
-                    new_files.push(f.clone());
-                    // Same reason for every file (another program, antivirus): stop early.
-                    if rep.files == 0 && rep.errors.len() >= 6 {
-                        rep.errors.push("Đã dừng sau nhiều lỗi giống nhau, chưa chuyển file nào.".into());
-                        break;
-                    }
+                Ok(None) => {
+                    rep.skipped += 1;
+                    copied_any = true;
                 }
+                Err(e) => rep.errors.push(format!("{e:#}")),
             }
         }
-        if new_files.len() < it.files.len() {
-            new_files.extend_from_slice(&it.files[new_files.len()..]);
-        }
-        it.files = new_files;
-        if let Some(a) = it.analysis.as_mut() {
-            a.path = it.path.clone();
-            a.files = it.files.clone();
-        }
-        rep.photos += moved_any as usize;
+        rep.photos += copied_any as usize;
     }
+    (p.on_step)(total, total, "Đang chép ảnh đã chọn vào thư mục con");
     Ok(rep)
+}
+
+fn same_file_content(a: &Path, b: &Path) -> bool {
+    matches!((export::crc_file(a), export::crc_file(b)), (Ok(x), Ok(y)) if x == y)
 }
 
 #[cfg(test)]
@@ -243,7 +241,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gathers_selected_shots_with_their_twins() {
+    fn copies_selected_shots_with_their_twins_and_keeps_originals() {
         let t = tempfile::tempdir().unwrap();
         let src = t.path().join("Cuoi");
         std::fs::create_dir_all(src.join("Cam2")).unwrap();
@@ -253,19 +251,26 @@ mod tests {
         for (p, b) in [(&raw, &b"raw"[..]), (&jpg, b"jpg"), (&other, b"x")] {
             std::fs::write(p, b).unwrap();
         }
-        let mut items = vec![
+        let items = vec![
             Item { path: jpg.clone(), files: vec![jpg.clone(), raw.clone()], analysis: None, error: None },
             Item { path: other.clone(), files: vec![other.clone()], analysis: None, error: None },
         ];
         let refs: Vec<Option<&Analysis>> = vec![None, None];
         let mut v = cull::cull(&refs, &Settings::default(), None);
         cull::set_manual(&mut v[0], Decision::Selected);
-        let r = gather_selected(&src, &mut items, &v, "Da-chon").unwrap();
+        let cancel = AtomicBool::new(false);
+        let p = Progress { on_step: &|_, _, _| {}, cancel: &cancel };
+        let r = gather_selected(&src, &items, &v, "Anh-da-chon", &p).unwrap();
         assert_eq!((r.photos, r.files), (1, 2), "{:?}", r.errors);
-        assert_eq!(std::fs::read(src.join("Da-chon/Cam2/DSC_1.NEF")).unwrap(), b"raw");
-        assert!(!raw.exists() && other.exists());
-        assert_eq!(items[0].path, src.join("Da-chon/Cam2/DSC_1.JPG"));
-        assert!(gather_selected(&src, &mut items, &v, "../x").is_err());
+        assert_eq!(std::fs::read(src.join("Anh-da-chon/Cam2/DSC_1.NEF")).unwrap(), b"raw");
+        assert!(raw.exists() && jpg.exists() && other.exists(), "originals stay");
+        // Again: nothing new to copy, no duplicates.
+        let r = gather_selected(&src, &items, &v, "Anh-da-chon", &p).unwrap();
+        assert_eq!((r.files, r.skipped), (0, 2));
+        // The copy folder is not analysed again.
+        let groups = crate::analyze::collect(&src, true).unwrap();
+        assert!(groups.iter().all(|(p, _)| !p.starts_with(src.join("Anh-da-chon"))));
+        assert!(gather_selected(&src, &items, &v, "../x", &p).is_err());
     }
 
     #[test]

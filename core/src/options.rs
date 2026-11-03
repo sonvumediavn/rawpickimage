@@ -14,6 +14,8 @@ pub struct Options {
     // Core culling switches.
     /// Reject photos where a main face has closed eyes.
     pub reject_closed_eyes: bool,
+    /// Send photos where the main person's mouth is wide open (mid-word, shouting) to review.
+    pub review_open_mouth: bool,
     /// Keep only the best shot of each burst / near-identical series.
     pub dedupe: bool,
     /// Blend in what the AI learned from Sơn's earlier choices.
@@ -49,6 +51,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             reject_closed_eyes: true,
+            review_open_mouth: false,
             dedupe: true,
             use_learned: true,
             moments: false,
