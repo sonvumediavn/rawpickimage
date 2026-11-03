@@ -152,6 +152,10 @@ pub struct FaceInfo {
     pub main: bool,
     pub score: f32,
     pub issues: Vec<String>,
+    /// Height of the dark gap between the lips relative to mouth width: 0 closed,
+    /// above ~0.25 the mouth is clearly open (speaking, shouting, laughing).
+    #[serde(default)]
+    pub mouth_open: f32,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -211,6 +215,39 @@ fn eye_open_ratio(g: &Gray, ex: f32, ey: f32, ew: f32) -> Option<f32> {
     }
     cols.sort_by(|a, b| a.partial_cmp(b).unwrap());
     Some(cols[cols.len() / 2])
+}
+
+/// How open the mouth is, from pixels: the tallest run of dark pixels (mouth cavity) in the
+/// columns around the mouth centre, relative to mouth width. Median over columns.
+fn mouth_open_ratio(g: &Gray, mc: (f32, f32), mw: f32, skin: f32) -> Option<f32> {
+    if mw < 10.0 {
+        return None;
+    }
+    let (x0, x1) = (mc.0 - mw * 0.22, mc.0 + mw * 0.22);
+    let (y0, y1) = (mc.1 - mw * 0.35, mc.1 + mw * 0.55);
+    if x0 < 0.0 || y0 < 0.0 || x1 >= g.w as f32 || y1 >= g.h as f32 {
+        return None;
+    }
+    let dark = (skin * 0.5).max(18.0);
+    let mut runs = vec![];
+    let mut x = x0 as usize;
+    while (x as f32) <= x1 {
+        let (mut best, mut cur) = (0usize, 0usize);
+        let mut y = y0 as usize;
+        while (y as f32) <= y1 {
+            if g.at(x, y) < dark {
+                cur += 1;
+                best = best.max(cur);
+            } else {
+                cur = 0;
+            }
+            y += 1;
+        }
+        runs.push(best as f32 / mw);
+        x += 1;
+    }
+    runs.sort_by(f32::total_cmp);
+    runs.get(runs.len() / 2).copied()
 }
 
 fn face_sharpness(g: &Gray, x0: usize, y0: usize, x1: usize, y1: usize, face_w: f32) -> (f32, f32) {
@@ -286,9 +323,19 @@ pub fn assess(img: &RgbImage, g: &Gray, raw: &[RawFace]) -> People {
                 s -= 2.0;
                 issues.push("mặt bị cháy sáng".into());
             }
+            let mouth_open = if small {
+                0.0
+            } else {
+                let (rm, lm) = (f.lm[3], f.lm[4]);
+                mouth_open_ratio(g, ((rm.0 + lm.0) / 2.0, (rm.1 + lm.1) / 2.0), dist(rm, lm), lum).unwrap_or(0.0)
+            };
+            if mouth_open > 0.3 {
+                s -= 0.8;
+                issues.push("đang há miệng".into());
+            }
             if yaw.abs() > 0.38 {
-                s -= 1.5;
-                issues.push("quay mặt đi".into());
+                // A turned face can be the best frame: no penalty, Sơn's own choices decide.
+                issues.push("mặt nghiêng".into());
             }
             if edge {
                 s -= 2.0;
@@ -307,6 +354,7 @@ pub fn assess(img: &RgbImage, g: &Gray, raw: &[RawFace]) -> People {
                 main: f.w * f.h >= max_area * 0.25,
                 score: s.clamp(0.0, 10.0),
                 issues,
+                mouth_open,
             }
         })
         .collect();
@@ -332,10 +380,28 @@ pub fn assess(img: &RgbImage, g: &Gray, raw: &[RawFace]) -> People {
         }
         (x / main.len() as f32, y / main.len() as f32)
     };
+    // Audience and crowd shots: someone always blinks. Only the two biggest faces (the ones a
+    // viewer looks at) decide, and the score leans on the average rather than the worst face.
+    let crowd = main.len() >= 5;
+    let lead: Vec<&FaceInfo> = if crowd {
+        let mut by_size = main.clone();
+        by_size.sort_by(|a, b| (b.bbox[2] * b.bbox[3]).total_cmp(&(a.bbox[2] * a.bbox[3])));
+        by_size.truncate(2);
+        by_size
+    } else {
+        main.clone()
+    };
+    if crowd {
+        let blinks = main.iter().filter(|f| f.closed).count();
+        if blinks > 0 && !lead.iter().any(|f| f.closed) {
+            notes.push(format!("Ảnh đông người: {blinks} người ở xa nhắm mắt, không tính"));
+        }
+    }
+    let score = if crowd { 0.3 * mn + 0.7 * avg } else { 0.6 * mn + 0.4 * avg };
     People {
-        score: Some((0.6 * mn + 0.4 * avg).clamp(0.0, 10.0)),
-        closed_eyes: main.iter().any(|f| f.closed),
-        blurred_face: main.iter().any(|f| f.sharp < 4.0),
+        score: Some(score.clamp(0.0, 10.0)),
+        closed_eyes: lead.iter().any(|f| f.closed),
+        blurred_face: lead.iter().any(|f| f.sharp < 4.0),
         notes,
         eye_center: Some(ec),
         faces,

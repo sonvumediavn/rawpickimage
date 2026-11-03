@@ -187,6 +187,8 @@ impl App {
             agreement: p.agreement(),
             explain: p.explain(),
             min_samples: learn::MIN_SAMPLES,
+            manual: p.manual_count(),
+            trust: p.trust(self.global.lock().unwrap().prefs.settings.learned_weight),
         }
     }
 
@@ -215,6 +217,10 @@ struct ProfileView {
     agreement: Option<f32>,
     explain: Vec<String>,
     min_samples: usize,
+    /// Photos Sơn decided by hand.
+    manual: usize,
+    /// Share of the score that comes from his learned taste.
+    trust: f32,
 }
 
 #[derive(Serialize)]
@@ -247,6 +253,9 @@ struct PhotoView {
 struct VerdictsView {
     verdicts: Vec<Verdict>,
     summary: Summary,
+    /// After a hand-made choice: what the AI has learned so far.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile: Option<ProfileView>,
 }
 
 /// Small description of a session for the tab bar.
@@ -431,7 +440,7 @@ fn op_save_prefs(app: &Arc<App>, id: Option<u32>, prefs: Prefs) -> Option<Verdic
     s.prefs = prefs;
     let out = if s.phase == Phase::Ready {
         app.recull(s);
-        Some(VerdictsView { verdicts: s.verdicts.clone(), summary: cull::summarize(&s.verdicts) })
+        Some(VerdictsView { verdicts: s.verdicts.clone(), summary: cull::summarize(&s.verdicts), profile: None })
     } else {
         None
     };
@@ -542,16 +551,26 @@ fn op_set_decision(app: &Arc<App>, id: u32, idx: usize, decision: Option<Decisio
     let mut map = app.sessions.lock().unwrap();
     let s = map.get_mut(&id).ok_or("Phiên đã đóng")?;
     let key = s.items.get(idx).ok_or("Sai ảnh")?.path.display().to_string();
+    let mut profile = None;
     match decision {
         Some(d) => {
-            s.overrides.insert(key, d);
+            s.overrides.insert(key.clone(), d);
+            // Learn right away from every hand-made choice (no need to export first).
+            if let (Some(a), Some(v)) = (s.items[idx].analysis.as_ref(), s.verdicts.get(idx)) {
+                let store = app.store();
+                let mut p = store.load(&s.prefs.profile);
+                p.add(vec![learn::Sample { name: key, f: learn::features(a).to_vec(), keep: d.keep(), ai_keep: v.ai_decision.keep(), manual: true }]);
+                p.train();
+                let _ = store.save(&p);
+                profile = Some(app.profile_view(&s.prefs.profile));
+            }
         }
         None => {
             s.overrides.remove(&key);
         }
     }
     app.recull(s);
-    let v = VerdictsView { verdicts: s.verdicts.clone(), summary: cull::summarize(&s.verdicts) };
+    let v = VerdictsView { verdicts: s.verdicts.clone(), summary: cull::summarize(&s.verdicts), profile };
     app.save_sessions(&map);
     Ok(v)
 }
@@ -833,7 +852,7 @@ fn op_chat(app: &Arc<App>, id: Option<u32>, message: String, use_claude: bool) -
                     let before = s.verdicts.iter().filter(|v| v.decision == Decision::Selected).count();
                     app.recull(s);
                     let after = s.verdicts.iter().filter(|v| v.decision == Decision::Selected).count();
-                    (Some(VerdictsView { verdicts: s.verdicts.clone(), summary: cull::summarize(&s.verdicts) }), Some(before), Some(after))
+                    (Some(VerdictsView { verdicts: s.verdicts.clone(), summary: cull::summarize(&s.verdicts), profile: None }), Some(before), Some(after))
                 } else {
                     (None, None, None)
                 }

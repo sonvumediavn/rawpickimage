@@ -252,12 +252,17 @@ pub fn cull(items: &[Option<&Analysis>], s: &Settings, profile: Option<&Profile>
             };
             let (rule, mut notes) = rule_score(a, &s.weights, fix);
             let learned = profile.and_then(|p| p.predict(&learn::features(a)));
+            // The more Sơn has taught (and the better the model fits him), the more his taste counts.
+            let trust = profile.map(|p| p.trust(s.learned_weight)).unwrap_or(0.0);
             let score = match learned {
-                Some(p) => r1((1.0 - s.learned_weight) * rule + s.learned_weight * 10.0 * p),
+                Some(p) => r1((1.0 - trust) * rule + trust * 10.0 * p),
                 None => rule,
             };
             let mut fixes = vec![];
-            let decision = first_decision(a, score, s, &mut notes, &mut fixes);
+            let mut decision = first_decision(a, score, s, &mut notes, &mut fixes);
+            if let Some(p) = learned {
+                decision = learned_override(decision, p, trust, score, s, &mut notes);
+            }
             let offset = if o.multi_camera { s.camera_offsets.get(&a.camera).copied().unwrap_or(0.0) } else { 0.0 };
             Verdict {
                 idx,
@@ -297,6 +302,29 @@ pub fn cull(items: &[Option<&Analysis>], s: &Settings, profile: Option<&Profile>
         v.ai_decision = v.decision;
     }
     out
+}
+
+/// Sơn's learned taste may overrule the fixed rules, except for things he always wants out
+/// (closed eyes of the main person, broken files, real blur) and duplicates.
+fn learned_override(d: Decision, p: f32, trust: f32, score: f32, s: &Settings, notes: &mut Vec<String>) -> Decision {
+    if trust < 0.3 {
+        return d;
+    }
+    match d {
+        Decision::Rejected(r) if !matches!(r, Reason::ClosedEyes | Reason::Broken | Reason::Blurry | Reason::Duplicate) && p >= 0.75 => {
+            notes.push(format!("AI đã học: bạn hay giữ kiểu ảnh này ({:.0}%), nên không loại vì «{}»", p * 100.0, r.label()));
+            if score >= s.threshold && p >= 0.85 {
+                Decision::Selected
+            } else {
+                Decision::Review
+            }
+        }
+        Decision::Selected if p <= 0.15 => {
+            notes.push(format!("AI đã học: bạn thường bỏ kiểu ảnh này (chỉ {:.0}% giữ)", p * 100.0));
+            Decision::Review
+        }
+        _ => d,
+    }
 }
 
 fn first_decision(a: &Analysis, score: f32, s: &Settings, notes: &mut Vec<String>, fixes: &mut Vec<String>) -> Decision {

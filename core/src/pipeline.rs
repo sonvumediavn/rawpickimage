@@ -28,10 +28,13 @@ struct Cache {
     entries: HashMap<String, Analysis>,
 }
 
+/// Bump when the analysis measures something new, so cached results are redone once.
+const ANALYSIS_VERSION: u32 = 2;
+
 fn cache_key(p: &Path) -> Option<String> {
     let m = std::fs::metadata(p).ok()?;
     let t = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
-    Some(format!("{}|{}|{}", p.display(), m.len(), t))
+    Some(format!("v{ANALYSIS_VERSION}|{}|{}|{}", p.display(), m.len(), t))
 }
 
 /// Working folder for one source folder inside the app's data folder.
@@ -103,6 +106,7 @@ pub fn analyze_all(source: &Path, recursive: bool, analyzer: &Analyzer, work: Op
     });
     if let Some(f) = cache_file {
         let mut c = cache;
+        c.entries.retain(|k, _| k.starts_with(&format!("v{ANALYSIS_VERSION}|")));
         for it in &items {
             if let (Some(a), Some(k)) = (&it.analysis, cache_key(&it.path)) {
                 c.entries.insert(k, a.clone());
@@ -144,7 +148,7 @@ pub fn training_samples(items: &[Item], verdicts: &[Verdict]) -> Vec<Sample> {
         .zip(verdicts)
         .filter_map(|(it, v)| {
             let a = it.analysis.as_ref()?;
-            Some(Sample { name: it.path.display().to_string(), f: learn::features(a).to_vec(), keep: v.decision.keep(), ai_keep: v.ai_decision.keep() })
+            Some(Sample { name: it.path.display().to_string(), f: learn::features(a).to_vec(), keep: v.decision.keep(), ai_keep: v.ai_decision.keep(), manual: v.overridden })
         })
         .collect()
 }

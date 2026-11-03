@@ -66,10 +66,17 @@ Cần đo lại trên máy Windows cũ của Sơn với thư mục RAW thật.
 
 ## AI học theo cách bạn chọn
 
-Mỗi lần xuất thư mục, ứng dụng ghi lại ảnh nào bạn giữ, ảnh nào bỏ (kể cả những ảnh bạn sửa tay) vào
-hồ sơ của **loại sự kiện** đang chọn (Cưới, Hội nghị, Sân khấu…). Đủ 40 ảnh có cả giữ và bỏ, AI bắt
-đầu điều chỉnh điểm theo gu của bạn và cho biết nó đã học được gì, đồng ý với bạn bao nhiêu phần trăm.
-Mọi thứ nằm trên máy, không gửi đi đâu.
+Mỗi lần bạn bấm **Chọn (P)** hoặc **Loại (X)** trên một ảnh, AI học ngay lựa chọn đó vào hồ sơ của
+**loại sự kiện** đang chọn (Cưới, Hội nghị, Sân khấu…) và chấm lại cả thư mục. Đủ 20 lựa chọn (ít nhất
+5 giữ, 5 bỏ) là AI bắt đầu chấm theo gu của bạn. Lựa chọn bằng tay được tính nặng gấp 3 ảnh để AI tự
+quyết; càng nhiều lựa chọn và AI càng tái hiện đúng thì gu của bạn càng chiếm nhiều phần điểm (tới 85%),
+và có thể giữ lại cả những ảnh mà luật cứng định loại (trừ mắt nhắm của nhân vật chính, ảnh mờ, ảnh hỏng,
+ảnh trùng). Mỗi lần xuất, AI cũng học từ toàn bộ thư mục.
+
+AI học từ: phơi sáng, độ nét, bố cục, vị trí và cỡ nhân vật chính, chủ thể sát mép, màu, nhiễu, mắt,
+**khẩu hình miệng** (đang nói, há miệng), **góc mặt nghiêng**, số người, độ sáng tổng. Mặt nghiêng không
+bị trừ điểm sẵn: AI theo gu của bạn. Ảnh đông người chỉ xét mắt của 2 người chính; mặt người đủ sáng thì
+vùng cháy sáng ở nền (màn chiếu, đèn) chỉ bị trừ nhẹ. Mọi thứ nằm trên máy, không gửi đi đâu.
 
 ## Các tuỳ chọn
 

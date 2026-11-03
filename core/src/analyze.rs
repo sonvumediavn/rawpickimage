@@ -96,7 +96,7 @@ impl Analyzer {
         let g640 = Gray::from_rgb(&a640);
         let ghi = Gray::from_rgb(&hi);
 
-        let exposure = metrics::exposure(&g640);
+        let mut exposure = metrics::exposure(&g640);
         let sig_hi = metrics::noise_sigma(&ghi);
         // Downscaling averages noise away roughly in proportion to the scale factor.
         let sig_native = sig_hi / pv.scale.max(0.05);
@@ -106,8 +106,9 @@ impl Analyzer {
         let mut comp = metrics::composition(&a640, &g640);
         let signature = metrics::signature(&a640, &g640);
 
-        // Pass 2 (faces) only for photos that are not already ruined.
-        let ruined = sharp.score < 2.5 || exposure.score < 1.5;
+        // Pass 2 (faces) only for photos that are not already ruined. Exposure doesn't count:
+        // a blown projector screen behind a well-lit speaker is a normal event photo.
+        let ruined = sharp.score < 2.5;
         let mut people = People::default();
         let mut faces_checked = false;
         #[cfg(feature = "faces")]
@@ -118,6 +119,7 @@ impl Analyzer {
             }
         }
         let _ = ruined;
+        subject_exposure(&mut exposure, &people);
         if let Some((ex, ey)) = people.eye_center {
             // With people in frame, the subject is their eyes.
             let (p3, pc, pos) = metrics::placement(ex, ey);
@@ -188,6 +190,27 @@ impl Analyzer {
             signature,
             thumb,
         })
+    }
+}
+
+/// Judge exposure on the people when there are any: blown screens, stage lights and windows
+/// behind a well-exposed face are part of the event, not a mistake.
+fn subject_exposure(e: &mut metrics::Exposure, p: &People) {
+    let main: Vec<&faces::FaceInfo> = p.faces.iter().filter(|f| f.main && !f.small).collect();
+    if main.is_empty() {
+        return;
+    }
+    let lum = main.iter().map(|f| f.lum).sum::<f32>() / main.len() as f32;
+    if !(70.0..=205.0).contains(&lum) {
+        return;
+    }
+    // 10 at a mid-tone face, ~6.5 at the edges of the good range.
+    let face_score = 10.0 - ((lum - 135.0).abs() / 70.0).powi(2) * 3.5;
+    let blended = 0.25 * e.score + 0.75 * face_score;
+    if blended > e.score + 0.2 {
+        e.score = blended.clamp(0.0, 10.0);
+        e.notes.retain(|n| !n.starts_with("Phơi sáng cân đối"));
+        e.notes.insert(0, "Mặt người đủ sáng; vùng cháy sáng nằm ở nền (màn chiếu, đèn, cửa sổ) nên chỉ trừ nhẹ".into());
     }
 }
 

@@ -231,8 +231,10 @@ function renderProfile(p) {
   sel.innerHTML = st.info.profiles.map((n) => `<option ${n === st.prefs.profile ? "selected" : ""}>${esc(n)}</option>`).join("");
   const pct = (v) => (v == null ? "—" : Math.round(v * 100) + "%");
   $("profileBox").innerHTML = p.ready
-    ? `Đã học từ <b>${p.samples}</b> ảnh · AI đồng ý với bạn <b>${pct(p.agreement)}</b> · tái hiện đúng <b>${pct(p.accuracy)}</b> lựa chọn<ul>${p.explain.map((e) => `<li>${esc(e)}</li>`).join("")}</ul>`
-    : `Chưa đủ dữ liệu: <b>${p.samples}</b> / ${p.min_samples} ảnh. Mỗi lần xuất thư mục, AI học từ những ảnh bạn giữ hoặc bỏ.`;
+    ? `Đã học từ <b>${p.samples}</b> ảnh (<b>${p.manual || 0}</b> ảnh bạn tự chọn) · tái hiện đúng <b>${pct(p.accuracy)}</b> lựa chọn của bạn · gu của bạn chiếm <b>${pct(p.trust)}</b> điểm<ul>${p.explain.map((e) => `<li>${esc(e)}</li>`).join("")}</ul>
+       <p class="note">Thấy AI chọn sai thì bấm Chọn (P) hoặc Loại (X): AI học ngay từng lần bấm.</p>`
+    : `Đang học gu của bạn: <b>${p.samples}</b> / ${p.min_samples} lựa chọn (cần cả ảnh giữ lẫn ảnh bỏ).
+       <p class="note">Mở ảnh AI chọn sai, bấm Chọn (P) hoặc Loại (X). Mỗi lần bấm AI học ngay, đủ ${p.min_samples} lần là bắt đầu chấm theo gu bạn.</p>`;
   $("btnTrain").disabled = !(st.session && meta()?.phase === "ready");
 }
 
@@ -500,6 +502,7 @@ function wireIn() {
 // ---------------------------------------------------------------- results
 
 function applyVerdicts(v) {
+  if (v.profile) renderProfile(v.profile);
   st.verdicts = v.verdicts;
   st.summary = v.summary;
   if (st.session) { st.session.verdicts = v.verdicts; st.session.summary = v.summary; }
