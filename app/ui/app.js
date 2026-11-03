@@ -163,6 +163,7 @@ function renderRules() {
   $("optAuto").checked = s.options.auto_apply;
   $("expReview").checked = st.prefs.export.copy_review;
   $("expRejected").checked = st.prefs.export.copy_rejected;
+  $("expReport").checked = st.prefs.export.report;
   renderExpMode();
 }
 
@@ -275,6 +276,7 @@ function wireRail() {
   $("optAuto").onchange = () => { st.prefs.settings.options.auto_apply = $("optAuto").checked; savePrefs(); };
   $("expReview").onchange = () => { st.prefs.export.copy_review = $("expReview").checked; savePrefs(); };
   $("expRejected").onchange = () => { st.prefs.export.copy_rejected = $("expRejected").checked; savePrefs(); };
+  $("expReport").onchange = () => { st.prefs.export.report = $("expReport").checked; savePrefs(); };
   for (const b of $("expMode").children) {
     b.onclick = () => { st.prefs.export.move_files = b.dataset.m === "move"; renderExpMode(); savePrefs(); };
   }
@@ -699,6 +701,34 @@ async function renderDetail() {
 const zoom = { idx: -1, s: 1, tx: 0, ty: 0, bw: 1, bh: 1, full: false, fullLoading: null, drag: null, seq: 0 };
 const Z_MAX = 8;
 
+/** Large previews already made (and warmed in the browser), by session and photo. */
+const bigCache = new Map();
+
+function bigPreview(i) {
+  const key = `${st.sid}:${i}`;
+  if (!bigCache.has(key)) {
+    const pr = invoke("big_preview", { id: st.sid, idx: i }).then((src) => {
+      const url = fileSrc(src);
+      const im = new Image();
+      im.src = url;
+      return (im.decode ? im.decode() : Promise.resolve()).then(() => url, () => url);
+    });
+    pr.catch(() => bigCache.delete(key));
+    bigCache.set(key, pr);
+    if (bigCache.size > 60) bigCache.delete(bigCache.keys().next().value);
+  }
+  return bigCache.get(key);
+}
+
+/** Get the photos on either side ready, so stepping through never waits. */
+function prefetchAround(i) {
+  const pos = st.view.indexOf(i);
+  for (const d of [1, -1, 2]) {
+    const n = st.view[pos + d];
+    if (n != null && !st.session.photos[n].error) bigPreview(n).catch(() => {});
+  }
+}
+
 function loadPhoto(i) {
   const p = st.session.photos[i];
   const img = $("dimg");
@@ -706,11 +736,26 @@ function loadPhoto(i) {
   zoom.full = false;
   zoom.fullLoading = null;
   const seq = ++zoom.seq;
-  zoomTo(1, null);
-  img.src = p.thumb ? fileSrc(p.thumb) : "";
-  if (!p.error) {
-    invoke("big_preview", { id: st.sid, idx: i }).then((src) => { if (zoom.seq === seq && !zoom.full) img.src = fileSrc(src); }).catch(() => {});
+  zoomTo(1, null); // the frame already has the photo's fitted size, whatever is drawn in it
+  if (p.error) {
+    img.src = p.thumb ? fileSrc(p.thumb) : "";
+    return;
   }
+  const big = bigPreview(i);
+  let shown = false;
+  big.then((url) => { if (zoom.seq === seq && !zoom.full) { shown = true; img.src = url; } prefetchAround(i); }).catch(() => {});
+  // Ready in a moment? Skip the thumbnail flash; otherwise show it stretched to size meanwhile.
+  setTimeout(() => { if (!shown && zoom.seq === seq && p.thumb) img.src = fileSrc(p.thumb); }, 60);
+}
+
+/** Size of the photo fitted into the viewer, from its real proportions. */
+function fitSize() {
+  const stage = $("dstage"), img = $("dimg");
+  const p = zoom.idx >= 0 ? st.session.photos[zoom.idx] : null;
+  const aw = Math.max(1, stage.clientWidth - 20), ah = Math.max(1, stage.clientHeight - 20);
+  const ratio = p && p.width && p.height ? p.width / p.height : (img.naturalWidth || 3) / (img.naturalHeight || 2);
+  const w = Math.min(aw, ah * ratio);
+  return [Math.round(w), Math.round(w / ratio)];
 }
 
 /** Load the preview at its native size once the user zooms past the 2560 px version. */
@@ -759,8 +804,10 @@ function showZoom() {
     f.style.cssText = `position:absolute;left:0;top:0;width:${w}px;height:${h}px;max-width:none;max-height:none;transform:translate(${Math.round(zoom.tx)}px,${Math.round(zoom.ty)}px)`;
     img.style.cssText = "width:100%;height:100%;max-width:none;max-height:none";
   } else {
-    f.style.cssText = "";
-    img.style.cssText = "";
+    // Always the full fitted size, even while only the small thumbnail is loaded.
+    const [w, h] = fitSize();
+    f.style.cssText = `width:${w}px;height:${h}px;max-width:none;max-height:none`;
+    img.style.cssText = "width:100%;height:100%;max-width:none;max-height:none";
   }
   f.style.setProperty("--zs", 1);
   $("dstage").classList.toggle("zoomed", zoomed);

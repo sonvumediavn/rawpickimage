@@ -213,7 +213,7 @@ pub fn collect(dir: &Path, recursive: bool) -> std::io::Result<Vec<(PathBuf, Vec
             let ft = e.file_type()?;
             if ft.is_dir() {
                 // Never re-scan our own output.
-                if recursive && !name.ends_with("_da-loc") {
+                if recursive && !name.ends_with("_da-loc") && !name.ends_with(" - Anh chon") {
                     stack.push(p);
                 }
             } else {

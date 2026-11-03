@@ -1,6 +1,6 @@
-//! Writing the result: copy every shot (RAW + JPEG twin + XMP) into
-//! `<event>_da-loc/1_Da-chon`, `2_Can-xem-lai`, `3_Bi-loai/<reason>` and a report.
-//! Originals are never moved or deleted; each copy is verified with CRC32.
+//! Writing the result: the chosen shots (RAW + JPEG twin + XMP, byte for byte) go straight into
+//! `<event> - Anh chon/`; on request also `Can-xem-lai/`, `Bi-loai/<reason>/` and a report.
+//! Each copy is verified with CRC32; originals are only removed in move mode, after that check.
 
 use crate::analyze::Analysis;
 use crate::cull::{self, Decision, Verdict};
@@ -15,10 +15,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ExportOptions {
-    /// Also copy rejected photos into `3_Bi-loai` (otherwise only listed in the report).
+    /// Also copy rejected photos into `Bi-loai/<reason>`.
     pub copy_rejected: bool,
+    /// Also copy «Cần xem lại» photos into `Can-xem-lai`.
     pub copy_review: bool,
-    /// Write the shoot summary (`tong-ket.txt`).
+    /// Write `bao-cao.csv` and the shoot summary `tong-ket.txt`.
     pub report: bool,
     /// Move instead of copy: each original is removed only after its new copy is verified
     /// (or renamed in one step when source and destination are on the same drive).
@@ -27,7 +28,8 @@ pub struct ExportOptions {
 
 impl Default for ExportOptions {
     fn default() -> Self {
-        Self { copy_rejected: true, copy_review: true, report: true, move_files: false }
+        // Sơn's call (2026-11-03): only the chosen photos, no report files.
+        Self { copy_rejected: false, copy_review: false, report: false, move_files: false }
     }
 }
 
@@ -41,10 +43,24 @@ pub struct ExportReport {
     pub errors: Vec<String>,
 }
 
-/// Default output folder: next to the source folder, `<name>_da-loc`.
+/// Name of the export folder: the source folder's name plus « - Anh chon».
+pub fn out_name(source: &Path) -> String {
+    let name = source.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Anh".into());
+    format!("{name} - Anh chon")
+}
+
+/// Default output folder: next to the source folder.
 pub fn default_out_dir(source: &Path) -> PathBuf {
-    let name = source.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "anh".into());
-    source.parent().unwrap_or(source).join(format!("{name}_da-loc"))
+    source.parent().unwrap_or(source).join(out_name(source))
+}
+
+/// Where a shot goes inside the export folder: chosen ones at the top.
+fn sub_folder(d: Decision) -> PathBuf {
+    match d {
+        Decision::Selected => PathBuf::new(),
+        Decision::Review => PathBuf::from("Can-xem-lai"),
+        Decision::Rejected(r) => Path::new("Bi-loai").join(r.folder()),
+    }
 }
 
 pub fn crc_file(p: &Path) -> std::io::Result<(u32, u64)> {
@@ -195,7 +211,7 @@ pub fn export(
         if !wanted {
             continue;
         }
-        let folder = out_dir.join(d.folder()).join(&e.rel_dir);
+        let folder = out_dir.join(sub_folder(d)).join(&e.rel_dir);
         for f in e.files {
             let name = f.file_name().unwrap_or_default();
             let mut dst = folder.join(name);
@@ -245,8 +261,8 @@ pub fn export(
         }
     }
     progress(total, total);
-    write_csv(entries, &out_dir.join("bao-cao.csv"))?;
     if opts.report {
+        write_csv(entries, &out_dir.join("bao-cao.csv"))?;
         std::fs::write(out_dir.join("tong-ket.txt"), summary_text(entries, &rep))?;
     }
     Ok(rep)
@@ -388,15 +404,22 @@ mod tests {
             Entry { files: &fb, analysis: None, verdict: &vb, rel_dir: PathBuf::new() },
         ];
         let out = default_out_dir(&src);
+        // Default: only the chosen shot, straight into «Su-kien - Anh chon», no report files.
         let rep = export(&entries, &out, &ExportOptions::default(), &|_, _| {}, &AtomicBool::new(false)).unwrap();
-        assert_eq!(rep.copied, 3, "{:?}", rep.errors);
-        assert!(out.join("1_Da-chon/IMG_1.CR3").exists() && out.join("1_Da-chon/IMG_1.JPG").exists());
-        assert_eq!(std::fs::read(out.join("3_Bi-loai/Nham-mat/IMG_2.JPG")).unwrap(), b"other");
+        assert_eq!(rep.copied, 2, "{:?}", rep.errors);
+        assert!(out.ends_with("Su-kien - Anh chon"));
+        assert_eq!(std::fs::read(out.join("IMG_1.CR3")).unwrap(), b"raw-bytes");
+        assert!(out.join("IMG_1.JPG").exists() && !out.join("IMG_2.JPG").exists());
+        assert!(!out.join("bao-cao.csv").exists() && !out.join("tong-ket.txt").exists() && !out.join("Bi-loai").exists());
+        let all = ExportOptions { copy_rejected: true, copy_review: true, report: true, move_files: false };
+        let rep = export(&entries, &out, &all, &|_, _| {}, &AtomicBool::new(false)).unwrap();
+        assert_eq!((rep.copied, rep.skipped_same), (1, 2), "{:?}", rep.errors);
+        assert_eq!(std::fs::read(out.join("Bi-loai/Nham-mat/IMG_2.JPG")).unwrap(), b"other");
         assert!(a.exists() && b.exists(), "originals stay");
         let csv = std::fs::read_to_string(out.join("bao-cao.csv")).unwrap();
         assert!(csv.starts_with('\u{feff}') && csv.contains("\"ghi chú, có dấu phẩy\""));
         // Running again skips identical files.
-        let rep2 = export(&entries, &out, &ExportOptions::default(), &|_, _| {}, &AtomicBool::new(false)).unwrap();
+        let rep2 = export(&entries, &out, &all, &|_, _| {}, &AtomicBool::new(false)).unwrap();
         assert_eq!((rep2.copied, rep2.skipped_same), (0, 3));
     }
 
@@ -416,6 +439,6 @@ mod tests {
         let rep = export(&entries, &out, &opts, &|_, _| {}, &AtomicBool::new(false)).unwrap();
         assert_eq!(rep.moved, 1, "{:?}", rep.errors);
         assert!(!a.exists());
-        assert_eq!(std::fs::read(out.join("1_Da-chon/DSC_1.NEF")).unwrap(), raw);
+        assert_eq!(std::fs::read(out.join("DSC_1.NEF")).unwrap(), raw);
     }
 }

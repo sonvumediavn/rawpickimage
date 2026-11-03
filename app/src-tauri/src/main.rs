@@ -32,11 +32,28 @@ struct Prefs {
     profile: String,
     recursive: bool,
     preset: String,
+    /// Settings revision, to apply changed defaults once to saved settings.
+    rev: u32,
+}
+
+/// 1: export only the chosen photos, without report files (Sơn, 2026-11-03).
+const PREFS_REV: u32 = 1;
+
+impl Prefs {
+    fn upgrade(mut self) -> Self {
+        if self.rev < 1 {
+            self.export.copy_rejected = false;
+            self.export.copy_review = false;
+            self.export.report = false;
+        }
+        self.rev = PREFS_REV;
+        self
+    }
 }
 
 impl Default for Prefs {
     fn default() -> Self {
-        Self { settings: Settings::default(), export: ExportOptions::default(), profile: "Sự kiện chung".into(), recursive: true, preset: "event".into() }
+        Self { settings: Settings::default(), export: ExportOptions::default(), profile: "Sự kiện chung".into(), recursive: true, preset: "event".into(), rev: PREFS_REV }
     }
 }
 
@@ -566,10 +583,10 @@ fn op_export_target(app: &Arc<App>, id: u32, parent: String) -> Result<String, S
     let map = app.sessions.lock().unwrap();
     let s = map.get(&id).ok_or("Phiên đã đóng")?;
     let src = s.source.as_ref().ok_or("Phiên chưa có thư mục")?;
-    Ok(Path::new(&parent).join(format!("{}_da-loc", folder_name(src))).display().to_string())
+    Ok(Path::new(&parent).join(rawpick_core::export::out_name(src)).display().to_string())
 }
 
-/// Export into `<parent>/<folder name>_da-loc`, `parent` chosen by Sơn.
+/// Export into `<parent>/<folder name> - Anh chon`, `parent` chosen by Sơn.
 fn op_export_folder(app: &Arc<App>, id: u32, parent: String) -> Result<ExportResult, String> {
     let app = app.clone();
     (move || {
@@ -591,7 +608,7 @@ fn op_export_folder(app: &Arc<App>, id: u32, parent: String) -> Result<ExportRes
             (s.source.clone().unwrap(), s.items.clone(), s.verdicts.clone(), opts, s.prefs.profile.clone(), s.cancel.clone())
         };
         sessions_changed(&app);
-        let out = parent.join(format!("{}_da-loc", folder_name(&source)));
+        let out = parent.join(rawpick_core::export::out_name(&source));
         let on_step = emitter(&app, Some(id));
         let p = Progress { on_step: &on_step, cancel: &cancel };
         let res = pipeline::export_all(&source, &items, &verdicts, &out, &opts, &p).map_err(|e| format!("{e:#}"));
@@ -999,11 +1016,12 @@ fn main() {
         .setup(|app| {
             let data_dir = app.path().app_local_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
-            let global: Global = std::fs::read(data_dir.join("settings.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+            let mut global: Global = std::fs::read(data_dir.join("settings.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+            global.prefs = global.prefs.upgrade();
             let saved: Vec<SavedSession> = std::fs::read(data_dir.join("sessions.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
             let mut sessions = BTreeMap::new();
             for s in saved {
-                let mut x = Session::new(s.id, s.prefs);
+                let mut x = Session::new(s.id, s.prefs.upgrade());
                 x.name = s.name;
                 x.source = s.source;
                 x.overrides = s.overrides;

@@ -21,19 +21,20 @@ toàn bằng CPU, không cần card đồ hoạ, không gửi ảnh đi đâu.
 5. Lấy ảnh ra theo một trong hai cách:
    - **Gom ảnh đã chọn vào thư mục con…**: chuyển ảnh đã chọn vào một thư mục con ngay trong thư mục gốc
      (ví dụ `Anh-da-chon/`). Chỉ đổi chỗ file, không chép lại, xong ngay.
-   - **Xuất ảnh ra thư mục…**: chọn thư mục đích trên máy, ứng dụng tạo `Ten-su-kien_da-loc` bên trong.
+   - **Xuất ảnh ra thư mục…**: chọn thư mục đích trên máy, ứng dụng tạo thư mục cùng tên thư mục ảnh
+     thêm chữ `- Anh chon` (ví dụ `261103_khai giang tesol - Anh chon`) và để ảnh đã chọn ngay trong đó.
      Chọn **Chép** (giữ ảnh gốc) hoặc **Chuyển** (bản gốc chỉ bị xoá sau khi bản mới đã kiểm tra khớp).
 
 ```
-Ten-su-kien_da-loc/
-  1_Da-chon/
-  2_Can-xem-lai/        (nếu bật)
-  3_Bi-loai/            (nếu bật)
-    Nham-mat/  Mo-net/  Chay-sang/  Thieu-sang/  Nghieng/
-    Bo-cuc/    Nhieu/   Trung-lap/  Mat-loi/     Diem-thap/
-  bao-cao.csv      (mở bằng Excel: điểm, lý do, gợi ý sửa từng ảnh)
-  tong-ket.txt     (thống kê buổi chụp, theo từng máy)
+Ten-su-kien - Anh chon/
+  (ảnh đã chọn, giữ nguyên tên, định dạng và thư mục con của máy ảnh)
+  Can-xem-lai/          (chỉ khi bật «Gồm cả ảnh Cần xem lại»)
+  Bi-loai/              (chỉ khi bật «Gồm cả ảnh bị loại»)
+    Nham-mat/  Mo-net/  Chay-sang/  Thieu-sang/  Nghieng/ ...
+  bao-cao.csv, tong-ket.txt   (chỉ khi bật «Kèm file báo cáo»)
 ```
+
+Mặc định chỉ xuất ảnh đã chọn, không kèm ảnh bị loại hay file báo cáo.
 
 **Chất lượng ảnh giữ nguyên tuyệt đối**: file RAW, JPEG cùng tên và `.xmp` được chép hoặc chuyển nguyên
 bản từng byte, không nén lại, không chuyển định dạng. Ảnh hiện trong ứng dụng chỉ là bản xem nhanh.
