@@ -1,5 +1,5 @@
 //! Writing the result: the chosen shots (RAW + JPEG twin + XMP, byte for byte) go straight into
-//! `<event> - Anh chon/`; on request also `Can-xem-lai/`, `Bi-loai/<reason>/` and a report.
+//! `<event>_anh chon/` inside the event folder; on request also `Can-xem-lai/`, `Bi-loai/<reason>/` and a report.
 //! Each copy is verified with CRC32; originals are only removed in move mode, after that check.
 
 use crate::analyze::Analysis;
@@ -43,15 +43,18 @@ pub struct ExportReport {
     pub errors: Vec<String>,
 }
 
-/// Name of the export folder: the source folder's name plus « - Anh chon».
+/// Suffix of the export folder, Sơn's naming (2026-11-04): «261104_van nghe cong doan_anh chon».
+pub const OUT_SUFFIX: &str = "_anh chon";
+
+/// Name of the export folder: the source folder's name plus «_anh chon».
 pub fn out_name(source: &Path) -> String {
     let name = source.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Anh".into());
-    format!("{name} - Anh chon")
+    format!("{name}{OUT_SUFFIX}")
 }
 
-/// Default output folder: next to the source folder.
+/// Default output folder: inside the source folder, where the show is archived.
 pub fn default_out_dir(source: &Path) -> PathBuf {
-    source.parent().unwrap_or(source).join(out_name(source))
+    source.join(out_name(source))
 }
 
 /// Where a shot goes inside the export folder: chosen ones at the top.
@@ -404,10 +407,10 @@ mod tests {
             Entry { files: &fb, analysis: None, verdict: &vb, rel_dir: PathBuf::new() },
         ];
         let out = default_out_dir(&src);
-        // Default: only the chosen shot, straight into «Su-kien - Anh chon», no report files.
+        // Default: only the chosen shot, straight into «Su-kien/Su-kien_anh chon», no report files.
         let rep = export(&entries, &out, &ExportOptions::default(), &|_, _| {}, &AtomicBool::new(false)).unwrap();
         assert_eq!(rep.copied, 2, "{:?}", rep.errors);
-        assert!(out.ends_with("Su-kien - Anh chon"));
+        assert!(out.ends_with("Su-kien/Su-kien_anh chon"));
         assert_eq!(std::fs::read(out.join("IMG_1.CR3")).unwrap(), b"raw-bytes");
         assert!(out.join("IMG_1.JPG").exists() && !out.join("IMG_2.JPG").exists());
         assert!(!out.join("bao-cao.csv").exists() && !out.join("tong-ket.txt").exists() && !out.join("Bi-loai").exists());

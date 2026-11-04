@@ -52,7 +52,7 @@ function esc(s) {
  * confirm() and prompt(), so every question goes through this.
  * With `value` it asks for text and resolves to the text (or null); otherwise to true/false.
  */
-function ask(text, { value = null, ok = "Đồng ý", title = "" } = {}) {
+function ask(text, { value = null, ok = "Đồng ý", title = "", cancel = "Huỷ" } = {}) {
   return new Promise((resolve) => {
     const wrap = document.createElement("div");
     wrap.className = "modal ask";
@@ -61,7 +61,7 @@ function ask(text, { value = null, ok = "Đồng ý", title = "" } = {}) {
       ${title ? `<h3>${esc(title)}</h3>` : ""}
       <p class="asktext">${esc(text)}</p>
       ${withInput ? `<input class="askin" spellcheck="false" aria-label="${esc(title || text)}">` : ""}
-      <div class="row2 end"><button type="button" class="btn" data-no>Huỷ</button><button type="submit" class="btn primary">${esc(ok)}</button></div>
+      <div class="row2 end"><button type="button" class="btn" data-no>${esc(cancel)}</button><button type="submit" class="btn primary">${esc(ok)}</button></div>
     </form>`;
     const input = wrap.querySelector(".askin");
     if (input) input.value = value;
@@ -78,9 +78,12 @@ function ask(text, { value = null, ok = "Đồng ý", title = "" } = {}) {
 }
 function cls(v) { return v >= 7.5 ? "hi" : v >= 5 ? "mid" : "lo"; }
 function decKind(d) { return d.kind; }
+/** AI picking switched off: nothing is chosen until Sơn chooses. */
+const aiOff = () => st.prefs && st.prefs.settings.options.ai_pick === false;
+
 function decLabel(d) {
   if (d.kind === "selected") return "Đã chọn";
-  if (d.kind === "review") return "Cần xem lại";
+  if (d.kind === "review") return aiOff() ? "Chưa chọn" : "Cần xem lại";
   return "Bị loại: " + (REASONS[d.reason] || d.reason);
 }
 function fmtTime(t) {
@@ -232,7 +235,7 @@ function renderProfile(p) {
   sel.innerHTML = st.info.profiles.map((n) => `<option ${n === st.prefs.profile ? "selected" : ""}>${esc(n)}</option>`).join("");
   const pct = (v) => (v == null ? "—" : Math.round(v * 100) + "%");
   $("profileBox").innerHTML = p.ready
-    ? `Đã học từ <b>${p.samples}</b> ảnh (<b>${p.manual || 0}</b> ảnh bạn tự chọn) · tái hiện đúng <b>${pct(p.accuracy)}</b> lựa chọn của bạn · gu của bạn chiếm <b>${pct(p.trust)}</b> điểm<ul>${p.explain.map((e) => `<li>${esc(e)}</li>`).join("")}</ul>
+    ? `Đã học từ <b>${p.samples}</b> ảnh (<b>${p.manual || 0}</b> ảnh bạn tự chọn${p.seen ? `, nhìn hình <b>${p.seen}</b> ảnh` : ""}) · tái hiện đúng <b>${pct(p.accuracy)}</b> lựa chọn của bạn · gu của bạn chiếm <b>${pct(p.trust)}</b> điểm${p.shared ? " · học chung với máy khác" : ""}<ul>${p.explain.map((e) => `<li>${esc(e)}</li>`).join("")}</ul>
        <p class="note">Thấy AI chọn sai thì bấm Chọn (P) hoặc Loại (X): AI học ngay từng lần bấm.</p>`
     : `Đang học gu của bạn: <b>${p.samples}</b> / ${p.min_samples} lựa chọn (cần cả ảnh giữ lẫn ảnh bỏ).
        <p class="note">Mở ảnh AI chọn sai, bấm Chọn (P) hoặc Loại (X). Mỗi lần bấm AI học ngay, đủ ${p.min_samples} lần là bắt đầu chấm theo gu bạn.</p>`;
@@ -391,8 +394,15 @@ function renderMain() {
     st.session = null;
   }
   $("btnExport").disabled = m.phase !== "ready";
-  $("btnGather").disabled = m.phase !== "ready";
+  $("btnExportOther").disabled = m.phase !== "ready";
   $("btnTrain").disabled = m.phase !== "ready";
+  renderAiSwitch();
+}
+
+function renderAiSwitch() {
+  $("optAiPick").checked = !aiOff();
+  const t = [...$("tabs").children].find((b) => b.dataset.t === "review");
+  if (t) t.textContent = aiOff() ? "Chưa chọn" : "Cần xem lại";
 }
 
 function renderProgress() {
@@ -519,7 +529,7 @@ function renderSummary() {
   const secs = t.seconds < 60 ? `${t.seconds.toFixed(1)} giây` : `${(t.seconds / 60).toFixed(1)} phút`;
   $("summary").innerHTML = `
     <div class="stat pick"><b>${s.selected}</b><span>đã chọn</span></div>
-    <div class="stat"><b>${s.review}</b><span>cần xem lại</span></div>
+    <div class="stat"><b>${s.review}</b><span>${aiOff() ? "chưa chọn" : "cần xem lại"}</span></div>
     <div class="stat"><b>${s.rejected}</b><span>bị loại</span></div>
     <div class="stat"><b>${s.total}</b><span>ảnh${s.moments > 1 ? ` · ${s.moments} khoảnh khắc` : ""}</span></div>
     <p class="meta">${esc(st.session.meta.source)} · phân tích trong ${secs} (${Math.round(t.per_photo_ms)} ms/ảnh${t.from_cache ? `, ${t.from_cache} ảnh lấy lại từ lần trước` : ""})</p>`;
@@ -538,6 +548,7 @@ function topWhy(p, v) {
   if (p.error) return p.error;
   if (v.decision.kind === "rejected") return v.notes.find((n) => !n.startsWith("Điểm bị giới hạn")) || REASONS[v.decision.reason];
   if (v.fixes.length) return "Sửa: " + v.fixes[0];
+  if (v.decision.kind === "review" && aiOff() && !v.overridden) return v.ai_decision.kind === "selected" ? "AI gợi ý: chọn" : v.ai_decision.kind === "rejected" ? "AI gợi ý: loại · " + (REASONS[v.ai_decision.reason] || "") : "AI gợi ý: xem lại";
   if (v.decision.kind === "review") return v.notes[0] || "Gần ngưỡng chọn";
   return v.notes[0] || (p.camera ? p.camera : "");
 }
@@ -582,8 +593,133 @@ function wireResults() {
   }
   $("reasonSel").onchange = () => { st.reason = $("reasonSel").value; if (st.reason) { st.tab = "all"; for (const x of $("tabs").children) x.setAttribute("aria-pressed", String(x.dataset.t === "all")); } renderGrid(); };
   $("sortSel").onchange = () => { st.sort = $("sortSel").value; renderGrid(); };
-  $("btnExport").onclick = doExport;
-  $("btnGather").onclick = doGather;
+  $("btnExport").onclick = doExportShow;
+  $("btnLearnShow").onclick = doLearnShow;
+  $("btnExportOther").onclick = doExport;
+  $("optAiPick").onchange = () => {
+    st.prefs.settings.options.ai_pick = $("optAiPick").checked;
+    renderAiSwitch();
+    savePrefs();
+    toast($("optAiPick").checked ? "AI tự chọn lại ảnh. Ảnh bạn đã chọn tay giữ nguyên." : "AI vẫn chấm điểm từng ảnh nhưng không chọn sẵn. Bạn tự chọn bằng phím P (chọn) và X (loại).", 7000);
+  };
+}
+
+/** One click (Sơn's flow): archive into «<source>_anh chon» inside the show, then copy to his Google Drive folder. */
+async function doExportShow() {
+  const id = st.sid, m = meta(id);
+  if (!m || m.phase !== "ready") return;
+  if (!st.summary.selected) return toast("Chưa có ảnh nào được chọn.");
+  if (!st.info.drive_dir) {
+    const ok = await ask("Chọn thư mục trên Google Drive để gửi ảnh cho khách. App sẽ nhớ thư mục này, lần sau xuất thẳng không hỏi lại.\n\nBấm «Để sau» nếu lần này chỉ lưu vào thư mục gốc.", { title: "Thư mục Google Drive", ok: "Chọn thư mục Drive", cancel: "Để sau" });
+    if (ok) await pickDriveDir();
+  }
+  m.phase = "exporting";
+  st.progress[id] = { done: 0, total: 0, stage: "Đang lưu ảnh chọn vào thư mục gốc" };
+  renderTabs();
+  renderMain();
+  try {
+    const r = await invoke("export_show", { id });
+    m.phase = "ready";
+    renderProfile(r.profile);
+    const rep = r.report;
+    let msg = `Đã lưu ${rep.copied + rep.moved + rep.skipped_same} file vào <a id="openArc">${esc(rep.out_dir)}</a>` + (rep.errors.length ? `, <b>${rep.errors.length} lỗi</b>: ${esc(rep.errors[0])}` : "") + ".";
+    if (r.drive) {
+      msg += `<br>Đã chép lên Google Drive, app Drive đang tải lên. `;
+      msg += r.drive.link
+        ? `Link: <a id="copyLink">${esc(r.drive.link)}</a> (đã chép, dán gửi khách được ngay).`
+        : `<a id="openDrive">Mở thư mục trên máy</a>, chuột phải vào thư mục → Google Drive → «Sao chép đường liên kết» để gửi khách.`;
+    } else if (r.drive_error) {
+      msg += `<br><b>Chưa lên Drive:</b> ${esc(r.drive_error)}`;
+    }
+    toast(msg, 30000);
+    const arc = document.getElementById("openArc");
+    if (arc) arc.onclick = () => T.opener.openPath(rep.out_dir);
+    if (r.drive && r.drive.link) {
+      try { await navigator.clipboard.writeText(r.drive.link); } catch (e) { /* clipboard blocked: the link is shown */ }
+      const a = document.getElementById("copyLink");
+      if (a) a.onclick = () => navigator.clipboard.writeText(r.drive.link).then(() => toast("Đã chép link."), () => {});
+    }
+    const od = document.getElementById("openDrive");
+    if (od && r.drive) od.onclick = () => T.opener.openPath(r.drive.dir.replace(/[\\/][^\\/]+[\\/]?$/, ""));
+  } catch (e) {
+    m.phase = "ready";
+    toast(esc(e));
+  }
+  st.metas = await invoke("list_sessions");
+  renderTabs();
+  renderMain();
+}
+
+async function pickDriveDir() {
+  const def = st.info.drive_dir || (st.info.drive_roots || [])[0];
+  const d = await T.dialog.open({ directory: true, multiple: false, title: "Chọn thư mục trên Google Drive để gửi ảnh cho khách", defaultPath: def || undefined });
+  if (!d) return false;
+  try {
+    st.info = Object.assign(st.info, await invoke("set_drive_dir", { path: d }));
+    renderDrive();
+    return true;
+  } catch (e) {
+    toast(esc(e));
+    return false;
+  }
+}
+
+function renderDrive() {
+  const d = st.info.drive_dir;
+  $("driveBox").innerHTML = d
+    ? `<span>Xuất xong chép lên Google Drive:</span><span class="path">${esc(d)}</span>
+       <span class="row"><button class="btn sm" id="driveChange">Đổi thư mục Drive</button><button class="btn sm" id="driveOff">Thôi chép lên Drive</button></span>`
+    : `<span>Chưa chọn thư mục Google Drive. Bấm «Xuất ảnh chọn» lần đầu app sẽ hỏi, hoặc chọn ngay:</span>
+       <span class="row"><button class="btn sm" id="driveChange">Chọn thư mục Drive…</button></span>`;
+  $("driveChange").onclick = pickDriveDir;
+  const off = document.getElementById("driveOff");
+  if (off) off.onclick = async () => { st.info = Object.assign(st.info, await invoke("set_drive_dir", { path: null })); renderDrive(); };
+}
+
+function renderSync() {
+  const d = st.info.sync_dir;
+  $("syncBox").innerHTML = d
+    ? `<span>Dùng chung điều AI đã học với máy khác qua:</span><span class="path">${esc(d)}</span>
+       <span class="row"><button class="btn sm" id="syncChange">Đổi thư mục</button><button class="btn sm" id="syncOff">Thôi dùng chung</button></span>`
+    : `<span>Làm trên cả máy Win và Mac? Chọn cùng một thư mục trên Google Drive ở mỗi máy để hai máy học chung.</span>
+       <span class="row"><button class="btn sm" id="syncChange">Chọn thư mục học chung…</button></span>`;
+  $("syncChange").onclick = async () => {
+    const def = st.info.sync_dir || (st.info.drive_roots || [])[0];
+    const dir = await T.dialog.open({ directory: true, multiple: false, title: "Thư mục trên Google Drive để các máy học chung (chọn cùng thư mục trên mọi máy)", defaultPath: def || undefined });
+    if (!dir) return;
+    try {
+      st.info = Object.assign(st.info, await invoke("set_sync_dir", { path: dir }));
+      renderSync();
+      renderProfile(await invoke("profile_info", { name: st.prefs.profile }));
+      toast("Đã bật học chung. Máy kia chọn cùng thư mục này là hai máy dùng chung điều AI đã học.", 9000);
+    } catch (e) {
+      toast(esc(e));
+    }
+  };
+  const off = document.getElementById("syncOff");
+  if (off) off.onclick = async () => { st.info = Object.assign(st.info, await invoke("set_sync_dir", { path: null })); renderSync(); };
+}
+
+async function doLearnShow() {
+  const dir = await T.dialog.open({ directory: true, multiple: false, title: "Chọn thư mục một show cũ bạn đã lọc xong" });
+  if (!dir) return;
+  busy(true, "Đang xem ảnh show cũ…");
+  try {
+    const r = await invoke("learn_show", { path: dir, name: st.prefs.profile });
+    busy(false);
+    renderProfile(r.profile);
+    const l = r.lesson;
+    toast(
+      l.only_picks
+        ? `Không thấy ảnh gốc trong thư mục này, nên app coi cả ${l.kept} ảnh là ảnh bạn đã chọn và học theo. Học thêm show có cả ảnh gốc để AI biết bạn hay bỏ ảnh kiểu nào.`
+        : `Đã học ${l.kept + l.dropped} ảnh của show: bạn chọn ${l.kept}, bỏ ${l.dropped}` + (l.pick_folders.length ? ` (ảnh chọn nằm ở ${l.pick_folders.map((f) => "«" + esc(f.split(/[\\/]/).pop()) + "»").join(", ")})` : "") + `. AI áp dụng ngay cho loại sự kiện «${esc(st.prefs.profile)}».`,
+      15000
+    );
+    if (st.sid) { const v = await invoke("get_session", { id: st.sid }).catch(() => null); if (v) { st.views[st.sid] = v; st.session = null; renderMain(); } }
+  } catch (e) {
+    busy(false);
+    toast(esc(e));
+  }
 }
 
 async function doExport() {
@@ -684,7 +820,9 @@ async function renderDetail() {
     if (f.issues.length) d.innerHTML = `<span>${esc(f.issues[0])}</span>`;
     frame.appendChild(d);
   }
-  const ai = v.overridden ? ` <span class="note">(AI: ${esc(decLabel(v.ai_decision))})</span>` : "";
+  const ai = v.overridden || (aiOff() && v.ai_decision.kind !== "review")
+    ? ` <span class="note">(AI ${v.overridden ? "" : "gợi ý "}: ${esc(aiOff() && v.ai_decision.kind === "review" ? "Cần xem lại" : decLabel(v.ai_decision))})</span>`
+    : "";
   $("dscore").innerHTML = `<b class="${cls(v.score)}">${v.score.toFixed(1)}</b><span class="verdict">${esc(decLabel(v.decision))}${ai}</span>
     <ul>${v.notes.map((n) => `<li>${esc(n)}</li>`).join("")}${v.fixes.map((n) => `<li class="fix">Gợi ý sửa: ${esc(n)}</li>`).join("")}${
       v.learned != null ? `<li>AI đã học: khả năng bạn giữ ảnh này ${Math.round(v.learned * 100)}% (điểm theo quy tắc ${v.rule_score.toFixed(1)})</li>` : ""
@@ -972,6 +1110,7 @@ function showPrefs(prefs) {
   renderWeights();
   renderRules();
   renderOptions();
+  renderAiSwitch();
 }
 
 async function undoChat() {
@@ -1129,6 +1268,8 @@ function wireWeb() {
   wireZoom();
   wireChat();
   wireWeb();
+  renderDrive();
+  renderSync();
   if (!st.metas.length) await newSession();
   await selectSession(st.metas[0].id);
   restoreSessions();

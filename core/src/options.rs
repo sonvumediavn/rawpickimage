@@ -20,6 +20,9 @@ pub struct Options {
     pub dedupe: bool,
     /// Blend in what the AI learned from Sơn's earlier choices.
     pub use_learned: bool,
+    /// Let the AI pick. Off: every photo still gets its score and notes, but nothing is chosen
+    /// until Sơn chooses (his own picks stay either way).
+    pub ai_pick: bool,
 
     // The ten extras.
     /// 1. Scene coverage: every moment of the event keeps at least one photo.
@@ -54,6 +57,7 @@ impl Default for Options {
             review_open_mouth: false,
             dedupe: true,
             use_learned: true,
+            ai_pick: true,
             moments: false,
             key_people: false,
             fix_instead_of_reject: false,

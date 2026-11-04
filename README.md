@@ -22,16 +22,23 @@ toàn bằng CPU, không cần card đồ hoạ, không gửi ảnh đi đâu.
    «AI đã học được gì từ tôi», «hoàn tác», «đặt lại mặc định»).
    AI trong máy hiểu các yêu cầu thường gặp, chạy offline. Máy nào đã cài **Claude Code** và đăng nhập tài
    khoản Claude thì bật «Dùng Claude» để hỏi tự do (dùng tài khoản của bạn, không cần API key).
-5. Lấy ảnh ra theo một trong hai cách:
-   - **Chép ảnh đã chọn vào thư mục con…**: chép ảnh đã chọn sang một thư mục con ngay trong thư mục gốc
-     (ví dụ `Anh-da-chon/`). Ảnh gốc giữ nguyên tại chỗ; bản chép giống hệt từng byte, có kiểm tra checksum.
-     Chép lại lần nữa thì bỏ qua file đã có; thư mục con này không bị phân tích lại.
-   - **Xuất ảnh ra thư mục…**: chọn thư mục đích trên máy, ứng dụng tạo thư mục cùng tên thư mục ảnh
-     thêm chữ `- Anh chon` (ví dụ `261103_khai giang tesol - Anh chon`) và để ảnh đã chọn ngay trong đó.
-     Chọn **Chép** (giữ ảnh gốc) hoặc **Chuyển** (bản gốc chỉ bị xoá sau khi bản mới đã kiểm tra khớp).
+5. Bấm **Xuất ảnh chọn** (một chạm):
+   - Ảnh đã chọn được chép vào thư mục con mang tên thư mục gốc thêm `_anh chon`, ngay trong thư mục gốc,
+     để lưu trữ cùng show. Ví dụ `261104_van nghe cong doan/261104_van nghe cong doan_anh chon/`.
+     Ảnh gốc giữ nguyên; bản chép giống hệt từng byte, có kiểm tra checksum. Xuất lại thì bỏ qua file đã có.
+   - Sau đó cả thư mục được chép tiếp vào thư mục **Google Drive** bạn chọn (app Google Drive for desktop
+     trên máy tự tải lên). Lần đầu app hỏi thư mục Drive, từ đó nhớ luôn, đổi ở mục «Khi xuất».
+     Mẹo: đặt thư mục Drive đó ở chế độ «Bất kỳ ai có đường liên kết đều xem được» một lần, mọi show
+     bên trong tự có quyền xem. Trên Mac app tự chép link thư mục; trên Windows chuột phải thư mục →
+     Google Drive → «Sao chép đường liên kết».
+   - **Xuất ra thư mục khác…** vẫn có khi cần chép (hoặc chuyển) sang một chỗ khác.
+
+   Công tắc **AI tự chọn** trên thanh công cụ: tắt thì AI vẫn chấm điểm, ghi chú và gợi ý từng ảnh nhưng
+   không chọn sẵn ảnh nào (tab «Chưa chọn»), bạn tự chọn bằng P / X. Bật lại thì AI chọn như cũ; ảnh bạn
+   đã chọn tay giữ nguyên ở cả hai chế độ.
 
 ```
-Ten-su-kien - Anh chon/
+Ten-su-kien_anh chon/
   (ảnh đã chọn, giữ nguyên tên, định dạng và thư mục con của máy ảnh)
   Can-xem-lai/          (chỉ khi bật «Gồm cả ảnh Cần xem lại»)
   Bi-loai/              (chỉ khi bật «Gồm cả ảnh bị loại»)
@@ -77,6 +84,20 @@ Mỗi lần bạn bấm **Chọn (P)** hoặc **Loại (X)** trên một ảnh, 
 quyết; càng nhiều lựa chọn và AI càng tái hiện đúng thì gu của bạn càng chiếm nhiều phần điểm (từ 50% khi đủ 20 lựa chọn, tới 95%),
 và có thể giữ lại cả những ảnh mà luật cứng định loại (trừ mắt nhắm của nhân vật chính, ảnh hỏng,
 ảnh trùng). Mỗi lần xuất, AI cũng học từ toàn bộ thư mục.
+
+**AI nhìn ảnh**: ngoài các con số đo được, mỗi ảnh có một «dấu vân hình» do mô hình MobileNetV2 (chạy
+trên CPU, không cần mạng) tạo ra. AI so ảnh mới với những ảnh bạn từng giữ và từng bỏ ở các show khác,
+nên học được cả kiểu khoảnh khắc, khung hình, dáng người bạn thích.
+
+**Học từ show cũ…**: chọn thư mục một show đã lọc xong, xếp kiểu gì cũng được. App tự nhận ra thư mục
+ảnh bạn đã chọn bằng hình (cùng giờ chụp và trông giống nhau, kể cả đã đổi tên, chỉnh màu, xuất lại),
+coi ảnh gốc có bản trong đó là ảnh bạn giữ, còn lại là ảnh bỏ, rồi học luôn cả show. Chỉ có ảnh đã chọn
+thì app coi tất cả là ảnh bạn thích.
+
+**Làm trên nhiều máy (Win và Mac)**: ở mục «AI học theo bạn», chọn cùng một thư mục trên Google Drive ở
+mỗi máy. Mỗi máy ghi lựa chọn của mình vào file riêng trong đó (không bao giờ ghi đè nhau); khi mở hay
+chấm ảnh, app gộp lựa chọn của mọi máy rồi học lại. Cài lại hay cập nhật app không mất gì: dữ liệu học
+nằm ở `%LOCALAPPDATA%\vn.sonvumedia.rawpick` (Windows) hoặc `~/Library/Application Support/vn.sonvumedia.rawpick` (Mac).
 
 AI học từ: phơi sáng, độ nét, bố cục, vị trí và cỡ nhân vật chính, chủ thể sát mép, màu, nhiễu, mắt,
 **khẩu hình miệng** (đang nói, há miệng), **góc mặt nghiêng**, số người, độ sáng tổng. Mặt nghiêng không

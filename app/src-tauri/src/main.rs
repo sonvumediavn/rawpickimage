@@ -67,6 +67,13 @@ struct Global {
     export_parent: Option<PathBuf>,
     /// The web version served by this app.
     web: web::WebPrefs,
+    /// Folder on Google Drive (synced by the Drive app) where each export is also copied, to
+    /// send clients a link. Chosen once by Sơn.
+    drive_dir: Option<PathBuf>,
+    /// Folder on Google Drive where this computer and the others share what the AI learned.
+    sync_dir: Option<PathBuf>,
+    /// Random id of this computer, for the shared learning files.
+    machine_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,7 +160,9 @@ impl App {
     }
 
     fn store(&self) -> Store {
-        Store::new(learn::default_dir(&self.data_dir))
+        let g = self.global.lock().unwrap();
+        let shared = g.sync_dir.as_ref().filter(|d| d.is_dir()).map(|d| learn::Shared { dir: d.clone(), machine: g.machine_id.clone(), label: machine_label() });
+        Store::new(learn::default_dir(&self.data_dir)).with_shared(shared)
     }
 
     fn save_global(&self) {
@@ -189,6 +198,8 @@ impl App {
             min_samples: learn::MIN_SAMPLES,
             manual: p.manual_count(),
             trust: p.trust(self.global.lock().unwrap().prefs.settings.learned_weight),
+            seen: p.seen_count(),
+            shared: self.global.lock().unwrap().sync_dir.as_ref().is_some_and(|d| d.is_dir()),
         }
     }
 
@@ -221,6 +232,10 @@ struct ProfileView {
     manual: usize,
     /// Share of the score that comes from his learned taste.
     trust: f32,
+    /// Photos the AI can compare by look.
+    seen: usize,
+    /// Learning shared with other computers through Google Drive.
+    shared: bool,
 }
 
 #[derive(Serialize)]
@@ -351,6 +366,71 @@ fn sessions_changed(app: &App) {
     app.emit("sessions-changed", ());
 }
 
+/// Name of this computer, shown next to its shared learning file.
+fn machine_label() -> String {
+    for k in ["COMPUTERNAME", "HOSTNAME"] {
+        if let Ok(v) = std::env::var(k) {
+            if !v.trim().is_empty() {
+                return v.trim().to_string();
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if let Ok(o) = std::process::Command::new("scutil").args(["--get", "ComputerName"]).output() {
+        let v = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    if cfg!(target_os = "macos") { "Mac".into() } else { "May-tinh".into() }
+}
+
+/// Google Drive folders the Drive app shows on this computer (to open the folder picker there).
+fn drive_roots() -> Vec<PathBuf> {
+    #[allow(unused_mut)]
+    let mut out = vec![];
+    #[cfg(windows)]
+    for l in b'D'..=b'Z' {
+        for n in ["My Drive", "Drive của tôi"] {
+            let p = PathBuf::from(format!("{}:\\{n}", l as char));
+            if p.is_dir() {
+                out.push(p);
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(h) = std::env::var_os("HOME") {
+        if let Ok(rd) = std::fs::read_dir(Path::new(&h).join("Library/CloudStorage")) {
+            for e in rd.flatten() {
+                if e.file_name().to_string_lossy().starts_with("GoogleDrive") {
+                    for n in ["My Drive", "Drive của tôi"] {
+                        let p = e.path().join(n);
+                        if p.is_dir() {
+                            out.push(p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Link of a folder synced by Google Drive for desktop, when the Drive app tells us its id
+/// (macOS keeps it in an extended attribute; elsewhere we can only open the folder).
+fn drive_link(dir: &Path) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let o = std::process::Command::new("xattr").args(["-p", "com.google.drivefs.item-id#S"]).arg(dir).output().ok()?;
+        let id = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        if o.status.success() && !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            return Some(format!("https://drive.google.com/drive/folders/{id}"));
+        }
+    }
+    let _ = dir;
+    None
+}
+
 fn folder_name(p: &Path) -> String {
     p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| p.display().to_string())
 }
@@ -367,6 +447,10 @@ struct AppInfo {
     defaults: Prefs,
     profiles: Vec<String>,
     export_parent: Option<String>,
+    drive_dir: Option<String>,
+    sync_dir: Option<String>,
+    drive_roots: Vec<String>,
+    machine: String,
     sessions: Vec<SessionMeta>,
 }
 
@@ -393,6 +477,10 @@ fn op_app_info(app: &Arc<App>) -> AppInfo {
         defaults: g.prefs,
         profiles,
         export_parent: g.export_parent.map(|p| p.display().to_string()),
+        drive_dir: g.drive_dir.map(|p| p.display().to_string()),
+        sync_dir: g.sync_dir.map(|p| p.display().to_string()),
+        drive_roots: drive_roots().into_iter().map(|p| p.display().to_string()).collect(),
+        machine: machine_label(),
         sessions,
     }
 }
@@ -559,7 +647,7 @@ fn op_set_decision(app: &Arc<App>, id: u32, idx: usize, decision: Option<Decisio
             if let (Some(a), Some(v)) = (s.items[idx].analysis.as_ref(), s.verdicts.get(idx)) {
                 let store = app.store();
                 let mut p = store.load(&s.prefs.profile);
-                p.add(vec![learn::Sample { name: key, f: learn::features(a).to_vec(), keep: d.keep(), ai_keep: v.ai_decision.keep(), manual: true }]);
+                p.add(vec![learn::Sample::new(key, a, d.keep(), v.ai_decision.keep(), true)]);
                 p.train();
                 let _ = store.save(&p);
                 profile = Some(app.profile_view(&s.prefs.profile));
@@ -658,6 +746,151 @@ fn op_export_folder(app: &Arc<App>, id: u32, parent: String) -> Result<ExportRes
 struct GatherResult {
     report: pipeline::GatherReport,
     view: SessionView,
+}
+
+#[derive(Serialize)]
+struct DriveCopy {
+    dir: PathBuf,
+    /// Shareable link when the Drive app tells us the folder's id.
+    link: Option<String>,
+    report: ExportReport,
+}
+
+#[derive(Serialize)]
+struct ShowExport {
+    /// The archive inside the source folder.
+    report: ExportReport,
+    drive: Option<DriveCopy>,
+    /// Why the copy to Google Drive did not happen.
+    drive_error: Option<String>,
+    profile: ProfileView,
+}
+
+/// Sơn's one-click export (2026-11-04): the picks go into `<source>/<source>_anh chon` to be
+/// archived with the show, then the same folder is copied to his Google Drive folder, which the
+/// Drive app uploads, so he can send clients a link.
+fn op_export_show(app: &Arc<App>, id: u32) -> Result<ShowExport, String> {
+    let app = app.clone();
+    (move || {
+        let (source, items, verdicts, opts, profile, cancel) = {
+            let mut map = app.sessions.lock().unwrap();
+            let s = map.get_mut(&id).ok_or("Phiên đã đóng")?;
+            if s.phase != Phase::Ready {
+                return Err("Phiên này chưa phân tích xong".into());
+            }
+            s.phase = Phase::Exporting;
+            s.cancel.store(false, Ordering::SeqCst);
+            let mut opts = s.prefs.export.clone();
+            opts.report = opts.report && s.prefs.settings.options.report;
+            (s.source.clone().unwrap(), s.items.clone(), s.verdicts.clone(), opts, s.prefs.profile.clone(), s.cancel.clone())
+        };
+        sessions_changed(&app);
+        let name = rawpick_core::export::out_name(&source);
+        let archive = source.join(&name);
+        let on_step = emitter(&app, Some(id));
+        let p = Progress { on_step: &on_step, cancel: &cancel };
+        let res = pipeline::export_all(&source, &items, &verdicts, &archive, &opts, &p).map_err(|e| format!("{e:#}"));
+        let drive_dir = app.global.lock().unwrap().drive_dir.clone();
+        let mut drive = None;
+        let mut drive_error = None;
+        if let (Ok(_), Some(d)) = (&res, drive_dir) {
+            if !d.is_dir() {
+                drive_error = Some(format!("Không thấy thư mục Google Drive {}. App Google Drive đã mở và đăng nhập chưa?", d.display()));
+            } else if !cancel.load(Ordering::SeqCst) {
+                let step = |n: usize, t: usize, _: &str| on_step(n, t, "Đang chép lên Google Drive");
+                let p2 = Progress { on_step: &step, cancel: &cancel };
+                // Always a copy: the archive keeps the photos, Drive gets its own.
+                let o2 = ExportOptions { move_files: false, ..opts.clone() };
+                let out = d.join(&name);
+                match pipeline::export_all(&source, &items, &verdicts, &out, &o2, &p2) {
+                    Ok(r) => drive = Some(DriveCopy { link: drive_link(&out), dir: out, report: r }),
+                    Err(e) => drive_error = Some(format!("Chép lên Google Drive lỗi: {e:#}")),
+                }
+            }
+        }
+        {
+            let mut map = app.sessions.lock().unwrap();
+            if let Some(s) = map.get_mut(&id) {
+                s.phase = Phase::Ready;
+                if res.is_ok() {
+                    s.last_export = Some(archive.clone());
+                }
+            }
+            app.save_sessions(&map);
+        }
+        sessions_changed(&app);
+        let report = res?;
+        let profile = learn_from(&app, &profile, &items, &verdicts);
+        Ok(ShowExport { report, drive, drive_error, profile })
+    })()
+}
+
+/// Remember (or forget, with `None`) a folder in Global: the Google Drive export folder or the
+/// shared learning folder.
+fn op_set_folder(app: &Arc<App>, which: &str, path: Option<String>) -> Result<AppInfo, String> {
+    let p = path.filter(|p| !p.trim().is_empty()).map(PathBuf::from);
+    if let Some(d) = &p {
+        if !d.is_dir() {
+            return Err(format!("Không tìm thấy thư mục {}", d.display()));
+        }
+    }
+    {
+        let mut g = app.global.lock().unwrap();
+        match which {
+            "drive" => g.drive_dir = p,
+            _ => g.sync_dir = p,
+        }
+    }
+    app.save_global();
+    Ok(op_app_info(app))
+}
+
+#[derive(Serialize)]
+struct LessonResult {
+    lesson: rawpick_core::lesson::Lesson,
+    profile: ProfileView,
+}
+
+/// «Học từ show cũ»: look at an old, already culled show and learn Sơn's picks from it.
+fn op_learn_show(app: &Arc<App>, path: String, profile: String) -> Result<LessonResult, String> {
+    let app = app.clone();
+    (move || {
+        let dir = PathBuf::from(&path);
+        if !dir.is_dir() {
+            return Err(format!("Không tìm thấy thư mục {path}"));
+        }
+        let on_step = emitter(&app, None);
+        on_step(0, 0, "Đang chờ phiên khác phân tích xong");
+        app.card_cancel.store(false, Ordering::SeqCst);
+        let work = pipeline::work_dir(&app.data_dir, &dir);
+        let (samples, lesson) = {
+            let mut an = app.analyzer.lock().unwrap();
+            an.thumbs_dir = None;
+            let p = Progress { on_step: &on_step, cancel: &app.card_cancel };
+            rawpick_core::lesson::learn_show(&dir, &an, Some(&work), &p).map_err(|e| format!("{e:#}"))?
+        };
+        if app.card_cancel.load(Ordering::SeqCst) {
+            return Err("Đã dừng".into());
+        }
+        if samples.is_empty() {
+            return Err("Không thấy ảnh nào đọc được trong thư mục này".into());
+        }
+        let store = app.store();
+        let mut p = store.load(&profile);
+        p.add(samples);
+        p.train();
+        store.save(&p).map_err(|e| e.to_string())?;
+        // Already-open sessions of this event type use the new knowledge right away.
+        {
+            let mut map = app.sessions.lock().unwrap();
+            for s in map.values_mut().filter(|s| s.prefs.profile == profile && s.phase == Phase::Ready) {
+                app.recull(s);
+            }
+            app.save_sessions(&map);
+        }
+        sessions_changed(&app);
+        Ok(LessonResult { lesson, profile: app.profile_view(&profile) })
+    })()
 }
 
 /// Copy the selected photos into a sub-folder of the source folder (originals untouched).
@@ -1221,6 +1454,10 @@ fn dispatch(app: &Arc<App>, cmd: &str, args: serde_json::Value) -> Result<serde_
         "train" => json(op_train(app, need(a.id, "id")?)?),
         "export_target" => json(op_export_target(app, need(a.id, "id")?, need(a.parent, "parent")?)?),
         "export_folder" => json(op_export_folder(app, need(a.id, "id")?, need(a.parent, "parent")?)?),
+        "export_show" => json(op_export_show(app, need(a.id, "id")?)?),
+        "set_drive_dir" => json(op_set_folder(app, "drive", a.path)?),
+        "set_sync_dir" => json(op_set_folder(app, "sync", a.path)?),
+        "learn_show" => json(op_learn_show(app, need(a.path, "path")?, need(a.name, "name")?)?),
         "gather_selected" => json(op_gather_selected(app, need(a.id, "id")?, need(a.sub, "sub")?)?),
         "claude_status" => json(op_claude_status()),
         "chat" => json(op_chat(app, a.id, need(a.message, "message")?, a.use_claude)?),
@@ -1272,6 +1509,12 @@ fn main() {
             std::fs::create_dir_all(&data_dir)?;
             let mut global: Global = std::fs::read(data_dir.join("settings.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
             global.prefs = global.prefs.upgrade();
+            if global.machine_id.is_empty() {
+                let mut b = [0u8; 8];
+                let _ = getrandom::fill(&mut b);
+                global.machine_id = b.iter().map(|x| format!("{x:02x}")).collect();
+                let _ = std::fs::write(data_dir.join("settings.json"), serde_json::to_vec_pretty(&global).unwrap_or_default());
+            }
             let saved: Vec<SavedSession> = std::fs::read(data_dir.join("sessions.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
             let mut sessions = BTreeMap::new();
             for s in saved {

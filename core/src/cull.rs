@@ -251,7 +251,7 @@ pub fn cull(items: &[Option<&Analysis>], s: &Settings, profile: Option<&Profile>
                 };
             };
             let (rule, mut notes) = rule_score(a, &s.weights, fix);
-            let learned = profile.and_then(|p| p.predict(&learn::features(a)));
+            let learned = profile.and_then(|p| p.predict(&learn::features(a), &a.embed));
             // The more Sơn has taught (and the better the model fits him), the more his taste counts.
             let trust = profile.map(|p| p.trust(s.learned_weight)).unwrap_or(0.0);
             let score = match learned {
@@ -300,6 +300,10 @@ pub fn cull(items: &[Option<&Analysis>], s: &Settings, profile: Option<&Profile>
     }
     for v in &mut out {
         v.ai_decision = v.decision;
+        // AI picking off: keep its opinion for display, leave the choice to Sơn.
+        if !o.ai_pick && v.decision != Decision::Rejected(Reason::Broken) {
+            v.decision = Decision::Review;
+        }
     }
     out
 }
@@ -488,9 +492,11 @@ fn limit(out: &mut [Verdict], n: usize) {
 }
 
 /// Apply Sơn's manual choice to one photo.
+/// Sơn's own choice. It counts as his even when it matches the AI (with AI picking off, the
+/// AI's opinion is only advice).
 pub fn set_manual(v: &mut Verdict, d: Decision) {
     v.decision = d;
-    v.overridden = d != v.ai_decision;
+    v.overridden = true;
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

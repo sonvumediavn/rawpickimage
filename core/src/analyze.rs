@@ -60,18 +60,30 @@ pub struct Analysis {
     pub faces_checked: bool,
     pub signature: Signature,
     pub thumb: Option<PathBuf>,
+    /// How the photo looks, for learning Sơn's taste from pictures ([`crate::visual`]).
+    #[serde(default, with = "crate::visual::hex")]
+    pub embed: Vec<i8>,
 }
 
 pub struct Analyzer {
     #[cfg(feature = "faces")]
     pub faces: Option<faces::FaceDetector>,
+    #[cfg(feature = "faces")]
+    pub visual: Option<crate::visual::Embedder>,
     pub thumbs_dir: Option<PathBuf>,
 }
 
 impl Analyzer {
+    /// `face_model` is the YuNet file; the image model ([`crate::visual::MODEL`]) is looked
+    /// for in the same folder.
     pub fn new(face_model: Option<&Path>, thumbs_dir: Option<PathBuf>) -> (Self, Option<String>) {
         #[cfg(feature = "faces")]
         {
+            let visual = face_model
+                .and_then(|p| p.parent())
+                .map(|d| d.join(crate::visual::MODEL))
+                .filter(|p| p.exists())
+                .and_then(|p| crate::visual::Embedder::load(&p).ok());
             let (det, warn) = match face_model {
                 Some(p) if p.exists() => match faces::FaceDetector::load(p) {
                     Ok(d) => (Some(d), None),
@@ -79,7 +91,7 @@ impl Analyzer {
                 },
                 _ => (None, Some("Chưa có mô hình nhận diện khuôn mặt, tiêu chí «Người» tạm bỏ qua".to_string())),
             };
-            (Self { faces: det, thumbs_dir }, warn)
+            (Self { faces: det, visual, thumbs_dir }, warn)
         }
         #[cfg(not(feature = "faces"))]
         {
@@ -150,6 +162,10 @@ impl Analyzer {
             sharp.notes.push("Vùng nét nhất nằm xa chủ thể, có thể lấy nét nhầm hậu cảnh".into());
         }
 
+        #[cfg(feature = "faces")]
+        let embed = self.visual.as_ref().and_then(|v| v.embed(&hi).ok()).unwrap_or_default();
+        #[cfg(not(feature = "faces"))]
+        let embed = vec![];
         let thumb = self.thumbs_dir.as_ref().and_then(|d| {
             let t = metrics::resize_long(&hi, 480);
             // Named after the file, not its position, so cached thumbnails stay right
@@ -189,6 +205,7 @@ impl Analyzer {
             faces_checked,
             signature,
             thumb,
+            embed,
         })
     }
 }
@@ -223,6 +240,11 @@ pub fn file_key(path: &Path) -> String {
 /// Group files of one shot (same folder + stem): RAW + JPEG twins, XMP sidecars.
 /// Returns (file used for scoring, all files), sorted by name.
 pub fn collect(dir: &Path, recursive: bool) -> std::io::Result<Vec<(PathBuf, Vec<PathBuf>)>> {
+    collect_with(dir, recursive, true)
+}
+
+/// Like [`collect`]; `skip_ours = false` also walks folders this app wrote (to learn from them).
+pub fn collect_with(dir: &Path, recursive: bool, skip_ours: bool) -> std::io::Result<Vec<(PathBuf, Vec<PathBuf>)>> {
     let mut all = vec![];
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
@@ -236,7 +258,8 @@ pub fn collect(dir: &Path, recursive: bool) -> std::io::Result<Vec<(PathBuf, Vec
             let ft = e.file_type()?;
             if ft.is_dir() {
                 // Never re-scan our own output.
-                if recursive && !name.ends_with("_da-loc") && !name.ends_with(" - Anh chon") && !p.join(crate::pipeline::COPY_MARKER).exists() {
+                let ours = name.ends_with("_da-loc") || name.ends_with(" - Anh chon") || name.ends_with(crate::export::OUT_SUFFIX) || p.join(crate::pipeline::COPY_MARKER).exists();
+                if recursive && !(skip_ours && ours) {
                     stack.push(p);
                 }
             } else {

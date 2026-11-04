@@ -35,6 +35,8 @@
       </label>
       <div class="profile" id="profileBox"></div>
       <button class="btn" id="btnTrain" disabled>Huấn luyện AI từ lựa chọn hiện tại</button>
+      <button class="btn" id="btnLearnShow" title="Chọn thư mục một show bạn đã lọc xong (ảnh gốc và ảnh đã chọn, xếp kiểu gì cũng được). AI tự nhận ra ảnh bạn chọn bằng hình và học theo.">Học từ show cũ…</button>
+      <div class="drivebox" id="syncBox"></div>
     </section>
 
     <section class="sec">
@@ -76,6 +78,7 @@
 
     <section class="sec">
       <h2>Khi xuất</h2>
+      <div class="drivebox" id="driveBox"></div>
       <div class="seg" id="expMode" role="radiogroup" aria-label="Cách xuất">
         <button data-m="copy" role="radio">Chép (giữ ảnh gốc)</button>
         <button data-m="move" role="radio">Chuyển sang thư mục mới</button>
@@ -121,14 +124,15 @@
           <button data-t="rejected">Bị loại</button>
         </div>
         <div class="tools">
+          <label class="chk aisw" title="Tắt: AI vẫn chấm điểm và ghi chú từng ảnh nhưng không chọn sẵn ảnh nào, bạn tự chọn"><input type="checkbox" id="optAiPick"> AI tự chọn</label>
           <select id="reasonSel"><option value="">Mọi lý do</option></select>
           <select id="sortSel">
             <option value="time">Theo thời gian</option>
             <option value="score">Điểm cao trước</option>
             <option value="name">Theo tên file</option>
           </select>
-          <button class="btn" id="btnGather" title="Chép ảnh đã chọn sang một thư mục con ngay trong thư mục gốc; ảnh gốc giữ nguyên">Chép ảnh đã chọn vào thư mục con…</button>
-          <button class="btn primary" id="btnExport">Xuất ảnh ra thư mục…</button>
+          <button class="btn" id="btnExportOther" title="Chép ảnh đã chọn ra một thư mục bạn chọn">Xuất ra thư mục khác…</button>
+          <button class="btn primary" id="btnExport" title="Lưu ảnh đã chọn vào thư mục «…_anh chon» trong thư mục gốc, rồi chép lên Google Drive">Xuất ảnh chọn</button>
         </div>
       </div>
       <div class="grid" id="grid"></div>

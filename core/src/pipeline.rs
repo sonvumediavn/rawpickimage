@@ -4,7 +4,7 @@
 use crate::analyze::{self, Analysis, Analyzer};
 use crate::cull::{self, Decision, Settings, Verdict};
 use crate::export::{self, Entry, ExportOptions, ExportReport};
-use crate::learn::{self, Profile, Sample};
+use crate::learn::{Profile, Sample};
 use crate::options::{self, Suggestion};
 use anyhow::Result;
 use rayon::prelude::*;
@@ -29,7 +29,7 @@ struct Cache {
 }
 
 /// Bump when the analysis measures something new, so cached results are redone once.
-const ANALYSIS_VERSION: u32 = 2;
+const ANALYSIS_VERSION: u32 = 3;
 
 fn cache_key(p: &Path) -> Option<String> {
     let m = std::fs::metadata(p).ok()?;
@@ -67,14 +67,19 @@ pub struct Timing {
 }
 
 pub fn analyze_all(source: &Path, recursive: bool, analyzer: &Analyzer, work: Option<&Path>, p: &Progress) -> Result<(Vec<Item>, Timing)> {
-    let t0 = Instant::now();
     let groups = analyze::collect(source, recursive)?;
+    analyze_groups(groups, analyzer, work, p, "Đang phân tích ảnh")
+}
+
+/// Analyse shots already grouped by [`analyze::collect`], `stage` names the work in progress.
+pub fn analyze_groups(groups: Vec<(PathBuf, Vec<PathBuf>)>, analyzer: &Analyzer, work: Option<&Path>, p: &Progress, stage: &str) -> Result<(Vec<Item>, Timing)> {
+    let t0 = Instant::now();
     let cache_file = work.map(|w| w.join("cache.json"));
     let cache: Cache = cache_file.as_ref().and_then(|f| std::fs::read(f).ok()).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
     let done = AtomicUsize::new(0);
     let hits = AtomicUsize::new(0);
     let total = groups.len();
-    (p.on_step)(0, total, "Đang phân tích ảnh");
+    (p.on_step)(0, total, stage);
     let pool = rayon::ThreadPoolBuilder::new().num_threads(threads()).build()?;
     let items: Vec<Item> = pool.install(|| {
         groups
@@ -96,7 +101,7 @@ pub fn analyze_all(source: &Path, recursive: bool, analyzer: &Analyzer, work: Op
                     None => analyzer.analyze(&path, files.clone(), i),
                 };
                 let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-                (p.on_step)(n, total, "Đang phân tích ảnh");
+                (p.on_step)(n, total, stage);
                 match res {
                     Ok(a) => Item { path, files, analysis: Some(a), error: None },
                     Err(e) => Item { path, files, analysis: None, error: Some(format!("{e:#}")) },
@@ -148,7 +153,7 @@ pub fn training_samples(items: &[Item], verdicts: &[Verdict]) -> Vec<Sample> {
         .zip(verdicts)
         .filter_map(|(it, v)| {
             let a = it.analysis.as_ref()?;
-            Some(Sample { name: it.path.display().to_string(), f: learn::features(a).to_vec(), keep: v.decision.keep(), ai_keep: v.ai_decision.keep(), manual: v.overridden })
+            Some(Sample::new(it.path.display().to_string(), a, v.decision.keep(), v.ai_decision.keep(), v.overridden))
         })
         .collect()
 }
