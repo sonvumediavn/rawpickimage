@@ -756,6 +756,20 @@ fn locate_claude() -> Option<ClaudeBin> {
     }
     let mut seen = std::collections::HashSet::new();
     dirs.retain(|d| !d.as_os_str().is_empty() && seen.insert(d.clone()));
+    // Last resort on Windows: the copy bundled with the Claude desktop app
+    // (%APPDATA%\Claude\claude-code\<version>\<build>\claude.exe), newest first.
+    #[cfg(windows)]
+    if let Ok(a) = std::env::var("APPDATA") {
+        let mut bundled: Vec<std::path::PathBuf> = std::fs::read_dir(std::path::Path::new(&a).join("Claude").join("claude-code"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .flat_map(|v| std::fs::read_dir(v.path()).into_iter().flatten().flatten().map(|b| b.path()))
+            .filter(|d| d.join("claude.exe").is_file())
+            .collect();
+        bundled.sort_by_key(|d| std::fs::metadata(d.join("claude.exe")).and_then(|m| m.modified()).ok());
+        dirs.extend(bundled.into_iter().rev());
+    }
     let names: &[&str] = if cfg!(windows) { &["claude.exe", "claude.cmd"] } else { &["claude"] };
     let exe = dirs.iter().flat_map(|d| names.iter().map(move |n| d.join(n))).find(|p| p.is_file())?;
     let path = std::env::join_paths(std::iter::once(exe.parent().unwrap().to_path_buf()).chain(dirs)).ok()?;
