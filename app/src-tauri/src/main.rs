@@ -152,6 +152,8 @@ struct App {
     web: web::Web,
     /// Sơn's open/closed-eye corrections and the eye rule fitted to them.
     eyes: Mutex<EyeBook>,
+    /// Profiles whose shared copy on Drive is behind (written later in one go).
+    share_due: Mutex<std::collections::BTreeSet<String>>,
 }
 
 impl App {
@@ -182,6 +184,19 @@ impl App {
     fn save_eyes(&self, b: &EyeBook) {
         let sh = self.eyes_shared();
         let _ = b.save(&self.data_dir.join("eyes.json"), sh.as_ref().map(|(d, m)| (d.as_path(), m.as_str())));
+    }
+
+    /// Bring the shared copies on Drive up to date with this computer's latest choices.
+    fn flush_shared(&self) {
+        let due: Vec<String> = std::mem::take(&mut *self.share_due.lock().unwrap()).into_iter().collect();
+        if due.is_empty() {
+            return;
+        }
+        let store = self.store();
+        for name in due {
+            let p = store.load(&name);
+            let _ = store.save(&p);
+        }
     }
 
     fn save_global(&self) {
@@ -694,7 +709,9 @@ fn op_set_decision(app: &Arc<App>, id: u32, idx: usize, decision: Option<Decisio
                 let mut p = store.load(&s.prefs.profile);
                 p.add(vec![learn::Sample::new(key, a, d.keep(), v.ai_decision.keep(), true)]);
                 p.train();
-                let _ = store.save(&p);
+                if let Ok(false) = store.save_quick(&p) {
+                    app.share_due.lock().unwrap().insert(s.prefs.profile.clone());
+                }
                 profile = Some(app.profile_view(&s.prefs.profile));
             }
         }
@@ -1646,8 +1663,16 @@ fn main() {
                 handle: std::sync::OnceLock::new(),
                 web: web::Web::default(),
                 eyes: Mutex::new(EyeBook::default()),
+                share_due: Mutex::new(Default::default()),
             });
             app_state.load_eyes();
+            {
+                let a = app_state.clone();
+                std::thread::spawn(move || loop {
+                    std::thread::sleep(std::time::Duration::from_secs(150));
+                    a.flush_shared();
+                });
+            }
             let _ = app_state.handle.set(app.handle().clone());
             web::start(&app_state);
             app.manage(app_state);
@@ -1660,6 +1685,7 @@ fn main() {
             if let tauri::RunEvent::Exit = event {
                 if let Some(app) = handle.try_state::<Arc<App>>() {
                     app.web.stop_tunnel();
+                    app.flush_shared();
                 }
             }
         });

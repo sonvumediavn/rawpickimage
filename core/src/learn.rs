@@ -20,10 +20,11 @@ pub const N_FEAT: usize = 17;
 pub const N_VIS: usize = 2;
 /// Inputs of the model.
 pub const N_ALL: usize = N_FEAT + N_VIS;
-/// Most recent photos with an image vector used for comparison.
-const BANK_MAX: usize = 1500;
-/// Samples whose picture-features are worked out during training (the rest count as neutral).
-const VIS_TRAIN_MAX: usize = 3000;
+/// Photos with an image vector kept for comparison, shared fairly between shows.
+const BANK_MAX: usize = 3000;
+/// Samples whose picture-features are worked out during training (spread over all shows; the
+/// rest count as neutral).
+const VIS_TRAIN_MAX: usize = 2500;
 /// Closest photos averaged for a picture-feature.
 const TOP_K: usize = 5;
 /// Decisions needed (with both kept and dropped photos) before the profile influences scores.
@@ -32,7 +33,40 @@ pub const MIN_SAMPLES: usize = 20;
 const MIN_CLASS: usize = 5;
 /// A photo Sơn decided by hand teaches more than one he let the AI decide.
 const MANUAL_WEIGHT: f32 = 3.0;
-const MAX_SAMPLES: usize = 8000;
+/// Stored decisions per event type. Beyond it, the biggest shows give up their oldest dropped
+/// photos first, so ten old shows all keep teaching.
+const MAX_SAMPLES: usize = 20000;
+
+/// Indices of `items` to keep so that at most `max` remain, shared fairly between groups: each
+/// group keeps up to the same quota, and within a group `rank` decides (lower stays first).
+fn fair_pick<T>(items: &[T], max: usize, group: impl Fn(&T) -> u32, rank: impl Fn(usize, &T) -> (u8, std::cmp::Reverse<usize>)) -> Vec<usize> {
+    if items.len() <= max {
+        return (0..items.len()).collect();
+    }
+    let mut by: std::collections::HashMap<u32, Vec<usize>> = std::collections::HashMap::new();
+    for (i, it) in items.iter().enumerate() {
+        by.entry(group(it)).or_default().push(i);
+    }
+    // Largest quota q with sum(min(size, q)) <= max.
+    let sizes: Vec<usize> = by.values().map(Vec::len).collect();
+    let (mut lo, mut hi) = (0usize, max);
+    while lo < hi {
+        let q = (lo + hi).div_ceil(2);
+        if sizes.iter().map(|&n| n.min(q)).sum::<usize>() <= max {
+            lo = q;
+        } else {
+            hi = q - 1;
+        }
+    }
+    let mut keep = vec![];
+    for (_, mut idx) in by {
+        idx.sort_by_key(|&i| rank(i, &items[i]));
+        idx.truncate(lo);
+        keep.extend(idx);
+    }
+    keep.sort_unstable();
+    keep
+}
 
 pub const FEATURE_NAMES: [&str; N_ALL] = [
     "Phơi sáng", "Độ nét", "Bố cục", "Màu sắc", "Nhiễu", "Người", "Có người", "Mắt nhắm", "Nghiêng (độ)", "Cháy sáng (%)", "Số khuôn mặt",
@@ -86,11 +120,15 @@ pub struct Sample {
     /// `None` = this computer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
+    /// Picture-features worked out at the last full training (so a single click does not
+    /// compare thousands of photos again).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v: Option<[f32; N_VIS]>,
 }
 
 impl Sample {
     pub fn new(name: String, a: &Analysis, keep: bool, ai_keep: bool, manual: bool) -> Self {
-        Self { name, f: features(a).to_vec(), keep, ai_keep, manual, e: a.embed.clone(), origin: None }
+        Self { name, f: features(a).to_vec(), keep, ai_keep, manual, e: a.embed.clone(), origin: None, v: None }
     }
 
     /// The show (folder) the photo came from: similar frames of the same show must not vouch
@@ -123,6 +161,9 @@ pub struct Profile {
     /// Which samples the weights were trained on (to notice choices merged from another computer).
     #[serde(default)]
     pub fp: u64,
+    /// Number of samples when picture-features were last all worked out again.
+    #[serde(default)]
+    pub vis_at: usize,
     #[serde(skip)]
     bank: Vec<BankEntry>,
 }
@@ -164,8 +205,9 @@ impl Profile {
 
     fn build_bank(&mut self) {
         let with: Vec<&Sample> = self.samples.iter().filter(|s| visual::usable(&s.e)).collect();
-        let from = with.len().saturating_sub(BANK_MAX);
-        self.bank = with[from..].iter().map(|s| BankEntry { e: s.e.clone(), keep: s.keep, show: s.show() }).collect();
+        // Every show keeps its share; inside a show, kept photos first, then the newest.
+        let pick = fair_pick(&with, BANK_MAX, |s| s.show(), |i, s| (!s.keep as u8, std::cmp::Reverse(i)));
+        self.bank = pick.into_iter().map(|i| with[i]).map(|s| BankEntry { e: s.e.clone(), keep: s.keep, show: s.show() }).collect();
     }
 
     /// [similarity to kept photos, similarity to dropped photos]; NaN where unknown.
@@ -212,8 +254,18 @@ impl Profile {
         self.samples.retain(|x| !names.contains(&x.name));
         self.samples.append(&mut s);
         if self.samples.len() > MAX_SAMPLES {
-            let cut = self.samples.len() - MAX_SAMPLES;
-            self.samples.drain(..cut);
+            // Hand choices and kept photos stay longest; the biggest shows shrink first.
+            let keep = fair_pick(&self.samples, MAX_SAMPLES, |s| s.show(), |i, s| ((!s.keep as u8) + (!s.manual as u8), std::cmp::Reverse(i)));
+            let mut it = keep.into_iter().peekable();
+            let mut i = 0usize;
+            self.samples.retain(|_| {
+                let k = it.peek() == Some(&i);
+                if k {
+                    it.next();
+                }
+                i += 1;
+                k
+            });
         }
     }
 
@@ -237,18 +289,41 @@ impl Profile {
         if n < MIN_SAMPLES || pos < MIN_CLASS || n - pos < MIN_CLASS {
             return false;
         }
-        // Picture-features of each sample, compared only with other shows.
-        let vis_from = n.saturating_sub(VIS_TRAIN_MAX);
-        let raw: Vec<[f32; N_ALL]> = self
+        // Picture-features of each sample, compared only with other shows; with many samples, a
+        // fair share of every show.
+        let vis_set: std::collections::HashSet<usize> =
+            fair_pick(&self.samples, VIS_TRAIN_MAX, |s| s.show(), |i, s| (!visual::usable(&s.e) as u8, std::cmp::Reverse(i))).into_iter().collect();
+        // Work everything out again when the photos to compare with changed a lot (a show was
+        // learned, another computer's choices arrived); otherwise reuse and only add new ones.
+        let full = self.vis_at == 0 || n > self.vis_at + self.vis_at / 10 + 50 || n + n / 10 + 50 < self.vis_at;
+        if full {
+            self.vis_at = n;
+        }
+        let vis: Vec<Option<[f32; N_VIS]>> = self
             .samples
             .par_iter()
             .enumerate()
             .map(|(i, s)| {
-                if i >= vis_from {
-                    self.inputs(&s.f, &s.e, Some(s.show()))
-                } else {
-                    self.inputs(&s.f, &[], None)
+                if !vis_set.contains(&i) {
+                    return None;
                 }
+                match (full, s.v) {
+                    (false, Some(v)) => Some(v),
+                    _ => Some(self.vis(&s.e, Some(s.show()))),
+                }
+            })
+            .collect();
+        for (s, v) in self.samples.iter_mut().zip(&vis) {
+            s.v = *v;
+        }
+        let raw: Vec<[f32; N_ALL]> = self
+            .samples
+            .iter()
+            .map(|s| {
+                let mut x = [0f32; N_ALL];
+                x[..N_FEAT].copy_from_slice(&s.f[..N_FEAT]);
+                x[N_FEAT..].copy_from_slice(&s.v.unwrap_or([f32::NAN; N_VIS]));
+                x
             })
             .collect();
         // Unknown values (old samples, nothing to compare with) count as average.
@@ -290,20 +365,38 @@ impl Profile {
         let tp: f32 = self.samples.iter().zip(&sw).filter(|(s, _)| s.keep).map(|(_, w)| w).sum();
         let wp = tot / (2.0 * tp);
         let wn = tot / (2.0 * (tot - tp));
-        let (mut w, mut b) = (vec![0f32; N_ALL], 0f32);
+        // A single new choice: start from the current weights, a few steps are enough.
+        let warm = !full && self.w.len() == N_ALL;
+        let (mut w, mut b) = if warm { (self.w.clone(), self.b) } else { (vec![0f32; N_ALL], 0f32) };
         let (lr, l2) = (0.3f32, 0.01f32);
-        for _ in 0..600 {
-            let mut gw = [0f32; N_ALL];
-            let mut gb = 0f32;
-            for ((xi, &yi), &si) in x.iter().zip(&y).zip(&sw) {
-                let z = b + xi.iter().zip(&w).map(|(a, c)| a * c).sum::<f32>();
-                let p = 1.0 / (1.0 + (-z).exp());
-                let e = (p - yi) * si * if yi > 0.5 { wp } else { wn };
-                for k in 0..N_ALL {
-                    gw[k] += e * xi[k];
-                }
-                gb += e;
-            }
+        for _ in 0..if warm { 120 } else { 600 } {
+            let (gw, gb) = x
+                .par_iter()
+                .zip(&y)
+                .zip(&sw)
+                .with_min_len(512)
+                .fold(
+                    || ([0f32; N_ALL], 0f32),
+                    |(mut gw, mut gb), ((xi, &yi), &si)| {
+                        let z = b + xi.iter().zip(&w).map(|(a, c)| a * c).sum::<f32>();
+                        let p = 1.0 / (1.0 + (-z).exp());
+                        let e = (p - yi) * si * if yi > 0.5 { wp } else { wn };
+                        for k in 0..N_ALL {
+                            gw[k] += e * xi[k];
+                        }
+                        gb += e;
+                        (gw, gb)
+                    },
+                )
+                .reduce(
+                    || ([0f32; N_ALL], 0f32),
+                    |(mut a, ab), (c, cb)| {
+                        for k in 0..N_ALL {
+                            a[k] += c[k];
+                        }
+                        (a, ab + cb)
+                    },
+                );
             for k in 0..N_ALL {
                 w[k] -= lr * (gw[k] / tot + l2 * w[k]);
             }
@@ -526,6 +619,24 @@ impl Store {
         Ok(())
     }
 
+    /// Save after a single click: the shared file (several MB once old shows are learned)
+    /// is rewritten at most every two minutes, so Drive is not uploading on every click.
+    /// Returns false when the shared copy was left for later ([`Store::save`] it then).
+    pub fn save_quick(&self, p: &Profile) -> std::io::Result<bool> {
+        self.save_local(p)?;
+        let Some(sh) = &self.shared else { return Ok(true) };
+        let fresh = std::fs::metadata(sh.own_file(&p.name))
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age < std::time::Duration::from_secs(120));
+        if fresh {
+            return Ok(false);
+        }
+        let _ = sh.write(p);
+        Ok(true)
+    }
+
     pub fn list(&self) -> Vec<String> {
         let mut out: Vec<String> = std::fs::read_dir(&self.dir)
             .map(|rd| {
@@ -566,7 +677,7 @@ mod tests {
             let mut f = vec![6.0; N_FEAT];
             f[1] = sharp;
             f[3] = ((i * 7) % 10) as f32; // irrelevant
-            s.push(Sample { name: format!("a{i}"), f, keep: sharp >= 6.0, ai_keep: true, manual: false, e: vec![], origin: None });
+            s.push(Sample { name: format!("a{i}"), f, keep: sharp >= 6.0, ai_keep: true, manual: false, e: vec![], origin: None, v: None });
         }
         p.add(s);
         assert!(p.train());
@@ -582,7 +693,7 @@ mod tests {
     #[test]
     fn stays_silent_without_enough_data() {
         let mut p = Profile::new("ít");
-        p.add(vec![Sample { name: "x".into(), f: vec![5.0; N_FEAT], keep: true, ai_keep: false, manual: false, e: vec![], origin: None }]);
+        p.add(vec![Sample { name: "x".into(), f: vec![5.0; N_FEAT], keep: true, ai_keep: false, manual: false, e: vec![], origin: None, v: None }]);
         assert!(!p.train());
         assert!(p.predict(&[5.0; N_FEAT], &[]).is_none());
         assert_eq!(p.agreement(), Some(0.0));
@@ -597,10 +708,10 @@ mod tests {
             let mut f = NEUTRAL.to_vec();
             let open = i % 2 == 0;
             f[11] = if open { 4.0 } else { 0.5 };
-            s.push(Sample { name: format!("m{i}"), f, keep: !open, ai_keep: true, manual: true, e: vec![], origin: None });
+            s.push(Sample { name: format!("m{i}"), f, keep: !open, ai_keep: true, manual: true, e: vec![], origin: None, v: None });
         }
         // Plus one sample saved by the old 11-feature version.
-        s.push(Sample { name: "old".into(), f: vec![5.0; 11], keep: true, ai_keep: true, manual: false, e: vec![], origin: None });
+        s.push(Sample { name: "old".into(), f: vec![5.0; 11], keep: true, ai_keep: true, manual: false, e: vec![], origin: None, v: None });
         p.add(s);
         p.upgrade();
         assert!(p.ready() && p.samples.iter().all(|x| x.f.len() == N_FEAT));
@@ -610,6 +721,13 @@ mod tests {
         calm[11] = 0.5;
         assert!(p.predict(&talk, &[]).unwrap() < 0.3 && p.predict(&calm, &[]).unwrap() > 0.7);
         assert!(p.trust(0.35) > 0.5 && p.trust(0.35) <= 0.95);
+    }
+
+    /// A full-length (v4) vector from a whole-frame one, for timing.
+    fn full(mut e: Vec<i8>) -> Vec<i8> {
+        let extra: Vec<i8> = e.iter().cycle().take(visual::FULL - visual::DIM).copied().collect();
+        e.extend(extra);
+        e
     }
 
     fn vec_like(seed: u32, noise: u32) -> Vec<i8> {
@@ -626,7 +744,7 @@ mod tests {
         for i in 0..60u32 {
             let keep = i % 2 == 0;
             let e = vec_like(if keep { 1 } else { 2 }, i);
-            s.push(Sample { name: format!("/show{}/p{i}.jpg", i % 6), f: NEUTRAL.to_vec(), keep, ai_keep: true, manual: true, e, origin: None });
+            s.push(Sample { name: format!("/show{}/p{i}.jpg", i % 6), f: NEUTRAL.to_vec(), keep, ai_keep: true, manual: true, e, origin: None, v: None });
         }
         p.add(s);
         assert!(p.train());
@@ -637,13 +755,49 @@ mod tests {
     }
 
     #[test]
+    fn ten_old_shows_all_keep_teaching() {
+        let mut p = Profile::new("nhiều show");
+        let mut s = vec![];
+        for show in 0..10u32 {
+            for i in 0..1200u32 {
+                let keep = i % 6 == 0;
+                s.push(Sample { name: format!("/show{show}/p{i}.jpg"), f: NEUTRAL.to_vec(), keep, ai_keep: true, manual: true, e: full(vec_like(if keep { 1 } else { 2 }, i)), origin: None, v: None });
+            }
+        }
+        p.add(s);
+        assert!(p.samples.len() <= MAX_SAMPLES);
+        let shows: std::collections::HashSet<u32> = p.samples.iter().map(|x| x.show()).collect();
+        assert_eq!(shows.len(), 10);
+        // Every kept photo survives the trim.
+        assert_eq!(p.samples.iter().filter(|x| x.keep).count(), 2000);
+        let t = std::time::Instant::now();
+        assert!(p.train());
+        eprintln!("train {} samples: {:?}", p.samples.len(), t.elapsed());
+        // One more click: only the new photo is compared.
+        p.add(vec![Sample { name: "/show0/new.jpg".into(), f: NEUTRAL.to_vec(), keep: true, ai_keep: false, manual: true, e: full(vec_like(1, 5)), origin: None, v: None }]);
+        let t = std::time::Instant::now();
+        assert!(p.train());
+        eprintln!("one more click: {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        let e = full(vec_like(2, 77));
+        for _ in 0..200 {
+            std::hint::black_box(p.predict(&NEUTRAL, &e));
+        }
+        eprintln!("200 predictions: {:?}", t.elapsed());
+        assert!(p.samples.iter().filter(|x| x.v.is_some()).count() >= VIS_TRAIN_MAX.min(p.samples.len()) - 1);
+        let bank_shows: std::collections::HashSet<u32> = p.bank.iter().map(|b| b.show).collect();
+        assert_eq!(bank_shows.len(), 10);
+        assert!(p.bank.len() <= BANK_MAX);
+    }
+
+    #[test]
     fn computers_share_choices_through_a_folder() {
         let d = tempfile::tempdir().unwrap();
         let drive = d.path().join("drive");
         let sh = |m: &str| Some(Shared { dir: drive.clone(), machine: m.to_string(), label: m.to_string() });
         let win = Store::new(d.path().join("win")).with_shared(sh("win00001"));
         let mac = Store::new(d.path().join("mac")).with_shared(sh("mac00001"));
-        let mk = |n: &str, keep: bool| Sample { name: n.into(), f: NEUTRAL.to_vec(), keep, ai_keep: keep, manual: true, e: vec![], origin: None };
+        let mk = |n: &str, keep: bool| Sample { name: n.into(), f: NEUTRAL.to_vec(), keep, ai_keep: keep, manual: true, e: vec![], origin: None, v: None };
         let mut p = win.load("cưới");
         p.add((0..12).map(|i| mk(&format!("w{i}"), i % 2 == 0)).collect());
         win.save(&p).unwrap();

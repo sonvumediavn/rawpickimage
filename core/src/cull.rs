@@ -229,6 +229,11 @@ pub fn cull(items: &[Option<&Analysis>], s: &Settings, profile: Option<&Profile>
     let o = &s.options;
     let fix = o.fix_instead_of_reject;
     let profile = profile.filter(|p| o.use_learned && p.ready());
+    // Comparing every photo with the learned ones is the slow part: all cores at once.
+    let learned_all: Vec<Option<f32>> = {
+        use rayon::prelude::*;
+        items.par_iter().map(|a| a.and_then(|a| profile.and_then(|p| p.predict(&learn::features(a), &a.embed)))).collect()
+    };
     let mut out: Vec<Verdict> = items
         .iter()
         .enumerate()
@@ -251,7 +256,7 @@ pub fn cull(items: &[Option<&Analysis>], s: &Settings, profile: Option<&Profile>
                 };
             };
             let (rule, mut notes) = rule_score(a, &s.weights, fix);
-            let learned = profile.and_then(|p| p.predict(&learn::features(a), &a.embed));
+            let learned = learned_all[idx];
             // The more Sơn has taught (and the better the model fits him), the more his taste counts.
             let trust = profile.map(|p| p.trust(s.learned_weight)).unwrap_or(0.0);
             let score = match learned {
