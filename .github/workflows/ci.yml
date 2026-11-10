@@ -27,5 +27,7 @@ jobs:
         env:
           RAWPICK_REQUIRE_MODEL: "1"
         run: cargo test -p rawpick-core
+      - name: In kết quả AI khuôn mặt và mắt
+        run: cargo test -p rawpick-core --test faces_model -- --nocapture
       - name: Build ứng dụng
         run: cargo build -p rawpick-app

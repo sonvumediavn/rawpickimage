@@ -248,7 +248,7 @@ pub fn load(path: &Path, min_long: u32) -> Result<Preview> {
         let long = nw.max(nh);
         let img = if long > min_long.saturating_mul(2) {
             let f = min_long as f32 / long as f32;
-            imageops::resize(&img, (nw as f32 * f) as u32, (nh as f32 * f) as u32, imageops::FilterType::Triangle)
+            crate::metrics::resize(&img, ((nw as f32 * f) as u32).max(1), ((nh as f32 * f) as u32).max(1))
         } else {
             img
         };

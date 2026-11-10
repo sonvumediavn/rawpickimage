@@ -2,6 +2,7 @@ pub mod exif;
 pub mod metrics;
 pub mod preview;
 pub mod faces;
+pub mod eyes;
 pub mod visual;
 pub mod analyze;
 pub mod cull;

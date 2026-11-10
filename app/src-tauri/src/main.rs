@@ -1375,6 +1375,12 @@ fn op_cancel(app: &Arc<App>, id: Option<u32>) {
 
 /// A larger preview for the detail view, cached next to the thumbnails.
 /// `full` = the preview at its native size (for checking focus at 100 %).
+fn rand_u32() -> u32 {
+    let mut b = [0u8; 4];
+    let _ = getrandom::fill(&mut b);
+    u32::from_le_bytes(b)
+}
+
 fn op_big_preview(app: &Arc<App>, id: u32, idx: usize, full: Option<bool>) -> Result<String, String> {
     let app = app.clone();
     let full = full.unwrap_or(false);
@@ -1390,13 +1396,17 @@ fn op_big_preview(app: &Arc<App>, id: u32, idx: usize, full: Option<bool>) -> Re
         if !out.exists() {
             let long = if full { u32::MAX } else { BIG_LONG };
             let pv = preview::load(&path, long).map_err(|e| format!("{e:#}"))?;
-            let img = if full || pv.rgb.width().max(pv.rgb.height()) <= BIG_LONG { pv.rgb } else { metrics::resize_long(&pv.rgb, BIG_LONG) };
+            // The decoder already shrinks by 1/2, 1/4…: up to 30% over the target is shown as is
+            // (the screen scales it anyway), which skips a resize.
+            let img = if full || pv.rgb.width().max(pv.rgb.height()) <= BIG_LONG * 13 / 10 { pv.rgb } else { metrics::resize_long(&pv.rgb, BIG_LONG) };
             std::fs::create_dir_all(out.parent().unwrap()).map_err(|e| e.to_string())?;
-            let tmp = out.with_extension("tmp");
-            let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp).map_err(|e| e.to_string())?);
-            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut f, if full { 97 } else { 92 }).encode_image(&img).map_err(|e| e.to_string())?;
-            drop(f);
-            std::fs::rename(&tmp, &out).map_err(|e| e.to_string())?;
+            let bytes = metrics::encode_jpeg(&img, if full { 95 } else { 90 }).map_err(|e| format!("{e:#}"))?;
+            // Unique temp name: the viewer may ask for the same photo twice at once.
+            let tmp = out.with_extension(format!("{}.tmp", rand_u32()));
+            std::fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
+            if std::fs::rename(&tmp, &out).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
         }
         Ok(out.display().to_string())
     })()

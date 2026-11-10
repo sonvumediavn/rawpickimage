@@ -30,7 +30,34 @@ pub fn resize_long(img: &RgbImage, long: u32) -> RgbImage {
         return img.clone();
     }
     let f = long as f32 / l as f32;
-    imageops::resize(img, ((w as f32 * f).round() as u32).max(1), ((h as f32 * f).round() as u32).max(1), imageops::FilterType::Triangle)
+    resize(img, ((w as f32 * f).round() as u32).max(1), ((h as f32 * f).round() as u32).max(1))
+}
+
+/// Resize to exactly `w`×`h` (bilinear, averaging properly when shrinking). SIMD through
+/// fast_image_resize: several times faster than `image`'s own resize, which matters on old PCs.
+pub fn resize(img: &RgbImage, w: u32, h: u32) -> RgbImage {
+    use fast_image_resize as fr;
+    let (sw, sh) = img.dimensions();
+    if (sw, sh) == (w, h) || sw == 0 || sh == 0 {
+        return img.clone();
+    }
+    let fast = || -> Option<RgbImage> {
+        let src = fr::images::ImageRef::new(sw, sh, img.as_raw(), fr::PixelType::U8x3).ok()?;
+        let mut dst = fr::images::Image::new(w, h, fr::PixelType::U8x3);
+        let opt = fr::ResizeOptions::new().resize_alg(fr::ResizeAlg::Convolution(fr::FilterType::Bilinear));
+        fr::Resizer::new().resize(&src, &mut dst, &opt).ok()?;
+        RgbImage::from_raw(w, h, dst.into_vec())
+    };
+    fast().unwrap_or_else(|| imageops::resize(img, w, h, imageops::FilterType::Triangle))
+}
+
+/// JPEG bytes of an image (jpeg-encoder, SIMD: about three times faster than `image`'s encoder).
+pub fn encode_jpeg(img: &RgbImage, quality: u8) -> anyhow::Result<Vec<u8>> {
+    let (w, h) = img.dimensions();
+    anyhow::ensure!(w <= u16::MAX as u32 && h <= u16::MAX as u32, "ảnh quá lớn");
+    let mut out = Vec::with_capacity((w * h / 4) as usize);
+    jpeg_encoder::Encoder::new(&mut out, quality).encode(img.as_raw(), w as u16, h as u16, jpeg_encoder::ColorType::Rgb)?;
+    Ok(out)
 }
 
 fn clamp10(v: f32) -> f32 {

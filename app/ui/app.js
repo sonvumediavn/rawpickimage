@@ -851,27 +851,54 @@ const Z_MAX = 8;
 
 /** Large previews already made (and warmed in the browser), by session and photo. */
 const bigCache = new Map();
+/** Previews being made run two at a time; the photo on screen jumps the queue. */
+const bigQueue = [];
+let bigRunning = 0;
 
-function bigPreview(i) {
+function bigPump() {
+  while (bigRunning < 2 && bigQueue.length) {
+    const job = bigQueue.shift();
+    bigRunning++;
+    invoke("big_preview", { id: job.sid, idx: job.i })
+      .then((src) => {
+        const url = fileSrc(src);
+        const im = new Image();
+        im.src = url;
+        return (im.decode ? im.decode() : Promise.resolve()).then(() => url, () => url);
+      })
+      .then(job.ok, job.fail)
+      .finally(() => { bigRunning--; bigPump(); });
+  }
+}
+
+function bigPreview(i, urgent) {
   const key = `${st.sid}:${i}`;
   if (!bigCache.has(key)) {
-    const pr = invoke("big_preview", { id: st.sid, idx: i }).then((src) => {
-      const url = fileSrc(src);
-      const im = new Image();
-      im.src = url;
-      return (im.decode ? im.decode() : Promise.resolve()).then(() => url, () => url);
-    });
+    let job;
+    const pr = new Promise((ok, fail) => { job = { sid: st.sid, i, key, ok, fail }; });
     pr.catch(() => bigCache.delete(key));
     bigCache.set(key, pr);
-    if (bigCache.size > 60) bigCache.delete(bigCache.keys().next().value);
+    if (urgent) bigQueue.unshift(job); else bigQueue.push(job);
+    if (bigCache.size > 80) bigCache.delete(bigCache.keys().next().value);
+    bigPump();
+  } else if (urgent) {
+    // Already waiting behind prefetches: move it to the front.
+    const at = bigQueue.findIndex((j) => j.key === key);
+    if (at > 0) bigQueue.unshift(bigQueue.splice(at, 1)[0]);
   }
   return bigCache.get(key);
 }
 
-/** Get the photos on either side ready, so stepping through never waits. */
+/** Get the next photos (and the one before) ready, so stepping through never waits. */
 function prefetchAround(i) {
   const pos = st.view.indexOf(i);
-  for (const d of [1, -1, 2]) {
+  // Forget prefetches for photos we have stepped away from.
+  for (let k = bigQueue.length - 1; k >= 0; k--) {
+    const j = bigQueue[k];
+    const d = st.view.indexOf(j.i) - pos;
+    if (j.sid !== st.sid || d < -2 || d > 6) { bigQueue.splice(k, 1); bigCache.delete(j.key); j.fail(new Error("skip")); }
+  }
+  for (const d of [1, 2, -1, 3, 4, 5, -2]) {
     const n = st.view[pos + d];
     if (n != null && !st.session.photos[n].error) bigPreview(n).catch(() => {});
   }
@@ -889,9 +916,11 @@ function loadPhoto(i) {
     img.src = p.thumb ? fileSrc(p.thumb) : "";
     return;
   }
-  const big = bigPreview(i);
+  const big = bigPreview(i, true);
   let shown = false;
-  big.then((url) => { if (zoom.seq === seq && !zoom.full) { shown = true; img.src = url; } prefetchAround(i); }).catch(() => {});
+  big.then((url) => { if (zoom.seq === seq && !zoom.full) { shown = true; img.src = url; } }).catch(() => {});
+  // Start on the neighbours straight away (they queue behind this one).
+  prefetchAround(i);
   // Ready in a moment? Skip the thumbnail flash; otherwise show it stretched to size meanwhile.
   setTimeout(() => { if (!shown && zoom.seq === seq && p.thumb) img.src = fileSrc(p.thumb); }, 60);
 }

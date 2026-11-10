@@ -116,7 +116,7 @@ impl Embedder {
     /// The whole frame squeezed to 224×224 (composition matters, so no crop).
     pub fn embed(&self, img: &RgbImage) -> anyhow::Result<Vec<i8>> {
         use tract_onnx::prelude::*;
-        let small = image::imageops::resize(img, INPUT as u32, INPUT as u32, image::imageops::FilterType::Triangle);
+        let small = crate::metrics::resize(img, INPUT as u32, INPUT as u32);
         const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
         const STD: [f32; 3] = [0.229, 0.224, 0.225];
         let input: Tensor = tract_ndarray::Array4::<f32>::from_shape_fn((1, 3, INPUT, INPUT), |(_, c, y, x)| {

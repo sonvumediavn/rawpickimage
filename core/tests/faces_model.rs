@@ -33,7 +33,14 @@ fn finds_the_face_and_tells_open_from_closed_eyes() {
     let cx = f.bbox[0] + f.bbox[2] / 2.0;
     assert!((0.3..0.6).contains(&cx), "{:?}", f.bbox);
 
+    eprintln!("mở: mạng mắt {:?}, điểm ảnh {:.2}, khả năng nhắm {:.2}", f.eye_p, f.eye_open, f.p_closed);
+    if std::env::var("RAWPICK_REQUIRE_MODEL").as_deref() == Ok("1") {
+        assert!(f.eye_p.is_some(), "thiếu mô hình mắt {}", rawpick_core::eyes::MODEL);
+    }
+
     let closed = an.analyze(&data.join("chan-dung-nham-mat.jpg"), vec![], 1).unwrap();
+    let g = &closed.people.faces[0];
+    eprintln!("nhắm: mạng mắt {:?}, điểm ảnh {:.2}, khả năng nhắm {:.2}", g.eye_p, g.eye_open, g.p_closed);
     assert!(closed.people.closed_eyes, "{:?}", closed.people.faces);
     assert!(closed.scores.people.unwrap() < open.scores.people.unwrap());
 }

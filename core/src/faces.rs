@@ -107,7 +107,7 @@ impl FaceDetector {
         let s = self.size;
         let (w, h) = img.dimensions();
         let f = s as f32 / w.max(h) as f32;
-        let small = image::imageops::resize(img, ((w as f32 * f) as u32).max(1), ((h as f32 * f) as u32).max(1), image::imageops::FilterType::Triangle);
+        let small = crate::metrics::resize(img, ((w as f32 * f) as u32).max(1), ((h as f32 * f) as u32).max(1));
         let (sw, sh) = (small.width() as usize, small.height() as usize);
         // BGR, 0–255, letterboxed at the top-left.
         let input: Tensor = tract_ndarray::Array4::<f32>::from_shape_fn((1, 3, s, s), |(_, c, y, x)| {
@@ -156,6 +156,30 @@ pub struct FaceInfo {
     /// above ~0.25 the mouth is clearly open (speaking, shouting, laughing).
     #[serde(default)]
     pub mouth_open: f32,
+    /// Eye-state network: probability the eyes are closed (both eyes averaged).
+    #[serde(default)]
+    pub eye_p: Option<f32>,
+    /// Pixel openness of the more closed eye.
+    #[serde(default)]
+    pub eye_min: f32,
+    /// Whether the eyes could be judged at all.
+    #[serde(default)]
+    pub eye_seen: bool,
+    /// Combined probability of closed eyes (after Sơn's corrections).
+    #[serde(default)]
+    pub p_closed: f32,
+    /// Sơn said himself whether these eyes are open.
+    #[serde(default)]
+    pub by_hand: bool,
+    /// Face score before the eye check.
+    #[serde(default)]
+    pub base: f32,
+}
+
+impl FaceInfo {
+    pub fn eye_features(&self) -> [f32; crate::eyes::N] {
+        crate::eyes::features(self.eye_p, self.eye_open, self.eye_min)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -272,8 +296,28 @@ fn face_sharpness(g: &Gray, x0: usize, y0: usize, x1: usize, y1: usize, face_w: 
     (s, (lm / n) as f32)
 }
 
-/// Judge every detected face on the high-resolution image `img`/`g`.
+/// Optional eye-state network, only in builds with the face models.
+#[cfg(feature = "faces")]
+pub type EyeNet = crate::eyes::EyeModel;
+#[cfg(not(feature = "faces"))]
+pub struct EyeNet;
+
+#[cfg(feature = "faces")]
+fn eye_net_p(net: Option<&EyeNet>, img: &RgbImage, e: (f32, f32), side: f32) -> Option<f32> {
+    net?.p_closed(img, e.0, e.1, side)
+}
+#[cfg(not(feature = "faces"))]
+fn eye_net_p(_: Option<&EyeNet>, _: &RgbImage, _: (f32, f32), _: f32) -> Option<f32> {
+    None
+}
+
+/// Measure every detected face on the high-resolution image `img`/`g`, then judge it with the
+/// starting eye rule.
 pub fn assess(img: &RgbImage, g: &Gray, raw: &[RawFace]) -> People {
+    assess_with(img, g, raw, None)
+}
+
+pub fn assess_with(img: &RgbImage, g: &Gray, raw: &[RawFace], net: Option<&EyeNet>) -> People {
     let (w, h) = (img.width() as f32, img.height() as f32);
     if raw.is_empty() {
         return People { notes: vec!["Không thấy khuôn mặt nào, tiêu chí này không tính vào điểm".into()], ..Default::default() };
@@ -286,29 +330,21 @@ pub fn assess(img: &RgbImage, g: &Gray, raw: &[RawFace]) -> People {
             let (re, le, nose) = (f.lm[0], f.lm[1], f.lm[2]);
             let iod = dist(re, le).max(1.0);
             let ew = iod * 0.47;
+            let small = f.w < 36.0;
             let ratios: Vec<f32> = [re, le].iter().filter_map(|e| eye_open_ratio(g, e.0, e.1, ew)).collect();
             let avg = if ratios.is_empty() { 1.0 } else { ratios.iter().sum::<f32>() / ratios.len() as f32 };
             let min = ratios.iter().cloned().fold(1.0f32, f32::min);
+            let side = f.w.max(f.h) * crate::eyes::PATCH;
+            let nets: Vec<f32> = if small { vec![] } else { [re, le].iter().filter_map(|&e| eye_net_p(net, img, e, side)).collect() };
+            let eye_p = (!nets.is_empty()).then(|| nets.iter().sum::<f32>() / nets.len() as f32);
             let (x0, y0) = (f.x.max(0.0) as usize, f.y.max(0.0) as usize);
             let (x1, y1) = ((f.x + f.w).min(w - 1.0) as usize, (f.y + f.h).min(h - 1.0) as usize);
             let (sharp, lum) = face_sharpness(g, x0, y0, x1, y1, f.w);
             let mid = ((re.0 + le.0) / 2.0, (re.1 + le.1) / 2.0);
             let yaw = (nose.0 - mid.0) / iod;
             let edge = f.x < w * 0.01 || f.y < h * 0.01 || f.x + f.w > w * 0.99 || f.y + f.h > h * 0.99;
-            let small = f.w < 36.0;
             let mut issues = vec![];
             let mut s = 10.0f32;
-            let mut closed = false;
-            if !small && !ratios.is_empty() {
-                if avg < 0.2 || (ratios.len() > 1 && min < 0.14) {
-                    s -= 6.0;
-                    closed = true;
-                    issues.push("nhắm mắt".to_string());
-                } else if avg < 0.28 {
-                    s -= 3.0;
-                    issues.push("mắt lim dim".to_string());
-                }
-            }
             if sharp < 4.0 {
                 s -= 4.0;
                 issues.push("mặt mờ".into());
@@ -345,7 +381,7 @@ pub fn assess(img: &RgbImage, g: &Gray, raw: &[RawFace]) -> People {
                 bbox: [f.x / w, f.y / h, f.w / w, f.h / h],
                 eyes: [(re.0 / w, re.1 / h), (le.0 / w, le.1 / h)],
                 eye_open: avg,
-                closed,
+                closed: false,
                 sharp,
                 lum,
                 yaw,
@@ -355,10 +391,46 @@ pub fn assess(img: &RgbImage, g: &Gray, raw: &[RawFace]) -> People {
                 score: s.clamp(0.0, 10.0),
                 issues,
                 mouth_open,
+                eye_p,
+                eye_min: min,
+                eye_seen: !small && (eye_p.is_some() || !ratios.is_empty()),
+                p_closed: 0.0,
+                by_hand: false,
+                base: s,
             }
         })
         .collect();
     faces.sort_by(|a, b| a.bbox[0].partial_cmp(&b.bbox[0]).unwrap());
+    judge(faces, &crate::eyes::EyeBook::default(), &|_| None)
+}
+
+/// Decide the eyes of every face (with Sơn's corrections in `book`, and his word on single faces
+/// from `forced(face number)`), then score the people in the photo. Cheap: no pixels involved,
+/// so it runs again whenever he corrects an eye.
+pub fn judge(mut faces: Vec<FaceInfo>, book: &crate::eyes::EyeBook, forced: &dyn Fn(usize) -> Option<bool>) -> People {
+    if faces.is_empty() {
+        return People { notes: vec!["Không thấy khuôn mặt nào, tiêu chí này không tính vào điểm".into()], ..Default::default() };
+    }
+    for (i, f) in faces.iter_mut().enumerate() {
+        f.issues.retain(|x| x != "nhắm mắt" && x != "mắt lim dim");
+        let mut s = f.base;
+        let hand = forced(i);
+        f.by_hand = hand.is_some();
+        f.p_closed = match hand {
+            Some(c) => c as u8 as f32,
+            None if f.eye_seen => book.p_closed(&f.eye_features()),
+            None => 0.0,
+        };
+        f.closed = f.p_closed >= 0.5;
+        if f.closed {
+            s -= 6.0;
+            f.issues.insert(0, "nhắm mắt".to_string());
+        } else if hand.is_none() && f.p_closed >= 0.3 {
+            s -= 2.0;
+            f.issues.insert(0, "mắt lim dim".to_string());
+        }
+        f.score = s.clamp(0.0, 10.0);
+    }
     let main: Vec<&FaceInfo> = faces.iter().filter(|f| f.main).collect();
     let mn = main.iter().map(|f| f.score).fold(10.0f32, f32::min);
     let avg = main.iter().map(|f| f.score).sum::<f32>() / main.len() as f32;
@@ -370,7 +442,14 @@ pub fn assess(img: &RgbImage, g: &Gray, raw: &[RawFace]) -> People {
     for (i, f) in main.iter().enumerate() {
         let lbl = if main.len() > 1 { format!("Người {}: ", i + 1) } else { String::new() };
         let body = if f.issues.is_empty() { "mắt mở, mặt nét, đủ sáng".to_string() } else { f.issues.join(", ") };
-        notes.push(format!("{lbl}{body}{}", if f.small { " (mặt nhỏ, chưa kiểm tra mắt)" } else { "" }));
+        let tail = if f.small {
+            " (mặt nhỏ, chưa kiểm tra mắt)"
+        } else if f.by_hand {
+            " (mắt: theo bạn sửa)"
+        } else {
+            ""
+        };
+        notes.push(format!("{lbl}{body}{tail}"));
     }
     let ec = {
         let (mut x, mut y) = (0f32, 0f32);
@@ -405,6 +484,22 @@ pub fn assess(img: &RgbImage, g: &Gray, raw: &[RawFace]) -> People {
         notes,
         eye_center: Some(ec),
         faces,
+    }
+}
+
+/// Faces a viewer looks at in this photo (the ones whose closed eyes count), by face number.
+pub fn lead_faces(p: &People) -> Vec<usize> {
+    let main: Vec<usize> = (0..p.faces.len()).filter(|&i| p.faces[i].main).collect();
+    if main.len() >= 5 {
+        let mut m = main;
+        m.sort_by(|&a, &b| {
+            let (fa, fb) = (&p.faces[a], &p.faces[b]);
+            (fb.bbox[2] * fb.bbox[3]).total_cmp(&(fa.bbox[2] * fa.bbox[3]))
+        });
+        m.truncate(2);
+        m
+    } else {
+        main
     }
 }
 

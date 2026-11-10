@@ -70,6 +70,8 @@ pub struct Analyzer {
     pub faces: Option<faces::FaceDetector>,
     #[cfg(feature = "faces")]
     pub visual: Option<crate::visual::Embedder>,
+    #[cfg(feature = "faces")]
+    pub eyes: Option<crate::eyes::EyeModel>,
     pub thumbs_dir: Option<PathBuf>,
 }
 
@@ -91,7 +93,12 @@ impl Analyzer {
                 },
                 _ => (None, Some("Chưa có mô hình nhận diện khuôn mặt, tiêu chí «Người» tạm bỏ qua".to_string())),
             };
-            (Self { faces: det, visual, thumbs_dir }, warn)
+            let eyes = face_model
+                .and_then(|p| p.parent())
+                .map(|d| d.join(crate::eyes::MODEL))
+                .filter(|p| p.exists())
+                .and_then(|p| crate::eyes::EyeModel::load(&p).ok());
+            (Self { faces: det, visual, eyes, thumbs_dir }, warn)
         }
         #[cfg(not(feature = "faces"))]
         {
@@ -126,7 +133,7 @@ impl Analyzer {
         #[cfg(feature = "faces")]
         if let (Some(det), false) = (&self.faces, ruined) {
             if let Ok(raw) = det.detect(&hi, 0.6) {
-                people = faces::assess(&hi, &ghi, &raw);
+                people = faces::assess_with(&hi, &ghi, &raw, self.eyes.as_ref());
                 faces_checked = true;
             }
         }
@@ -171,8 +178,7 @@ impl Analyzer {
             // Named after the file, not its position, so cached thumbnails stay right
             // when the folder's contents change.
             let p = d.join(format!("{}.jpg", file_key(path)));
-            let mut f = std::io::BufWriter::new(std::fs::File::create(&p).ok()?);
-            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut f, 82).encode_image(&t).ok()?;
+            std::fs::write(&p, metrics::encode_jpeg(&t, 82).ok()?).ok()?;
             Some(p)
         });
 
@@ -289,4 +295,14 @@ pub fn collect_with(dir: &Path, recursive: bool, skip_ours: bool) -> std::io::Re
     }
     out.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(out)
+}
+
+/// Re-decide the eyes in an analysed photo with Sơn's corrections (no pixels needed).
+pub fn rejudge(a: &mut Analysis, book: &crate::eyes::EyeBook, forced: &dyn Fn(usize) -> Option<bool>) {
+    if a.people.faces.is_empty() {
+        return;
+    }
+    let faces = std::mem::take(&mut a.people.faces);
+    a.people = faces::judge(faces, book, forced);
+    a.scores.people = a.people.score.map(|v| (v * 10.0).round() / 10.0);
 }

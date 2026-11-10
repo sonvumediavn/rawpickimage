@@ -19,6 +19,8 @@ faces = ["dep:tract-onnx"]
 
 [dependencies]
 jpeg-decoder = { version = "0.3", default-features = false }
+fast_image_resize = "6"
+jpeg-encoder = { version = "0.6", features = ["simd"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "tiff", "webp"] }
 rayon = "1.10"
 serde = { version = "1", features = ["derive"] }
