@@ -310,6 +310,9 @@ struct PhotoView {
     notes: Vec<(String, Vec<String>)>,
     faces: Vec<FaceBox>,
     error: Option<String>,
+    /// Stars given on the camera / in Lightroom, and the camera's protect lock.
+    stars: u8,
+    protected: bool,
 }
 
 #[derive(Serialize)]
@@ -388,6 +391,8 @@ fn photo_view(idx: usize, it: &Item) -> PhotoView {
             .map(|a| a.people.faces.iter().map(|f| FaceBox { bbox: f.bbox, closed: f.closed, main: f.main, issues: f.issues.clone(), eyes: f.eye_seen, by_hand: f.by_hand }).collect())
             .unwrap_or_default(),
         error: it.error.clone(),
+        stars: a.map(|a| a.stars).unwrap_or(0),
+        protected: a.is_some_and(|a| a.protected),
     }
 }
 

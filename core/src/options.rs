@@ -8,6 +8,18 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::Path;
 
+/// What to do with the stars Sơn gave on the camera.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum StarMode {
+    #[default]
+    Off,
+    /// Only starred photos go on; the AI still judges them (eyes, blur, duplicates…).
+    Filter,
+    /// Every starred photo is picked, nothing else.
+    Pick,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Options {
@@ -23,6 +35,11 @@ pub struct Options {
     /// Let the AI pick. Off: every photo still gets its score and notes, but nothing is chosen
     /// until Sơn chooses (his own picks stay either way).
     pub ai_pick: bool,
+    /// Stars given on the camera: ignore them, keep only starred photos for the AI to judge,
+    /// or take every starred photo as picked.
+    pub stars: StarMode,
+    /// Fewest stars that count (protected photos always count).
+    pub min_stars: u8,
 
     // The ten extras.
     /// 1. Scene coverage: every moment of the event keeps at least one photo.
@@ -58,6 +75,8 @@ impl Default for Options {
             dedupe: true,
             use_learned: true,
             ai_pick: true,
+            stars: StarMode::Off,
+            min_stars: 1,
             moments: false,
             key_people: false,
             fix_instead_of_reject: false,

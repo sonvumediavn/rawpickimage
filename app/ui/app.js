@@ -17,6 +17,7 @@ const PRESETS = {
 const REASONS = {
   "closed-eyes": "Nhắm mắt", blurry: "Mờ, rung, trượt nét", overexposed: "Cháy sáng / thừa sáng", underexposed: "Thiếu sáng",
   tilted: "Nghiêng", composition: "Sai bố cục", noise: "Nhiễu hạt nặng", duplicate: "Trùng lặp", broken: "File hỏng", "low-score": "Điểm thấp",
+  "not-starred": "Không gắn sao trên máy",
 };
 const CORE_OPTS = [
   ["reject_closed_eyes", "Loại ảnh có người nhắm mắt"],
@@ -401,6 +402,14 @@ function renderMain() {
 
 function renderAiSwitch() {
   $("optAiPick").checked = !aiOff();
+  // Stars: offered once the folder has starred (or camera-locked) photos, or the mode is on.
+  const o = st.prefs ? st.prefs.settings.options : {};
+  const photos = (st.session && st.session.photos) || [];
+  const n = photos.filter((p) => p.stars > 0 || p.protected).length;
+  const mode = o.stars || "off";
+  $("starWrap").hidden = !n && mode === "off";
+  $("optStars").value = mode;
+  $("optStars").options[0].textContent = n ? `Bỏ qua sao trên máy (${n} ảnh có sao)` : "Bỏ qua sao trên máy";
   const t = [...$("tabs").children].find((b) => b.dataset.t === "review");
   if (t) t.textContent = aiOff() ? "Chưa chọn" : "Cần xem lại";
 }
@@ -572,7 +581,7 @@ function renderGrid() {
       const p = P[i], v = st.verdicts[i], k = decKind(v.decision);
       return `<div class="card ${k}" data-i="${i}" tabindex="0">
         <div class="th">${p.thumb ? `<img loading="lazy" src="${fileSrc(p.thumb)}" alt="">` : ""}
-          <span class="sc ${cls(v.score)}">${v.score.toFixed(1)}</span>${v.overridden ? `<span class="man">sửa tay</span>` : ""}</div>
+          <span class="sc ${cls(v.score)}">${v.score.toFixed(1)}</span>${v.overridden ? `<span class="man">sửa tay</span>` : ""}${p.stars > 0 ? `<span class="star">${"★".repeat(p.stars)}</span>` : p.protected ? `<span class="star" title="Khóa bảo vệ trên máy">🔒</span>` : ""}</div>
         <div class="cap"><div class="nm">${esc(p.name)}${v.time != null ? " · " + fmtTime(v.time) : ""}</div><div class="why">${esc(topWhy(p, v))}</div></div>
       </div>`;
     })
@@ -596,6 +605,16 @@ function wireResults() {
   $("btnExport").onclick = doExportShow;
   $("btnLearnShow").onclick = doLearnShow;
   $("btnExportOther").onclick = doExport;
+  $("optStars").onchange = () => {
+    const v = $("optStars").value;
+    st.prefs.settings.options.stars = v;
+    renderAiSwitch();
+    savePrefs();
+    const n = st.session.photos.filter((p) => p.stars > 0 || p.protected).length;
+    toast(v === "pick" ? `Lấy đúng ${n} ảnh bạn gắn sao trên máy ảnh, các ảnh khác vào «Bị loại».`
+      : v === "filter" ? `Chỉ giữ ${n} ảnh có sao, AI lọc tiếp trong số đó (mắt nhắm, mờ, trùng…).`
+      : "Không dùng sao trên máy ảnh nữa.", 7000);
+  };
   $("optAiPick").onchange = () => {
     st.prefs.settings.options.ai_pick = $("optAiPick").checked;
     renderAiSwitch();

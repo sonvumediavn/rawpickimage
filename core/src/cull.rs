@@ -3,7 +3,7 @@
 use crate::analyze::{Analysis, CRITERIA};
 use crate::learn::{self, Profile};
 use crate::metrics;
-use crate::options::Options;
+use crate::options::{Options, StarMode};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -20,10 +20,12 @@ pub enum Reason {
     Duplicate,
     Broken,
     LowScore,
+    /// Not starred on the camera while only starred photos count.
+    NotStarred,
 }
 
 impl Reason {
-    pub const ALL: [Reason; 10] = [
+    pub const ALL: [Reason; 11] = [
         Reason::ClosedEyes,
         Reason::Blurry,
         Reason::Overexposed,
@@ -34,6 +36,7 @@ impl Reason {
         Reason::Duplicate,
         Reason::Broken,
         Reason::LowScore,
+        Reason::NotStarred,
     ];
 
     /// Sub-folder inside `3_Bi-loai` (ASCII so it survives any file system / zip tool).
@@ -49,6 +52,7 @@ impl Reason {
             Reason::Duplicate => "Trung-lap",
             Reason::Broken => "Mat-loi",
             Reason::LowScore => "Diem-thap",
+            Reason::NotStarred => "Khong-gan-sao",
         }
     }
 
@@ -64,6 +68,7 @@ impl Reason {
             Reason::Duplicate => "Trùng lặp",
             Reason::Broken => "File hỏng / không đọc được",
             Reason::LowScore => "Điểm thấp",
+            Reason::NotStarred => "Không gắn sao trên máy",
         }
     }
 }
@@ -229,6 +234,15 @@ pub fn cull(items: &[Option<&Analysis>], s: &Settings, profile: Option<&Profile>
     let o = &s.options;
     let fix = o.fix_instead_of_reject;
     let profile = profile.filter(|p| o.use_learned && p.ready());
+    // Camera stars. A folder where every file is read-only was copied that way (a disc, a
+    // shared drive): the camera's protect lock says nothing there.
+    let all_locked = {
+        let ok: Vec<&Analysis> = items.iter().flatten().copied().collect();
+        ok.len() >= 5 && ok.iter().all(|a| a.protected)
+    };
+    let min_stars = o.min_stars.max(1);
+    let starred = |a: &Analysis| a.stars >= min_stars || (a.protected && !all_locked);
+    let stars_on = o.stars != StarMode::Off;
     // Comparing every photo with the learned ones is the slow part: all cores at once.
     let learned_all: Vec<Option<f32>> = {
         use rayon::prelude::*;
@@ -268,6 +282,9 @@ pub fn cull(items: &[Option<&Analysis>], s: &Settings, profile: Option<&Profile>
             if let Some(p) = learned {
                 decision = learned_override(decision, p, trust, score, s, &mut notes);
             }
+            if stars_on && !starred(a) {
+                decision = Decision::Rejected(Reason::NotStarred);
+            }
             let offset = if o.multi_camera { s.camera_offsets.get(&a.camera).copied().unwrap_or(0.0) } else { 0.0 };
             Verdict {
                 idx,
@@ -304,9 +321,27 @@ pub fn cull(items: &[Option<&Analysis>], s: &Settings, profile: Option<&Profile>
         limit(&mut out, n);
     }
     for v in &mut out {
+        // Sơn's stars are his own choice: they win over anything the AI did afterwards.
+        let mine = match (stars_on, items[v.idx]) {
+            (true, Some(a)) if !starred(a) => {
+                v.decision = Decision::Rejected(Reason::NotStarred);
+                true
+            }
+            (true, Some(a)) => {
+                let how = if a.stars > 0 { format!("Bạn gắn {} sao trên máy ảnh", a.stars) } else { "Bạn khóa bảo vệ ảnh này trên máy ảnh".to_string() };
+                v.notes.insert(0, how);
+                if o.stars == StarMode::Pick {
+                    v.decision = Decision::Selected;
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
         v.ai_decision = v.decision;
         // AI picking off: keep its opinion for display, leave the choice to Sơn.
-        if !o.ai_pick && v.decision != Decision::Rejected(Reason::Broken) {
+        if !o.ai_pick && !mine && v.decision != Decision::Rejected(Reason::Broken) {
             v.decision = Decision::Review;
         }
     }
@@ -616,5 +651,32 @@ mod tests {
         let v = cull(&items, &s, None);
         assert_eq!(v[0].decision, Decision::Review);
         assert!(v[0].fixes[0].starts_with("Xoay thẳng"));
+    }
+
+    #[test]
+    fn camera_stars_filter_or_pick() {
+        let mut items: Vec<Analysis> = (0..6u64).map(|i| photo(&format!("p{i}"), i as f64 * 600.0, [8.0; 5], i.wrapping_mul(0x9e37_79b9_7f4a_7c15))).collect();
+        items[1].stars = 3;
+        items[4].protected = true;
+        let refs: Vec<Option<&Analysis>> = items.iter().map(Some).collect();
+        let mut s = Settings::default();
+        s.options.stars = StarMode::Pick;
+        let v = cull(&refs, &s, None);
+        let picked: Vec<usize> = v.iter().filter(|x| x.decision.keep()).map(|x| x.idx).collect();
+        assert_eq!(picked, vec![1, 4]);
+        assert!(v.iter().filter(|x| !x.decision.keep()).all(|x| x.decision == Decision::Rejected(Reason::NotStarred)));
+        // Filter: the starred ones still go through the AI; the rest are out.
+        s.options.stars = StarMode::Filter;
+        let v = cull(&refs, &s, None);
+        assert!(v.iter().filter(|x| ![1, 4].contains(&x.idx)).all(|x| x.decision == Decision::Rejected(Reason::NotStarred)));
+        assert!(v[1].decision != Decision::Rejected(Reason::NotStarred));
+        // Everything read-only (copied from a disc): the lock means nothing.
+        for a in &mut items {
+            a.protected = true;
+        }
+        let refs: Vec<Option<&Analysis>> = items.iter().map(Some).collect();
+        s.options.stars = StarMode::Pick;
+        let v = cull(&refs, &s, None);
+        assert_eq!(v.iter().filter(|x| x.decision.keep()).map(|x| x.idx).collect::<Vec<_>>(), vec![1]);
     }
 }

@@ -1,4 +1,5 @@
 pub mod exif;
+pub mod rating;
 pub mod metrics;
 pub mod preview;
 pub mod faces;

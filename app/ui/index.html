@@ -125,6 +125,13 @@
         </div>
         <div class="tools">
           <label class="chk aisw" title="Tắt: AI vẫn chấm điểm và ghi chú từng ảnh nhưng không chọn sẵn ảnh nào, bạn tự chọn"><input type="checkbox" id="optAiPick"> AI tự chọn</label>
+          <label class="chk aisw" id="starWrap" hidden title="Ảnh bạn gắn sao (hoặc khóa bảo vệ) ngay trên máy ảnh">★
+            <select id="optStars">
+              <option value="off">Bỏ qua sao trên máy</option>
+              <option value="filter">Chỉ lọc ảnh có sao</option>
+              <option value="pick">Lấy luôn ảnh có sao</option>
+            </select>
+          </label>
           <select id="reasonSel"><option value="">Mọi lý do</option></select>
           <select id="sortSel">
             <option value="time">Theo thời gian</option>

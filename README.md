@@ -97,6 +97,11 @@ trên CPU) xem từng mắt, kết hợp với phép đo độ cao tròng đen. 
 bạn sửa. Khi bạn chọn một ảnh mà AI tưởng là nhắm mắt, AI cũng coi đó là gợi ý nhẹ rằng mắt đang mở.
 Các lần sửa mắt cũng được chia sẻ qua thư mục học chung giữa các máy.
 
+**Ảnh gắn sao trên máy ảnh**: app đọc số sao bạn gắn ngay trên máy (Canon, Nikon, Sony, Fujifilm,
+cả sao gắn sau trong Lightroom/Bridge qua file .xmp) và ảnh khóa bảo vệ. Khi thư mục có ảnh gắn sao,
+thanh công cụ hiện ô ★: «Chỉ lọc ảnh có sao» (bỏ ảnh không sao, AI lọc tiếp trong số ảnh có sao: mắt
+nhắm, mờ, trùng…) hoặc «Lấy luôn ảnh có sao» (chọn đúng những ảnh bạn gắn sao).
+
 **Học từ show cũ…**: chọn thư mục một show đã lọc xong, xếp kiểu gì cũng được. App tự nhận ra thư mục
 ảnh bạn đã chọn bằng hình (cùng giờ chụp và trông giống nhau, kể cả đã đổi tên, chỉnh màu, xuất lại),
 coi ảnh gốc có bản trong đó là ảnh bạn giữ, còn lại là ảnh bỏ, rồi học luôn cả show. Chỉ có ảnh đã chọn

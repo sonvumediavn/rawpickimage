@@ -103,7 +103,13 @@ pub fn analyze_groups(groups: Vec<(PathBuf, Vec<PathBuf>)>, analyzer: &Analyzer,
                 let n = done.fetch_add(1, Ordering::Relaxed) + 1;
                 (p.on_step)(n, total, stage);
                 match res {
-                    Ok(a) => Item { path, files, analysis: Some(a), error: None },
+                    Ok(mut a) => {
+                        // Read fresh every time: stars may be added in Lightroom after analysis.
+                        let r = crate::rating::read(if files.is_empty() { std::slice::from_ref(&path) } else { &files });
+                        a.stars = r.stars;
+                        a.protected = r.protected;
+                        Item { path, files, analysis: Some(a), error: None }
+                    }
                     Err(e) => Item { path, files, analysis: None, error: Some(format!("{e:#}")) },
                 }
             })

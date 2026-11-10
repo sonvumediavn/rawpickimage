@@ -63,6 +63,12 @@ pub struct Analysis {
     /// How the photo looks, for learning Sơn's taste from pictures ([`crate::visual`]).
     #[serde(default, with = "crate::visual::hex")]
     pub embed: Vec<i8>,
+    /// Stars given on the camera or in Lightroom (0 = none), see [`crate::rating`].
+    #[serde(default)]
+    pub stars: u8,
+    /// Locked ("protect") on the camera.
+    #[serde(default)]
+    pub protected: bool,
 }
 
 pub struct Analyzer {
@@ -212,6 +218,8 @@ impl Analyzer {
             signature,
             thumb,
             embed,
+            stars: 0,
+            protected: false,
         })
     }
 }
