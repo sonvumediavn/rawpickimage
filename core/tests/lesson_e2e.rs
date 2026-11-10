@@ -34,7 +34,7 @@ fn learns_picks_from_a_real_show() {
     let p = Progress { on_step: &|_, _, _| {}, cancel: &cancel };
     let (samples, l) = lesson::learn_show(&d.path().join("show"), &an, None, &p).unwrap();
     eprintln!("{l:?}");
-    assert!(samples.iter().all(|s| s.e.len() == rawpick_core::visual::DIM));
+    assert!(samples.iter().all(|s| s.e.len() == rawpick_core::visual::FULL));
     assert_eq!(l.kept, 2, "{l:?}");
     assert_eq!(l.dropped, files.len() - 2);
 }

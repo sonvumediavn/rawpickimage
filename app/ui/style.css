@@ -128,6 +128,11 @@ kbd { font-family: var(--f-mono); font-size: 10.5px; color: var(--dim); margin-l
 .frame img { max-width: 100%; max-height: calc(92vh - 20px); display: block; }
 .fbox { position: absolute; border: calc(2px / var(--zs, 1)) solid var(--hi); border-radius: calc(4px / var(--zs, 1)); }
 .fbox.closed { border-color: var(--pencil); }
+.fbox.hl { box-shadow: 0 0 0 calc(3px / var(--zs, 1)) var(--fg); }
+.deyes { border-top: 1px solid var(--line); padding-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+.deyes .h { display: flex; justify-content: space-between; gap: 8px; font-size: 13px; flex-wrap: wrap; }
+.eyerow { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+.eyerow > span { flex: 1; }
 .dimg.zoomed .fbox { display: none; } /* boxes would hide the detail being checked */
 .fbox span { position: absolute; bottom: 100%; left: 0; transform: scale(calc(1 / var(--zs, 1))); transform-origin: 0 100%; font-size: 11px; background: var(--pencil); color: #fff; padding: 0 4px; border-radius: 3px; white-space: nowrap; }
 .dside { overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; border-left: 1px solid var(--line); }

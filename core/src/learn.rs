@@ -163,14 +163,14 @@ impl Profile {
     }
 
     fn build_bank(&mut self) {
-        let with: Vec<&Sample> = self.samples.iter().filter(|s| s.e.len() == visual::DIM).collect();
+        let with: Vec<&Sample> = self.samples.iter().filter(|s| visual::usable(&s.e)).collect();
         let from = with.len().saturating_sub(BANK_MAX);
         self.bank = with[from..].iter().map(|s| BankEntry { e: s.e.clone(), keep: s.keep, show: s.show() }).collect();
     }
 
     /// [similarity to kept photos, similarity to dropped photos]; NaN where unknown.
     fn vis(&self, e: &[i8], skip_show: Option<u32>) -> [f32; N_VIS] {
-        if e.len() != visual::DIM {
+        if !visual::usable(e) {
             return [f32::NAN; N_VIS];
         }
         let mut kept = vec![];
@@ -356,7 +356,7 @@ impl Profile {
 
     /// Photos with an image vector, i.e. what the AI can compare by look.
     pub fn seen_count(&self) -> usize {
-        self.samples.iter().filter(|s| s.e.len() == visual::DIM).count()
+        self.samples.iter().filter(|s| visual::usable(&s.e)).count()
     }
 
     /// Plain-language summary of what the profile has learned, strongest first.

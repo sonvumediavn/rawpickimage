@@ -813,13 +813,18 @@ async function renderDetail() {
   if (zoom.idx !== i) loadPhoto(i);
   const frame = $("dframe");
   for (const b of frame.querySelectorAll(".fbox")) b.remove();
-  for (const f of p.faces) {
+  const mains = p.faces.map((f, n) => ({ f, n })).filter((x) => x.f.main);
+  p.faces.forEach((f, n) => {
     const d = document.createElement("div");
     d.className = "fbox" + (f.closed ? " closed" : "");
+    d.dataset.n = n;
     Object.assign(d.style, { left: f.bbox[0] * 100 + "%", top: f.bbox[1] * 100 + "%", width: f.bbox[2] * 100 + "%", height: f.bbox[3] * 100 + "%" });
-    if (f.issues.length) d.innerHTML = `<span>${esc(f.issues[0])}</span>`;
+    const num = mains.length > 1 ? mains.findIndex((x) => x.n === n) + 1 : 0;
+    const label = [num > 0 ? `${num}` : "", f.issues[0] || ""].filter(Boolean).join(" · ");
+    if (label) d.innerHTML = `<span>${esc(label)}</span>`;
     frame.appendChild(d);
-  }
+  });
+  renderEyes(i, p, mains);
   const ai = v.overridden || (aiOff() && v.ai_decision.kind !== "review")
     ? ` <span class="note">(AI ${v.overridden ? "" : "gợi ý "}: ${esc(aiOff() && v.ai_decision.kind === "review" ? "Cần xem lại" : decLabel(v.ai_decision))})</span>`
     : "";
@@ -1080,6 +1085,49 @@ async function decide(kind) {
     decision = { kind: "rejected", reason: cur.ai_decision.kind === "rejected" ? cur.ai_decision.reason : "low-score" };
   }
   applyVerdicts(await invoke("set_decision", { id: st.sid, idx: i, decision }));
+}
+
+/** One row per main face: Sơn tells the AI whether the eyes are open or closed. */
+function renderEyes(i, p, mains) {
+  const box = $("deyes");
+  const rows = mains.filter((x) => x.f.eyes).slice(0, 8);
+  box.hidden = !rows.length || !!p.error;
+  if (box.hidden) { box.innerHTML = ""; return; }
+  box.innerHTML = `<div class="h"><span>Mắt</span><span class="note">AI nhìn sai? Bấm để sửa, AI nhớ cho lần sau</span></div>` + rows
+    .map(({ f, n }, k) => `<div class="eyerow" data-n="${n}">
+      <span>${rows.length > 1 || mains.length > 1 ? `Người ${mains.findIndex((x) => x.n === n) + 1}` : "Mắt"}${f.by_hand ? ' <em class="note">(bạn sửa)</em>' : ""}</span>
+      <button class="btn sm${!f.closed ? " on" : ""}" data-open="1">Mở</button>
+      <button class="btn sm${f.closed ? " on" : ""}" data-open="0">Nhắm</button>
+      ${f.by_hand ? `<button class="btn sm" data-open="" title="Để AI tự xét lại mặt này">↺</button>` : ""}
+    </div>`)
+    .join("");
+  for (const row of box.querySelectorAll(".eyerow")) {
+    const n = +row.dataset.n;
+    const fb = () => $("dframe").querySelector(`.fbox[data-n="${n}"]`);
+    row.onmouseenter = () => fb()?.classList.add("hl");
+    row.onmouseleave = () => fb()?.classList.remove("hl");
+    for (const b of row.querySelectorAll("button")) b.onclick = () => setEyes(i, n, b.dataset.open === "" ? null : b.dataset.open === "1");
+  }
+}
+
+async function setEyes(i, face, open) {
+  let r;
+  try {
+    r = await invoke("set_eyes", { id: st.sid, idx: i, face, open });
+  } catch (e) {
+    toast(esc(String(e)));
+    return;
+  }
+  st.session.photos[i] = r.photo;
+  applyVerdicts({ verdicts: r.verdicts, summary: r.summary });
+  toast(open == null ? "Đã để AI tự xét lại mắt người này." : `Đã ghi nhớ: mắt ${open ? "mở" : "nhắm"}. AI đã học từ ${r.corrected} lần bạn sửa mắt và xét lại các ảnh khác.`, 3500);
+  // Other photos may have changed too (the eye rule learned): refresh their notes quietly.
+  const sid = st.sid;
+  invoke("get_session", { id: sid }).then((v) => {
+    if (st.sid !== sid || !st.session) return;
+    st.session.photos = v.photos;
+    if (st.views[sid]) st.views[sid].photos = v.photos;
+  }).catch(() => {});
 }
 
 function step(d) {

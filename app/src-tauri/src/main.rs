@@ -8,6 +8,7 @@ use rawpick_core::ingest::{self, CopyReport};
 use rawpick_core::learn::{self, Store};
 use rawpick_core::options::{self, FeatureInfo, Suggestion};
 use rawpick_core::pipeline::{self, Item, Progress, Timing};
+use rawpick_core::eyes::EyeBook;
 use rawpick_core::{metrics, preview};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -149,6 +150,8 @@ struct App {
     /// The desktop window; events also go to every open web page.
     handle: std::sync::OnceLock<AppHandle>,
     web: web::Web,
+    /// Sơn's open/closed-eye corrections and the eye rule fitted to them.
+    eyes: Mutex<EyeBook>,
 }
 
 impl App {
@@ -163,6 +166,22 @@ impl App {
         let g = self.global.lock().unwrap();
         let shared = g.sync_dir.as_ref().filter(|d| d.is_dir()).map(|d| learn::Shared { dir: d.clone(), machine: g.machine_id.clone(), label: machine_label() });
         Store::new(learn::default_dir(&self.data_dir)).with_shared(shared)
+    }
+
+    fn eyes_shared(&self) -> Option<(PathBuf, String)> {
+        let g = self.global.lock().unwrap();
+        g.sync_dir.as_ref().filter(|d| d.is_dir()).map(|d| (d.clone(), g.machine_id.clone()))
+    }
+
+    fn load_eyes(&self) {
+        let sh = self.eyes_shared();
+        let b = EyeBook::load(&self.data_dir.join("eyes.json"), sh.as_ref().map(|(d, m)| (d.as_path(), m.as_str())));
+        *self.eyes.lock().unwrap() = b;
+    }
+
+    fn save_eyes(&self, b: &EyeBook) {
+        let sh = self.eyes_shared();
+        let _ = b.save(&self.data_dir.join("eyes.json"), sh.as_ref().map(|(d, m)| (d.as_path(), m.as_str())));
     }
 
     fn save_global(&self) {
@@ -205,6 +224,16 @@ impl App {
 
     /// Re-decide with the session's settings and keep Sơn's manual choices.
     fn recull(&self, s: &mut Session) {
+        // Eyes first: Sơn's corrections may have changed who has their eyes closed.
+        {
+            let book = self.eyes.lock().unwrap();
+            for it in s.items.iter_mut() {
+                let key = it.path.display().to_string();
+                if let Some(a) = it.analysis.as_mut() {
+                    rawpick_core::analyze::rejudge(a, &book, &|f| book.forced(&key, f));
+                }
+            }
+        }
         let prof = self.store().load(&s.prefs.profile);
         s.verdicts = pipeline::decide(&s.items, &s.prefs.settings, Some(&prof));
         pipeline::apply_overrides(&mut s.verdicts, &s.items, &s.overrides);
@@ -244,6 +273,10 @@ struct FaceBox {
     closed: bool,
     main: bool,
     issues: Vec<String>,
+    /// Eyes can be judged (and corrected): face not too small.
+    eyes: bool,
+    /// Sơn corrected these eyes himself.
+    by_hand: bool,
 }
 
 #[derive(Serialize)]
@@ -337,7 +370,7 @@ fn photo_view(idx: usize, it: &Item) -> PhotoView {
             })
             .unwrap_or_default(),
         faces: a
-            .map(|a| a.people.faces.iter().map(|f| FaceBox { bbox: f.bbox, closed: f.closed, main: f.main, issues: f.issues.clone() }).collect())
+            .map(|a| a.people.faces.iter().map(|f| FaceBox { bbox: f.bbox, closed: f.closed, main: f.main, issues: f.issues.clone(), eyes: f.eye_seen, by_hand: f.by_hand }).collect())
             .unwrap_or_default(),
         error: it.error.clone(),
     }
@@ -645,6 +678,18 @@ fn op_set_decision(app: &Arc<App>, id: u32, idx: usize, decision: Option<Decisio
             s.overrides.insert(key.clone(), d);
             // Learn right away from every hand-made choice (no need to export first).
             if let (Some(a), Some(v)) = (s.items[idx].analysis.as_ref(), s.verdicts.get(idx)) {
+                // Picked although the AI saw closed eyes: the eyes of the people who matter were
+                // most likely open. Taken as a soft hint for the eye rule.
+                if d.keep() && a.people.closed_eyes {
+                    let mut book = app.eyes.lock().unwrap();
+                    for fi in rawpick_core::faces::lead_faces(&a.people) {
+                        let f = &a.people.faces[fi];
+                        if f.closed && !f.by_hand && f.eye_seen {
+                            book.set(&key, fi, f.eye_features(), Some(false), false);
+                        }
+                    }
+                    app.save_eyes(&book);
+                }
                 let store = app.store();
                 let mut p = store.load(&s.prefs.profile);
                 p.add(vec![learn::Sample::new(key, a, d.keep(), v.ai_decision.keep(), true)]);
@@ -661,6 +706,51 @@ fn op_set_decision(app: &Arc<App>, id: u32, idx: usize, decision: Option<Decisio
     let v = VerdictsView { verdicts: s.verdicts.clone(), summary: cull::summarize(&s.verdicts), profile };
     app.save_sessions(&map);
     Ok(v)
+}
+
+#[derive(Serialize)]
+struct EyesResult {
+    photo: PhotoView,
+    verdicts: Vec<Verdict>,
+    summary: Summary,
+    /// Faces Sơn has corrected so far (all shows).
+    corrected: usize,
+}
+
+/// Sơn says the eyes of face `face` in photo `idx` are open (`open = true`), closed, or lets the
+/// AI decide again (`None`). The photo changes at once; the eye rule learns from it for every
+/// other photo.
+fn op_set_eyes(app: &Arc<App>, id: u32, idx: usize, face: usize, open: Option<bool>) -> Result<EyesResult, String> {
+    let mut map = app.sessions.lock().unwrap();
+    let s = map.get_mut(&id).ok_or("Phiên đã đóng")?;
+    let it = s.items.get(idx).ok_or("Sai ảnh")?;
+    let key = it.path.display().to_string();
+    let f = it.analysis.as_ref().and_then(|a| a.people.faces.get(face)).ok_or("Không có khuôn mặt này")?;
+    if !f.eye_seen {
+        return Err("Mặt này quá nhỏ để xét mắt".into());
+    }
+    let x = f.eye_features();
+    let corrected = {
+        let mut book = app.eyes.lock().unwrap();
+        book.set(&key, face, x, open.map(|o| !o), true);
+        app.save_eyes(&book);
+        book.manual_count()
+    };
+    // Re-decide every open session: the new rule applies to all of them.
+    let ids: Vec<u32> = map.keys().copied().collect();
+    for sid in ids {
+        if let Some(x) = map.get_mut(&sid) {
+            if !x.items.is_empty() {
+                app.recull(x);
+            }
+        }
+    }
+    let s = map.get(&id).ok_or("Phiên đã đóng")?;
+    let r = EyesResult { photo: photo_view(idx, &s.items[idx]), verdicts: s.verdicts.clone(), summary: cull::summarize(&s.verdicts), corrected };
+    app.save_sessions(&map);
+    drop(map);
+    sessions_changed(app);
+    Ok(r)
 }
 
 /// Teach the session's event-type profile from its final choices.
@@ -842,6 +932,9 @@ fn op_set_folder(app: &Arc<App>, which: &str, path: Option<String>) -> Result<Ap
         }
     }
     app.save_global();
+    if which != "drive" {
+        app.load_eyes();
+    }
     Ok(op_app_info(app))
 }
 
@@ -1438,6 +1531,8 @@ struct Args {
     new_password: bool,
     tunnel_host: Option<String>,
     tunnel_token: Option<String>,
+    face: Option<usize>,
+    open: Option<bool>,
 }
 
 fn need<T>(v: Option<T>, what: &str) -> Result<T, String> {
@@ -1473,6 +1568,7 @@ fn dispatch(app: &Arc<App>, cmd: &str, args: serde_json::Value) -> Result<serde_
         "chat" => json(op_chat(app, a.id, need(a.message, "message")?, a.use_claude)?),
         "copy_card" => json(op_copy_card(app, need(a.card, "card")?, need(a.dest, "dest")?, a.backup)?),
         "cancel" => json(op_cancel(app, a.id)),
+        "set_eyes" => json(op_set_eyes(app, need(a.id, "id")?, need(a.idx, "idx")?, need(a.face, "face")?, a.open)?),
         "big_preview" => json(op_big_preview(app, need(a.id, "id")?, need(a.idx, "idx")?, a.full)?),
         "list_dir" => json(web::list_dir(a.path.as_deref())?),
         "open_path" => {
@@ -1549,7 +1645,9 @@ fn main() {
                 card_busy: AtomicBool::new(false),
                 handle: std::sync::OnceLock::new(),
                 web: web::Web::default(),
+                eyes: Mutex::new(EyeBook::default()),
             });
+            app_state.load_eyes();
             let _ = app_state.handle.set(app.handle().clone());
             web::start(&app_state);
             app.manage(app_state);

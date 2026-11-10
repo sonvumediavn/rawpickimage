@@ -87,7 +87,15 @@ và có thể giữ lại cả những ảnh mà luật cứng định loại (t
 
 **AI nhìn ảnh**: ngoài các con số đo được, mỗi ảnh có một «dấu vân hình» do mô hình MobileNetV2 (chạy
 trên CPU, không cần mạng) tạo ra. AI so ảnh mới với những ảnh bạn từng giữ và từng bỏ ở các show khác,
-nên học được cả kiểu khoảnh khắc, khung hình, dáng người bạn thích.
+nên học được cả kiểu khoảnh khắc, khung hình, dáng người bạn thích. Dấu vân hình gồm ba phần: trong
+ảnh có gì, cái gì nằm ở góc nào của khung (bốn phần tư khung hình), và chỗ mắt người xem bị hút vào
+(chủ thể đặt ở đâu, to hay nhỏ). Nhờ đó AI nhớ được bố cục và góc máy bạn hay chọn, không cần Claude.
+
+**Mắt mở hay nhắm**: một mô hình nhỏ chuyên nhận mắt (open-closed-eye-0001 của OpenVINO, 46 KB, chạy
+trên CPU) xem từng mắt, kết hợp với phép đo độ cao tròng đen. Nếu AI nhìn sai, mở ảnh và bấm «Mở» hoặc
+«Nhắm» cạnh từng người: ảnh đó sửa ngay, và AI chỉnh lại cách xét mắt cho mọi ảnh khác theo những lần
+bạn sửa. Khi bạn chọn một ảnh mà AI tưởng là nhắm mắt, AI cũng coi đó là gợi ý nhẹ rằng mắt đang mở.
+Các lần sửa mắt cũng được chia sẻ qua thư mục học chung giữa các máy.
 
 **Học từ show cũ…**: chọn thư mục một show đã lọc xong, xếp kiểu gì cũng được. App tự nhận ra thư mục
 ảnh bạn đã chọn bằng hình (cùng giờ chụp và trông giống nhau, kể cả đã đổi tên, chỉnh màu, xuất lại),

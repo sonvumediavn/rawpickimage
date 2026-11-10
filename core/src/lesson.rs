@@ -67,7 +67,7 @@ pub fn lessons(items: &[Item]) -> (Vec<Sample>, Lesson) {
                     continue;
                 }
                 let b = other.analysis.as_ref().unwrap();
-                let sim = visual::similarity(&a.embed, &b.embed);
+                let sim = visual::similarity_content(&a.embed, &b.embed);
                 let same_time = matches!((a.time, b.time), (Some(x), Some(y)) if (x - y).abs() <= SAME_TIME);
                 let same_name = a.name.rsplit_once('.').map(|x| x.0.to_lowercase()) == b.name.rsplit_once('.').map(|x| x.0.to_lowercase());
                 let hit = (same_time && (sim >= SIM_WITH_TIME || a.embed.is_empty() || b.embed.is_empty() || same_name)) || sim >= SIM_ALONE;
