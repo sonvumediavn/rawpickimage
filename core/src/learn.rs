@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 /// Measured features stored with each sample.
-pub const N_FEAT: usize = 17;
+pub const N_FEAT: usize = 20;
 /// Features from the pictures themselves: how close a photo looks to the ones Sơn kept, and
 /// to the ones he dropped (computed from the stored image vectors, not stored).
 pub const N_VIS: usize = 2;
@@ -71,11 +71,12 @@ fn fair_pick<T>(items: &[T], max: usize, group: impl Fn(&T) -> u32, rank: impl F
 pub const FEATURE_NAMES: [&str; N_ALL] = [
     "Phơi sáng", "Độ nét", "Bố cục", "Màu sắc", "Nhiễu", "Người", "Có người", "Mắt nhắm", "Nghiêng (độ)", "Cháy sáng (%)", "Số khuôn mặt",
     "Miệng mở (khẩu hình)", "Mặt nghiêng", "Cỡ nhân vật chính", "Chủ thể ở điểm mạnh", "Chủ thể sát mép", "Độ sáng tổng",
+    "Cúi đầu", "Người phát biểu cúi đầu", "Tỉ lệ người mở mắt",
     "Nhìn giống ảnh bạn hay chọn", "Nhìn giống ảnh bạn hay bỏ",
 ];
 
 /// Values for features a sample saved by an older version doesn't have.
-const NEUTRAL: [f32; N_FEAT] = [5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.46];
+const NEUTRAL: [f32; N_FEAT] = [5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.46, 0.0, 0.0, 9.0];
 
 pub fn features(a: &Analysis) -> [f32; N_FEAT] {
     let s = &a.scores;
@@ -100,6 +101,11 @@ pub fn features(a: &Analysis) -> [f32; N_FEAT] {
         a.comp.pos * 10.0,
         a.comp.border_pen.min(5.0),
         a.exposure.mean / 255.0,
+        // Bowed head: whether it matters depends on the shot, so also alone in the frame
+        // (a speaker at the lectern) versus with others (a candid moment).
+        lead.map(|f| f.pitch.max(0.0) * 10.0).unwrap_or(0.0),
+        a.people.solo().map(|f| f.pitch.max(0.0) * 10.0).unwrap_or(0.0),
+        a.people.open_share() * 10.0,
     ]
 }
 

@@ -49,6 +49,68 @@ pub struct EyeSample {
     pub origin: Option<String>,
 }
 
+/// Other things Sơn can say about a face, learned the same way as the eyes: each from one
+/// measure, with a starting threshold that his corrections move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Mark {
+    /// Unflattering mouth (mid-word, wide open, twisted): "khẩu hình xấu".
+    Mouth,
+    /// Face turned away from the camera.
+    Turned,
+    /// Looking down / head bowed.
+    Down,
+}
+
+impl Mark {
+    pub const ALL: [Mark; 3] = [Mark::Mouth, Mark::Turned, Mark::Down];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Mark::Mouth => "mouth",
+            Mark::Turned => "turned",
+            Mark::Down => "down",
+        }
+    }
+
+    pub fn from_key(k: &str) -> Option<Mark> {
+        Mark::ALL.into_iter().find(|m| m.key() == k)
+    }
+
+    /// Starting rule: (threshold on the measure, steepness).
+    fn prior(self) -> [f32; 2] {
+        match self {
+            // Mouth gap height / width; above ~0.3 clearly open.
+            Mark::Mouth => [-0.3 * 20.0, 20.0],
+            // |yaw| in eye distances; above ~0.38 clearly turned.
+            Mark::Turned => [-0.38 * 15.0, 15.0],
+            // Head pitch (see faces::head_pitch); above ~0.2 clearly bowed.
+            Mark::Down => [-0.2 * 15.0, 15.0],
+        }
+    }
+}
+
+/// What a mark is judged from: [1, measure].
+pub fn mark_features(m: Mark, mouth_open: f32, yaw: f32, pitch: f32) -> [f32; 2] {
+    [
+        1.0,
+        match m {
+            Mark::Mouth => mouth_open,
+            Mark::Turned => yaw.abs(),
+            Mark::Down => pitch,
+        },
+    ]
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarkSample {
+    pub mark: Mark,
+    pub x: [f32; 2],
+    pub yes: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+}
+
 /// Sơn's eye corrections and the combiner fitted to them.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EyeBook {
@@ -56,6 +118,11 @@ pub struct EyeBook {
     pub samples: BTreeMap<String, EyeSample>,
     #[serde(skip)]
     pub w: Option<[f32; N]>,
+    /// Mouth / face angle / head corrections, keyed by `<mark>|<photo path>#<face number>`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub marks: BTreeMap<String, MarkSample>,
+    #[serde(skip)]
+    pub mw: BTreeMap<Mark, [f32; 2]>,
 }
 
 pub fn key(photo: &str, face: usize) -> String {
@@ -75,7 +142,63 @@ impl EyeBook {
     }
 
     pub fn manual_count(&self) -> usize {
-        self.samples.values().filter(|s| s.manual).count()
+        self.samples.values().filter(|s| s.manual).count() + self.marks.len()
+    }
+
+    /// Probability that a face shows mark `m` (bad mouth, turned, looking down).
+    pub fn p_mark(&self, m: Mark, x: &[f32; 2]) -> f32 {
+        let w = self.mw.get(&m).copied().unwrap_or(m.prior());
+        sigmoid(w[0] * x[0] + w[1] * x[1])
+    }
+
+    /// Sơn's own word on mark `m` of this face.
+    pub fn forced_mark(&self, m: Mark, photo: &str, face: usize) -> Option<bool> {
+        self.marks.get(&format!("{}|{}", m.key(), key(photo, face))).map(|s| s.yes)
+    }
+
+    /// Record (or with `None` forget) what Sơn says about mark `m` of a face, and re-fit it.
+    pub fn set_mark(&mut self, m: Mark, photo: &str, face: usize, x: [f32; 2], yes: Option<bool>) {
+        let k = format!("{}|{}", m.key(), key(photo, face));
+        match yes {
+            Some(y) => {
+                self.marks.insert(k, MarkSample { mark: m, x, yes: y, origin: None });
+            }
+            None => {
+                self.marks.remove(&k);
+            }
+        }
+        self.train_marks();
+    }
+
+    /// One small logistic fit per mark, pulled towards its starting rule.
+    fn train_marks(&mut self) {
+        self.mw.clear();
+        for m in Mark::ALL {
+            let data: Vec<(&[f32; 2], f32)> = self.marks.values().filter(|s| s.mark == m).map(|s| (&s.x, s.yes as u8 as f32)).collect();
+            if data.is_empty() {
+                continue;
+            }
+            let prior = m.prior();
+            let n = data.len() as f32;
+            let lambda = 4.0 / n.max(1.0);
+            let mut w = prior;
+            // The measure's scale differs per mark: step in units of the prior's steepness.
+            let scale = prior[1].abs().max(1.0);
+            for _ in 0..600 {
+                let mut g = [0f32; 2];
+                for (x, y) in &data {
+                    let p = sigmoid(w[0] * x[0] + w[1] * x[1]);
+                    g[0] += (p - y) * x[0];
+                    g[1] += (p - y) * x[1];
+                }
+                for k in 0..2 {
+                    g[k] = g[k] / n + lambda * (w[k] - prior[k]) * 0.02 / (scale * scale);
+                }
+                w[0] -= 0.5 * scale * g[0];
+                w[1] -= 4.0 * scale * scale * g[1];
+            }
+            self.mw.insert(m, w);
+        }
     }
 
     /// Record a correction (`None` forgets it) and re-fit.
@@ -99,6 +222,7 @@ impl EyeBook {
     /// Logistic regression pulled towards the starting rule: a handful of corrections nudge it,
     /// many corrections can reshape it. Hand corrections count double a guess.
     pub fn train(&mut self) {
+        self.train_marks();
         let data: Vec<(&[f32; N], f32, f32)> = self.samples.values().map(|s| (&s.x, s.closed as u8 as f32, if s.manual { 1.0 } else { 0.5 })).collect();
         if data.is_empty() {
             self.w = None;
@@ -128,6 +252,7 @@ impl EyeBook {
     pub fn load(local: &Path, shared: Option<(&Path, &str)>) -> EyeBook {
         let mut b: EyeBook = std::fs::read(local).ok().and_then(|x| serde_json::from_slice(&x).ok()).unwrap_or_default();
         b.samples.retain(|_, s| s.origin.is_none());
+        b.marks.retain(|_, s| s.origin.is_none());
         if let Some((dir, me)) = shared {
             for f in std::fs::read_dir(dir).into_iter().flatten().flatten() {
                 let name = f.file_name().to_string_lossy().into_owned();
@@ -140,6 +265,10 @@ impl EyeBook {
                     s.origin = Some(machine.to_string());
                     b.samples.entry(k).or_insert(s);
                 }
+                for (k, mut s) in other.marks {
+                    s.origin = Some(machine.to_string());
+                    b.marks.entry(k).or_insert(s);
+                }
             }
         }
         b.train();
@@ -148,7 +277,12 @@ impl EyeBook {
 
     /// Save this computer's corrections (and share them when a shared folder is set).
     pub fn save(&self, local: &Path, shared: Option<(&Path, &str)>) -> std::io::Result<()> {
-        let mine = EyeBook { samples: self.samples.iter().filter(|(_, s)| s.origin.is_none()).map(|(k, s)| (k.clone(), s.clone())).collect(), w: None };
+        let mine = EyeBook {
+            samples: self.samples.iter().filter(|(_, s)| s.origin.is_none()).map(|(k, s)| (k.clone(), s.clone())).collect(),
+            w: None,
+            marks: self.marks.iter().filter(|(_, s)| s.origin.is_none()).map(|(k, s)| (k.clone(), s.clone())).collect(),
+            mw: BTreeMap::new(),
+        };
         let bytes = serde_json::to_vec(&mine)?;
         std::fs::write(local, &bytes)?;
         if let Some((dir, me)) = shared {
@@ -229,6 +363,24 @@ mod tests {
         // A guess does not overwrite his word.
         b.set("/a/1.jpg", 0, x_open, Some(true), false);
         assert_eq!(b.forced("/a/1.jpg", 0), Some(false));
+    }
+
+    #[test]
+    fn learns_marks_from_corrections() {
+        let mut b = EyeBook::default();
+        let x = |v: f32| mark_features(Mark::Down, 0.0, 0.0, v);
+        assert!(b.p_mark(Mark::Down, &x(0.3)) > 0.5);
+        assert!(b.p_mark(Mark::Down, &x(0.05)) < 0.5);
+        // His camera angle (shooting up at a stage): faces measure ~0.25 while looking straight.
+        for i in 0..6 {
+            b.set_mark(Mark::Down, &format!("/a/{i}.jpg"), 0, x(0.24 + i as f32 * 0.01), Some(false));
+            b.set_mark(Mark::Down, &format!("/b/{i}.jpg"), 0, x(0.45 + i as f32 * 0.01), Some(true));
+        }
+        assert!(b.p_mark(Mark::Down, &x(0.27)) < 0.5, "{}", b.p_mark(Mark::Down, &x(0.27)));
+        assert!(b.p_mark(Mark::Down, &x(0.47)) > 0.5);
+        assert_eq!(b.forced_mark(Mark::Down, "/a/1.jpg", 0), Some(false));
+        // Other marks keep their starting rule.
+        assert!(b.p_mark(Mark::Mouth, &mark_features(Mark::Mouth, 0.5, 0.0, 0.0)) > 0.5);
     }
 
     #[test]

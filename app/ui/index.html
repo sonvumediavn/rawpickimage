@@ -21,6 +21,7 @@
       </div>
       <div class="row2">
         <button class="btn" id="btnCard">Chép từ thẻ nhớ…</button>
+        <button class="btn" id="btnStarCopy" title="Chép ngay các ảnh bạn gắn sao trên máy ảnh, lấy thẳng từ thẻ nhớ hoặc thư mục, không cần đợi AI chấm">★ Chép nhanh ảnh gắn sao…</button>
         <label class="chk"><input type="checkbox" id="optRecursive"> Gồm thư mục con</label>
       </div>
     </section>
@@ -129,6 +130,7 @@
           <button data-t="selected">Đã chọn</button>
           <button data-t="review">Cần xem lại</button>
           <button data-t="rejected">Bị loại</button>
+          <button data-t="stars" title="Ảnh bạn gắn sao (rating 1–5) hoặc khóa bảo vệ trên máy ảnh">★ Gắn sao</button>
         </div>
         <div class="tools">
           <label class="chk aisw" title="Tắt: AI vẫn chấm điểm và ghi chú từng ảnh nhưng không chọn sẵn ảnh nào, bạn tự chọn"><input type="checkbox" id="optAiPick"> AI tự chọn</label>
@@ -148,6 +150,14 @@
           <button class="btn" id="btnExportOther" title="Chép ảnh đã chọn ra một thư mục bạn chọn">Xuất ra thư mục khác…</button>
           <button class="btn primary" id="btnExport" title="Lưu ảnh đã chọn vào thư mục «…_anh chon» trong thư mục gốc, rồi chép lên Google Drive">Xuất ảnh chọn</button>
         </div>
+      </div>
+      <div class="starbar" id="starBar" hidden>
+        <div class="seg" id="starMin" role="radiogroup" aria-label="Số sao tối thiểu">
+          <button data-n="1">1★ trở lên</button><button data-n="2">2★+</button><button data-n="3">3★+</button><button data-n="4">4★+</button><button data-n="5">5★</button>
+        </div>
+        <span class="note" id="starInfo"></span>
+        <button class="btn" id="btnStarLearn" title="Ảnh gắn sao là ảnh bạn chọn trên máy: AI học theo (ảnh có sao = giữ, còn lại = bỏ)">Dạy AI theo ảnh gắn sao</button>
+        <button class="btn primary" id="btnStarExport" title="Chép các ảnh này (kèm RAW) sang thư mục bạn chọn">Chép ảnh gắn sao…</button>
       </div>
       <div class="grid" id="grid"></div>
     </div>
@@ -178,6 +188,10 @@
   <div class="dview">
     <div class="dimg" id="dstage">
       <div class="frame" id="dframe"><img id="dimg" alt="" draggable="false"></div>
+      <div class="cropresult" id="cropResult" hidden>
+        <canvas id="cropResultCanvas"></canvas>
+        <div class="crbar"><span id="cropResultInfo"></span><button class="btn sm" id="cropResultEdit">Sửa crop</button><button class="btn sm" id="cropResultClose">Xem ảnh gốc</button></div>
+      </div>
       <div class="zoombar" role="toolbar" aria-label="Phóng to thu nhỏ">
         <button class="btn sm" id="zOut" title="Thu nhỏ (phím −)">−</button>
         <span id="zPct">Vừa khung</span>
@@ -205,6 +219,7 @@
         <div class="row" id="cropIdle">
           <button class="btn sm" id="cropStart" title="Cắt bớt phần thừa khi xuất (phím C)">✂ Crop <kbd>C</kbd></button>
           <span class="note" id="cropInfo"></span>
+          <button class="btn sm" id="cropView" hidden title="Xem ảnh sau khi crop">Xem kết quả</button>
           <button class="btn sm" id="cropClear" hidden title="Xuất nguyên khung như ảnh gốc">Bỏ crop</button>
         </div>
         <div id="cropEdit" hidden>
@@ -214,6 +229,7 @@
             <button class="btn sm" id="cropCancel">Huỷ <kbd>Esc</kbd></button>
           </div>
           <p class="note" id="cropNote"></p>
+          <p class="note">Giữ <kbd>Shift</kbd> khi kéo: giữ nguyên hình dạng khung, chỉ to nhỏ. Lăn chuột: phóng to thu nhỏ khung. <kbd>Ctrl</kbd>+<kbd>Z</kbd> hoàn tác, <kbd>Ctrl</kbd>+<kbd>Y</kbd> làm lại.</p>
         </div>
       </div>
       <div class="deyes" id="deyes" hidden></div>
@@ -234,6 +250,23 @@
     <div class="row2 end">
       <button class="btn" id="cardCancel">Huỷ</button>
       <button class="btn primary" id="cardGo">Bắt đầu chép</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal" id="starDlg" hidden role="dialog" aria-modal="true">
+  <div class="box">
+    <h3>★ Chép nhanh ảnh gắn sao</h3>
+    <p class="note">Lấy thẳng từ thẻ nhớ hoặc một thư mục: chỉ đọc số sao bạn gắn trên máy ảnh (rating 1–5, cả ảnh khóa bảo vệ), không chờ AI chấm. RAW và JPEG chép nguyên bản, kiểm tra từng file; ảnh gốc giữ nguyên.</p>
+    <label class="field">Lấy từ (thẻ nhớ hoặc thư mục) <span class="pick"><input id="starSrc" readonly><button class="btn sm" data-pick="starSrc">Chọn…</button></span></label>
+    <label class="field">Chép vào <span class="pick"><input id="starDst" readonly><button class="btn sm" data-pick="starDst">Chọn…</button></span></label>
+    <label class="field">Số sao tối thiểu
+      <select id="starDlgMin"><option value="1">1★ trở lên</option><option value="2">2★ trở lên</option><option value="3">3★ trở lên</option><option value="4">4★ trở lên</option><option value="5">5★</option></select>
+    </label>
+    <label class="chk"><input type="checkbox" id="starThen"> Chép xong thì cho AI lọc tiếp các ảnh này</label>
+    <div class="row2 end">
+      <button class="btn" id="starCancel">Huỷ</button>
+      <button class="btn primary" id="starGo">Chép ảnh gắn sao</button>
     </div>
   </div>
 </div>

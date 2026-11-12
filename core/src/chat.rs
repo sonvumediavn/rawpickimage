@@ -30,6 +30,8 @@ pub struct Patch {
     pub dedupe: Option<bool>,
     pub reject_closed_eyes: Option<bool>,
     pub review_open_mouth: Option<bool>,
+    pub speaker_head_up: Option<bool>,
+    pub keep_each_shot: Option<bool>,
     pub moments: Option<bool>,
     pub fix_instead_of_reject: Option<bool>,
     pub use_learned: Option<bool>,
@@ -53,6 +55,8 @@ impl Patch {
             let mut o = s.options.clone();
             o.reject_closed_eyes = d.options.reject_closed_eyes;
             o.review_open_mouth = d.options.review_open_mouth;
+            o.speaker_head_up = d.options.speaker_head_up;
+            o.keep_each_shot = d.options.keep_each_shot;
             o.dedupe = d.options.dedupe;
             o.use_learned = d.options.use_learned;
             o.fix_instead_of_reject = d.options.fix_instead_of_reject;
@@ -120,6 +124,13 @@ impl Patch {
             "Ảnh nhân vật chính đang há miệng đưa vào «Cần xem lại»",
             "Không soi khẩu hình nữa (ảnh há miệng chỉ bị trừ nhẹ)",
         );
+        flag(
+            &mut o.speaker_head_up,
+            self.speaker_head_up,
+            "Người phát biểu (một mình trong khung) cúi đầu: đưa vào «Cần xem lại»",
+            "Người phát biểu cúi đầu vẫn được chọn",
+        );
+        flag(&mut o.keep_each_shot, self.keep_each_shot, "Cảnh nào bạn chụp nhiều tấm thì giữ ít nhất 1 tấm đẹp nhất", "Không tự giữ cảnh chụp nhiều tấm nữa");
         flag(&mut o.moments, self.moments, "Bật «Đủ khoảnh khắc»", "Tắt «Đủ khoảnh khắc»");
         flag(&mut o.fix_instead_of_reject, self.fix_instead_of_reject, "Bật «Sửa thay vì loại»", "Tắt «Sửa thay vì loại»");
         flag(&mut o.use_learned, self.use_learned, "Dùng điều AI đã học từ lựa chọn của bạn", "Không dùng điều AI đã học");
@@ -291,6 +302,27 @@ pub fn understand(msg: &str, w: &[f32; 6]) -> Understood {
             p.dedupe_seconds = Some(e.dedupe_seconds);
             p.dedupe = Some(true);
             notes.push(format!("Chuyển sang cách chọn cho «{}». {}", e.name, e.note));
+            continue;
+        }
+
+        // Head up / looking down (ngẩng / cúi đầu).
+        if has(&f, &["cui dau", "ngang dau", "ngung dau", "cui mat", "nhin xuong", "doc giay"]) {
+            let allow = has(&f, &["van giu", "van chon", "khong loai", "dung loai", "cho phep", "chap nhan", "khong sao", "khong can", "bo qua", "duoc"])
+                && !has(&f, &["phai ngang", "can ngang", "uu tien ngang"]);
+            p.speaker_head_up = Some(!allow);
+            notes.push(if allow {
+                "Người phát biểu cúi đầu vẫn được chọn. Ảnh khoảnh khắc có nhiều người thì cúi đầu vẫn luôn được giữ.".into()
+            } else {
+                "Ảnh một người phát biểu đang cúi đầu (đọc giấy, nhìn xuống) sẽ vào «Cần xem lại». Ảnh khoảnh khắc có nhiều người thì cúi đầu vẫn được giữ. Thấy AI nhìn sai thì bấm Ngẩng/Cúi ở ảnh đó, AI nhớ cho lần sau.".into()
+            });
+            continue;
+        }
+
+        // A shot taken many times (award groups, posed groups).
+        if has(&f, &["chon thieu", "bi thieu", "thieu nhom", "moi nhom", "nhan giai", "trao giai", "moi canh"]) {
+            p.keep_each_shot = Some(true);
+            p.dedupe = Some(true);
+            notes.push("Cảnh nào bạn chụp nhiều tấm (từng nhóm lên nhận giải, chụp nhóm) thì giữ ít nhất 1 tấm đẹp nhất, kể cả khi điểm hơi thấp hơn ngưỡng chọn.".into());
             continue;
         }
 
@@ -475,6 +507,8 @@ pub fn claude_prompt(msg: &str, s: &Settings, preset: &str, ctx: Option<&Context
         "dedupe": s.options.dedupe,
         "reject_closed_eyes": s.options.reject_closed_eyes,
         "review_open_mouth": s.options.review_open_mouth,
+        "speaker_head_up": s.options.speaker_head_up,
+        "keep_each_shot": s.options.keep_each_shot,
         "moments": s.options.moments,
         "fix_instead_of_reject": s.options.fix_instead_of_reject,
         "use_learned": s.options.use_learned,
@@ -498,7 +532,7 @@ Trả lời DUY NHẤT một đối tượng JSON, không kèm chữ nào khác:
 {{"reply": "câu trả lời ngắn bằng tiếng Việt, giải thích bạn chỉnh gì và vì sao",
  "patch": {{ chỉ các trường cần đổi trong: "preset" ("event"|"balanced"|"portrait"|"landscape"), "weights" {{"exposure"..."people": 0-50}},
    "threshold" (5-9.5), "review_margin" (0-3), "max_selected" (0 = không giới hạn), "keep_per_series" (1-5), "dedupe_seconds",
-   "dedupe", "reject_closed_eyes", "review_open_mouth" (ảnh nhân vật chính há miệng vào «Cần xem lại»), "moments", "fix_instead_of_reject", "use_learned" (bool), "learned_weight" (0-0.8) }} }}
+   "dedupe", "reject_closed_eyes", "review_open_mouth" (ảnh nhân vật chính há miệng vào «Cần xem lại»), "speaker_head_up" (người phát biểu một mình cúi đầu vào «Cần xem lại»), "keep_each_shot" (cảnh chụp nhiều tấm giữ 1 tấm đẹp nhất), "moments", "fix_instead_of_reject", "use_learned" (bool), "learned_weight" (0-0.8) }} }}
 Nếu yêu cầu không liên quan tới chọn ảnh, trả "patch": {{}} và giải thích ngắn."#
     )
 }
@@ -570,6 +604,11 @@ mod tests {
 
         assert_eq!(understand("loại ảnh há miệng", &W).patch.review_open_mouth, Some(true));
         assert_eq!(understand("há miệng không sao, cứ giữ", &W).patch.review_open_mouth, Some(false));
+        assert_eq!(understand("người phát biểu phải ngẩng đầu", &W).patch.speaker_head_up, Some(true));
+        assert_eq!(understand("cúi đầu vẫn giữ", &W).patch.speaker_head_up, Some(false));
+        assert_eq!(understand("6 nhóm nhận giải mà chọn thiếu", &W).patch.keep_each_shot, Some(true));
+        let u = understand("Mỗi nhóm nhận giải giữ 1 ảnh", &W);
+        assert_eq!((u.patch.keep_each_shot, u.patch.keep_per_series), (Some(true), None), "{:?}", u.patch);
         let u = understand("mặt nghiêng đẹp vẫn giữ", &W);
         assert!(u.patch.is_empty() && !u.notes.is_empty());
         assert_eq!(understand("mắt nhân vật chính phải mở", &W).patch.reject_closed_eyes, Some(true));

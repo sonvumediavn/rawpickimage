@@ -276,7 +276,7 @@ pub fn collect_with(dir: &Path, recursive: bool, skip_ours: bool) -> std::io::Re
             let ft = e.file_type()?;
             if ft.is_dir() {
                 // Never re-scan our own output.
-                let ours = name.ends_with("_da-loc") || name.ends_with(" - Anh chon") || name.ends_with(crate::export::OUT_SUFFIX) || p.join(crate::pipeline::COPY_MARKER).exists();
+                let ours = name.ends_with("_da-loc") || name.ends_with(" - Anh chon") || name.ends_with(crate::export::OUT_SUFFIX) || name.ends_with(crate::ingest::STAR_SUFFIX) || p.join(crate::pipeline::COPY_MARKER).exists();
                 if recursive && !(skip_ours && ours) {
                     stack.push(p);
                 }
@@ -310,11 +310,11 @@ pub fn collect_with(dir: &Path, recursive: bool, skip_ours: bool) -> std::io::Re
 }
 
 /// Re-decide the eyes in an analysed photo with Sơn's corrections (no pixels needed).
-pub fn rejudge(a: &mut Analysis, book: &crate::eyes::EyeBook, forced: &dyn Fn(usize) -> Option<bool>) {
+pub fn rejudge(a: &mut Analysis, book: &crate::eyes::EyeBook, photo: &str) {
     if a.people.faces.is_empty() {
         return;
     }
     let faces = std::mem::take(&mut a.people.faces);
-    a.people = faces::judge(faces, book, forced);
+    a.people = faces::judge(faces, book, Some(photo));
     a.scores.people = a.people.score.map(|v| (v * 10.0).round() / 10.0);
 }

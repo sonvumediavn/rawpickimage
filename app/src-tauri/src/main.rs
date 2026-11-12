@@ -263,7 +263,7 @@ impl App {
             for it in s.items.iter_mut() {
                 let key = it.path.display().to_string();
                 if let Some(a) = it.analysis.as_mut() {
-                    rawpick_core::analyze::rejudge(a, &book, &|f| book.forced(&key, f));
+                    rawpick_core::analyze::rejudge(a, &book, &key);
                 }
             }
         }
@@ -310,6 +310,14 @@ struct FaceBox {
     eyes: bool,
     /// Sơn corrected these eyes himself.
     by_hand: bool,
+    /// Unflattering mouth, face turned, looking down (as judged now).
+    mouth: bool,
+    turned: bool,
+    down: bool,
+    /// Which of those Sơn set himself ("mouth", "turned", "down").
+    hand_marks: Vec<&'static str>,
+    /// Too small to judge mouth and head.
+    small: bool,
 }
 
 #[derive(Serialize)]
@@ -408,7 +416,19 @@ fn photo_view(idx: usize, it: &Item) -> PhotoView {
             })
             .unwrap_or_default(),
         faces: a
-            .map(|a| a.people.faces.iter().map(|f| FaceBox { bbox: f.bbox, closed: f.closed, main: f.main, issues: f.issues.clone(), eyes: f.eye_seen, by_hand: f.by_hand }).collect())
+            .map(|a| a.people.faces.iter().map(|f| FaceBox {
+                        bbox: f.bbox,
+                        closed: f.closed,
+                        main: f.main,
+                        issues: f.issues.clone(),
+                        eyes: f.eye_seen,
+                        by_hand: f.by_hand,
+                        mouth: f.mouth_bad,
+                        turned: f.turned,
+                        down: f.down,
+                        hand_marks: f.hand_marks.iter().map(|m| m.key()).collect(),
+                        small: f.small,
+                    }).collect())
             .unwrap_or_default(),
         error: it.error.clone(),
         stars: a.map(|a| a.stars).unwrap_or(0),
@@ -815,6 +835,41 @@ fn op_set_crop(app: &Arc<App>, id: u32, idx: usize, crop: Option<[f32; 4]>) -> R
     let v = photo_view(idx, it);
     app.save_sessions(&map);
     Ok(v)
+}
+
+/// Sơn says face `face` of photo `idx` has (`yes = true`) or has not an unflattering mouth /
+/// a turned face / a bowed head, or lets the AI judge again (`None`). Learned for every photo.
+fn op_set_mark(app: &Arc<App>, id: u32, idx: usize, face: usize, mark: &str, yes: Option<bool>) -> Result<EyesResult, String> {
+    let m = rawpick_core::eyes::Mark::from_key(mark).ok_or("Sai loại")?;
+    let mut map = app.sessions.lock().unwrap();
+    let s = map.get_mut(&id).ok_or("Phiên đã đóng")?;
+    let it = s.items.get(idx).ok_or("Sai ảnh")?;
+    let key = it.path.display().to_string();
+    let f = it.analysis.as_ref().and_then(|a| a.people.faces.get(face)).ok_or("Không có khuôn mặt này")?;
+    if f.small {
+        return Err("Mặt này quá nhỏ để xét".into());
+    }
+    let x = rawpick_core::eyes::mark_features(m, f.mouth_open, f.yaw, f.pitch);
+    let corrected = {
+        let mut book = app.eyes.lock().unwrap();
+        book.set_mark(m, &key, face, x, yes);
+        app.save_eyes(&book);
+        book.manual_count()
+    };
+    let ids: Vec<u32> = map.keys().copied().collect();
+    for sid in ids {
+        if let Some(x) = map.get_mut(&sid) {
+            if !x.items.is_empty() {
+                app.recull(x);
+            }
+        }
+    }
+    let s = map.get(&id).ok_or("Phiên đã đóng")?;
+    let r = EyesResult { photo: photo_view(idx, &s.items[idx]), verdicts: s.verdicts.clone(), summary: cull::summarize(&s.verdicts), corrected };
+    app.save_sessions(&map);
+    drop(map);
+    sessions_changed(app);
+    Ok(r)
 }
 
 /// Teach the session's event-type profile from its final choices.
@@ -1519,6 +1574,80 @@ fn op_copy_card(app: &Arc<App>, card: String, dest: String, backup: Option<Strin
     })()
 }
 
+/// Copy the photos starred on the camera straight from a folder or the memory card, without
+/// waiting for the AI.
+fn op_copy_starred(app: &Arc<App>, source: String, dest: String, min_stars: u8) -> Result<ingest::StarCopy, String> {
+    let app = app.clone();
+    (move || {
+        let (src, dst) = (PathBuf::from(&source), PathBuf::from(&dest));
+        if !src.is_dir() {
+            return Err(format!("Không tìm thấy thư mục {source}"));
+        }
+        if !dst.is_dir() {
+            return Err(format!("Không tìm thấy thư mục {dest}"));
+        }
+        if app.card_busy.swap(true, Ordering::SeqCst) {
+            return Err("Đang chép một thẻ khác".to_string());
+        }
+        app.card_cancel.store(false, Ordering::SeqCst);
+        let on_step = emitter(&app, None);
+        on_step(0, 0, "Đang đọc số sao trên ảnh");
+        let r = ingest::copy_starred(&src, &dst, min_stars, &|n, t| on_step(n, t, "Đang chép ảnh gắn sao"), &app.card_cancel).map_err(|e| format!("{e:#}"));
+        app.card_busy.store(false, Ordering::SeqCst);
+        r
+    })()
+}
+
+#[derive(Serialize)]
+struct StarLesson {
+    kept: usize,
+    dropped: usize,
+    profile: ProfileView,
+}
+
+/// The stars Sơn gave on the camera are his picks: learn them (starred = keep, the rest of the
+/// show = drop) like hand-made choices.
+fn op_learn_stars(app: &Arc<App>, id: u32, min_stars: u8) -> Result<StarLesson, String> {
+    let (profile, samples) = {
+        let map = app.sessions.lock().unwrap();
+        let s = map.get(&id).ok_or("Phiên đã đóng")?;
+        if s.phase != Phase::Ready {
+            return Err("Phiên này chưa phân tích xong".into());
+        }
+        let ok: Vec<&Item> = s.items.iter().filter(|i| i.analysis.is_some()).collect();
+        let all_locked = ok.len() >= 5 && ok.iter().all(|i| i.analysis.as_ref().unwrap().protected);
+        let starred = |a: &rawpick_core::analyze::Analysis| a.stars >= min_stars.max(1) || (a.protected && !all_locked);
+        let samples: Vec<learn::Sample> = ok
+            .iter()
+            .map(|i| {
+                let a = i.analysis.as_ref().unwrap();
+                let k = starred(a);
+                learn::Sample::new(i.path.display().to_string(), a, k, k, true)
+            })
+            .collect();
+        (s.prefs.profile.clone(), samples)
+    };
+    let kept = samples.iter().filter(|x| x.keep).count();
+    if kept == 0 {
+        return Err("Thư mục này chưa có ảnh nào gắn sao".into());
+    }
+    let dropped = samples.len() - kept;
+    let store = app.store();
+    let mut p = store.load(&profile);
+    p.add(samples);
+    p.train();
+    store.save(&p).map_err(|e| e.to_string())?;
+    {
+        let mut map = app.sessions.lock().unwrap();
+        for s in map.values_mut().filter(|s| s.prefs.profile == profile && s.phase == Phase::Ready) {
+            app.recull(s);
+        }
+        app.save_sessions(&map);
+    }
+    sessions_changed(app);
+    Ok(StarLesson { kept, dropped, profile: app.profile_view(&profile) })
+}
+
 /// Stop a session's analysis/export, or the card copy when `id` is None.
 fn op_cancel(app: &Arc<App>, id: Option<u32>) {
     match id {
@@ -1599,6 +1728,9 @@ struct Args {
     face: Option<usize>,
     open: Option<bool>,
     crop: Option<[f32; 4]>,
+    mark: Option<String>,
+    yes: Option<bool>,
+    min_stars: Option<u8>,
 }
 
 fn need<T>(v: Option<T>, what: &str) -> Result<T, String> {
@@ -1635,6 +1767,9 @@ fn dispatch(app: &Arc<App>, cmd: &str, args: serde_json::Value) -> Result<serde_
         "copy_card" => json(op_copy_card(app, need(a.card, "card")?, need(a.dest, "dest")?, a.backup)?),
         "cancel" => json(op_cancel(app, a.id)),
         "set_crop" => json(op_set_crop(app, need(a.id, "id")?, need(a.idx, "idx")?, a.crop)?),
+        "copy_starred" => json(op_copy_starred(app, need(a.source, "source")?, need(a.dest, "dest")?, a.min_stars.unwrap_or(1))?),
+        "learn_stars" => json(op_learn_stars(app, need(a.id, "id")?, a.min_stars.unwrap_or(1))?),
+        "set_mark" => json(op_set_mark(app, need(a.id, "id")?, need(a.idx, "idx")?, need(a.face, "face")?, &need(a.mark, "mark")?, a.yes)?),
         "set_eyes" => json(op_set_eyes(app, need(a.id, "id")?, need(a.idx, "idx")?, need(a.face, "face")?, a.open)?),
         "big_preview" => json(op_big_preview(app, need(a.id, "id")?, need(a.idx, "idx")?, a.full)?),
         "list_dir" => json(web::list_dir(a.path.as_deref())?),

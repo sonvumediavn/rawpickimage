@@ -137,7 +137,7 @@ impl FaceDetector {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FaceInfo {
     /// x, y, w, h as fractions of the image.
     pub bbox: [f32; 4],
@@ -174,6 +174,21 @@ pub struct FaceInfo {
     /// Face score before the eye check.
     #[serde(default)]
     pub base: f32,
+    /// Head tilt up/down from the landmarks: about 0 facing the camera, positive = looking
+    /// down (nose drops towards the mouth), negative = chin up.
+    #[serde(default)]
+    pub pitch: f32,
+    /// Unflattering mouth, face turned away, looking down: judged from the measures with Sơn's
+    /// corrections ([`crate::eyes::Mark`]).
+    #[serde(default)]
+    pub mouth_bad: bool,
+    #[serde(default)]
+    pub turned: bool,
+    #[serde(default)]
+    pub down: bool,
+    /// Marks Sơn set himself on this face.
+    #[serde(default)]
+    pub hand_marks: Vec<crate::eyes::Mark>,
 }
 
 impl FaceInfo {
@@ -342,6 +357,7 @@ pub fn assess_with(img: &RgbImage, g: &Gray, raw: &[RawFace], net: Option<&EyeNe
             let (sharp, lum) = face_sharpness(g, x0, y0, x1, y1, f.w);
             let mid = ((re.0 + le.0) / 2.0, (re.1 + le.1) / 2.0);
             let yaw = (nose.0 - mid.0) / iod;
+            let pitch = head_pitch(re, le, nose, f.lm[3], f.lm[4]);
             let edge = f.x < w * 0.01 || f.y < h * 0.01 || f.x + f.w > w * 0.99 || f.y + f.h > h * 0.99;
             let mut issues = vec![];
             let mut s = 10.0f32;
@@ -365,14 +381,6 @@ pub fn assess_with(img: &RgbImage, g: &Gray, raw: &[RawFace], net: Option<&EyeNe
                 let (rm, lm) = (f.lm[3], f.lm[4]);
                 mouth_open_ratio(g, ((rm.0 + lm.0) / 2.0, (rm.1 + lm.1) / 2.0), dist(rm, lm), lum).unwrap_or(0.0)
             };
-            if mouth_open > 0.3 {
-                s -= 0.8;
-                issues.push("đang há miệng".into());
-            }
-            if yaw.abs() > 0.38 {
-                // A turned face can be the best frame: no penalty, Sơn's own choices decide.
-                issues.push("mặt nghiêng".into());
-            }
             if edge {
                 s -= 2.0;
                 issues.push("mặt bị cắt mép khung".into());
@@ -397,23 +405,58 @@ pub fn assess_with(img: &RgbImage, g: &Gray, raw: &[RawFace], net: Option<&EyeNe
                 p_closed: 0.0,
                 by_hand: false,
                 base: s,
+                pitch,
+                mouth_bad: false,
+                turned: false,
+                down: false,
+                hand_marks: vec![],
             }
         })
         .collect();
     faces.sort_by(|a, b| a.bbox[0].partial_cmp(&b.bbox[0]).unwrap());
-    judge(faces, &crate::eyes::EyeBook::default(), &|_| None)
+    judge(faces, &crate::eyes::EyeBook::default(), None)
 }
 
-/// Decide the eyes of every face (with Sơn's corrections in `book`, and his word on single faces
-/// from `forced(face number)`), then score the people in the photo. Cheap: no pixels involved,
-/// so it runs again whenever he corrects an eye.
-pub fn judge(mut faces: Vec<FaceInfo>, book: &crate::eyes::EyeBook, forced: &dyn Fn(usize) -> Option<bool>) -> People {
+/// Decide the eyes, mouth, face angle and head of every face (with Sơn's corrections in `book`,
+/// and his word on single faces of `photo`), then score the people in the photo. Cheap: no pixels
+/// involved, so it runs again whenever he corrects a face.
+pub fn judge(mut faces: Vec<FaceInfo>, book: &crate::eyes::EyeBook, photo: Option<&str>) -> People {
+    use crate::eyes::{mark_features, Mark};
+    let forced = |i: usize| photo.and_then(|p| book.forced(p, i));
     if faces.is_empty() {
         return People { notes: vec!["Không thấy khuôn mặt nào, tiêu chí này không tính vào điểm".into()], ..Default::default() };
     }
     for (i, f) in faces.iter_mut().enumerate() {
-        f.issues.retain(|x| x != "nhắm mắt" && x != "mắt lim dim");
+        f.issues.retain(|x| !matches!(x.as_str(), "nhắm mắt" | "mắt lim dim" | "khẩu hình chưa đẹp" | "đang há miệng" | "mặt nghiêng" | "cúi đầu"));
         let mut s = f.base;
+        f.hand_marks.clear();
+        let mut marks = [false; 3];
+        for (k, m) in Mark::ALL.into_iter().enumerate() {
+            let hand = photo.and_then(|p| book.forced_mark(m, p, i));
+            if hand.is_some() {
+                f.hand_marks.push(m);
+            }
+            marks[k] = match hand {
+                Some(v) => v,
+                // Too small to see the mouth or head reliably.
+                None if f.small => false,
+                None => book.p_mark(m, &mark_features(m, f.mouth_open, f.yaw, f.pitch)) >= 0.5,
+            };
+        }
+        [f.mouth_bad, f.turned, f.down] = marks;
+        if f.mouth_bad {
+            s -= 0.8;
+            f.issues.push("khẩu hình chưa đẹp".into());
+        }
+        if f.turned {
+            // A turned face can be the best frame: no penalty, Sơn's own choices decide.
+            f.issues.push("mặt nghiêng".into());
+        }
+        if f.down {
+            // Fine in a candid moment; whether it matters is for the rules of the shot (a
+            // speaker) and Sơn's own choices.
+            f.issues.push("cúi đầu".into());
+        }
         let hand = forced(i);
         f.by_hand = hand.is_some();
         f.p_closed = match hand {
@@ -484,6 +527,57 @@ pub fn judge(mut faces: Vec<FaceInfo>, book: &crate::eyes::EyeBook, forced: &dyn
         notes,
         eye_center: Some(ec),
         faces,
+    }
+}
+
+/// Above this [`FaceInfo::pitch`] the head is clearly bowed (reading notes, looking at the floor).
+pub const HEAD_DOWN: f32 = 0.2;
+
+/// How far the head is bowed, from the eyes, nose tip and mouth corners. Measured along the
+/// face's own up-down axis (so a tilted head does not count): facing the camera the nose tip
+/// sits about 0.6 of the way from the eye line to the mouth; bowing pushes it towards the mouth,
+/// raising the chin pulls it up towards the eyes.
+pub fn head_pitch(re: (f32, f32), le: (f32, f32), nose: (f32, f32), rm: (f32, f32), lm: (f32, f32)) -> f32 {
+    let (ux, uy) = (le.0 - re.0, le.1 - re.1);
+    let iod = (ux * ux + uy * uy).sqrt().max(1.0);
+    let (nx, ny) = (-uy / iod, ux / iod);
+    let em = ((re.0 + le.0) / 2.0, (re.1 + le.1) / 2.0);
+    let mm = ((rm.0 + lm.0) / 2.0, (rm.1 + lm.1) / 2.0);
+    let dn = (nose.0 - em.0) * nx + (nose.1 - em.1) * ny;
+    let dm = (mm.0 - em.0) * nx + (mm.1 - em.1) * ny;
+    if dm < iod * 0.2 {
+        // Landmarks folded together (extreme angle or a bad detection): no opinion.
+        return 0.0;
+    }
+    (dn / dm - 0.6).clamp(-0.6, 0.6)
+}
+
+impl People {
+    /// Share of the main faces whose eyes were judged open (1 when none could be judged).
+    pub fn open_share(&self) -> f32 {
+        let seen: Vec<&FaceInfo> = self.faces.iter().filter(|f| f.main && f.eye_seen).collect();
+        if seen.is_empty() {
+            return 1.0;
+        }
+        seen.iter().filter(|f| !f.closed).count() as f32 / seen.len() as f32
+    }
+
+    /// Share of the main faces looking up (not bowed).
+    pub fn up_share(&self) -> f32 {
+        let m: Vec<&FaceInfo> = self.faces.iter().filter(|f| f.main && !f.small).collect();
+        if m.is_empty() {
+            return 1.0;
+        }
+        m.iter().filter(|f| !f.down).count() as f32 / m.len() as f32
+    }
+
+    /// The one person the photo is about (a speaker at the lectern, a portrait), if there is one.
+    pub fn solo(&self) -> Option<&FaceInfo> {
+        let mut m = self.faces.iter().filter(|f| f.main);
+        match (m.next(), m.next()) {
+            (Some(f), None) if !f.small => Some(f),
+            _ => None,
+        }
     }
 }
 

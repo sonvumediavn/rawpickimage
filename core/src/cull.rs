@@ -417,6 +417,10 @@ fn first_decision(a: &Analysis, score: f32, s: &Settings, notes: &mut Vec<String
         notes.push("Nhân vật chính đang há miệng, khẩu hình chưa đẹp: để bạn xem lại".into());
         return Decision::Review;
     }
+    if score >= s.threshold && s.options.speaker_head_up && speaker_head_down(a) {
+        notes.push("Người phát biểu đang cúi đầu: để bạn xem lại (ảnh có người khác cùng khung thì cúi đầu vẫn giữ)".into());
+        return Decision::Review;
+    }
     if score >= s.threshold {
         if !fixes.is_empty() {
             notes.push("Đạt điểm chọn nhưng cần sửa nhẹ trước khi giao".into());
@@ -434,49 +438,126 @@ fn first_decision(a: &Analysis, score: f32, s: &Settings, notes: &mut Vec<String
 fn lead_mouth_open(a: &Analysis) -> bool {
     let mut main: Vec<_> = a.people.faces.iter().filter(|f| f.main && !f.small).collect();
     main.sort_by(|x, y| (y.bbox[2] * y.bbox[3]).total_cmp(&(x.bbox[2] * x.bbox[3])));
-    main.iter().take(2).any(|f| f.mouth_open > 0.3)
+    main.iter().take(2).any(|f| f.mouth_bad)
 }
 
 /// Group consecutive near-identical photos; keep the best `keep_per_series`.
 /// Two frames of the same shot: the quick pixel fingerprint matches, or the image model sees the
 /// same picture (it is not fooled by a turned head, a small pan or zoom, or a flash that did not
-/// fire). Without capture times to back it up, only near-identical frames count.
-fn same_shot(a: &Analysis, b: &Analysis, timed: bool) -> bool {
+/// fire) with the same people in the same places. `gap` = seconds between them, when known.
+fn same_shot(a: &Analysis, b: &Analysis, gap: Option<f64>) -> bool {
+    let content = crate::visual::similarity_content(&a.embed, &b.embed);
+    // Same stage, same backdrop, other people (award groups called up one after another):
+    // the picture looks alike, even to the pixel fingerprint, the people do not.
+    // Only frames of one press of the shutter may differ in faces found (a head turns away
+    // and the detector loses it).
+    if !same_people_layout(a, b) {
+        let burst = gap.is_some_and(|g| g <= BURST_GAP);
+        return burst && (content >= SAME_PICTURE || (a.embed.is_empty() && metrics::similar(&a.signature, &b.signature)));
+    }
     if metrics::similar(&a.signature, &b.signature) {
         return true;
     }
     if (a.signature.aspect - b.signature.aspect).abs() > 0.05 {
         return false;
     }
-    let content = crate::visual::similarity_content(&a.embed, &b.embed);
-    if timed {
-        content >= SAME_SHOT
-    } else {
-        content >= SAME_SHOT_UNTIMED && crate::visual::similarity(&a.embed, &b.embed) >= SAME_SHOT_UNTIMED - 0.03
+    match gap {
+        // Pressed again within a second or two: the same shot even if people moved a lot.
+        Some(g) if g <= BURST_GAP => content >= SAME_SHOT_BURST,
+        Some(_) => content >= SAME_SHOT,
+        None => content >= SAME_SHOT_UNTIMED && crate::visual::similarity(&a.embed, &b.embed) >= SAME_SHOT_UNTIMED - 0.03,
     }
+}
+
+/// Whether two frames show about the same number of people in about the same places.
+fn same_people_layout(a: &Analysis, b: &Analysis) -> bool {
+    let centres = |x: &Analysis| -> Vec<(f32, f32)> {
+        x.people.faces.iter().filter(|f| f.main && !f.small).map(|f| (f.bbox[0] + f.bbox[2] / 2.0, f.bbox[1] + f.bbox[3] / 2.0)).collect()
+    };
+    let (ca, cb) = (centres(a), centres(b));
+    let (lo, hi) = (ca.len().min(cb.len()), ca.len().max(cb.len()));
+    if hi <= 1 {
+        return true;
+    }
+    if lo == 0 || hi - lo >= 2 {
+        return false;
+    }
+    let (small, big) = if ca.len() <= cb.len() { (&ca, &cb) } else { (&cb, &ca) };
+    let matched = small.iter().filter(|p| big.iter().any(|q| (p.0 - q.0).abs() < 0.1 && (p.1 - q.1).abs() < 0.12)).count();
+    matched as f32 >= 0.6 * hi as f32
 }
 
 /// Image-model similarity for frames a few seconds apart to count as one shot (measured: re-framed,
 /// rotated, brightened copies of one photo score 0.84–0.99, different photos below 0.4).
 const SAME_SHOT: f32 = 0.86;
 const SAME_SHOT_UNTIMED: f32 = 0.94;
+/// Frames this close (seconds) are one press of the shutter, people moving or not.
+const BURST_GAP: f64 = 2.0;
+const SAME_SHOT_BURST: f32 = 0.78;
+/// Within one press of the shutter, a frame where the detector found other faces still counts
+/// when the picture is practically the same.
+const SAME_PICTURE: f32 = 0.9;
+/// A series longer than this (seconds) is a long speech or performance, not one shot: it starts
+/// a new series so it keeps a few photos.
+const SERIES_SPAN: f64 = 45.0;
+/// A shot taken this many times was meant: its best frame is kept when usable.
+const MEANT_SHOT: usize = 3;
+
+/// The rules want this photo looked at by Sơn rather than picked (mouth wide open, a speaker
+/// looking down).
+fn flagged(a: &Analysis, s: &Settings) -> bool {
+    (s.options.review_open_mouth && lead_mouth_open(a)) || (s.options.speaker_head_up && speaker_head_down(a))
+}
+
+fn speaker_head_down(a: &Analysis) -> bool {
+    a.people.solo().is_some_and(|f| f.down)
+}
+
+/// Best frame first: a frame the rules would pick, then the score, then (with several people)
+/// the frame where everyone has their eyes open and heads up.
+fn frame_rank(a: Option<&Analysis>, v: &Verdict, s: &Settings) -> f32 {
+    let mut k = v.score;
+    if let Some(a) = a {
+        if a.people.faces.iter().filter(|f| f.main).count() >= 2 {
+            k += 2.0 * (a.people.open_share() - 1.0) + 0.6 * (a.people.up_share() - 1.0);
+        }
+        if flagged(a, s) {
+            k -= 1.5;
+        }
+    }
+    if v.decision == Decision::Selected {
+        k += 100.0;
+    }
+    k
+}
 
 fn dedupe(items: &[Option<&Analysis>], out: &mut [Verdict], order: &[usize], s: &Settings) {
     let mut series: Vec<Vec<usize>> = vec![];
     for &i in order {
         let Some(a) = items[i] else { continue };
+        let ti = out[i].time;
         let joined = series.last_mut().filter(|g| {
-            let &last = g.last().unwrap();
-            let timed = match (out[i].time, out[last].time) {
-                (Some(t1), Some(t2)) => Some((t1 - t2).abs() <= s.dedupe_seconds),
-                _ => None,
-            };
-            if timed == Some(false) {
-                return false;
+            let (&first, &last) = (g.first().unwrap(), g.last().unwrap());
+            if let (Some(t), Some(l)) = (ti, out[last].time) {
+                if (t - l).abs() > s.dedupe_seconds {
+                    return false;
+                }
             }
-            // Same shot as any photo of the series so far (people move, the camera pans a little
-            // between frames, so comparing with the last frame alone splits real bursts).
-            g.iter().rev().take(12).any(|&k| items[k].is_some_and(|b| same_shot(a, b, timed.is_some())))
+            if let (Some(t), Some(f)) = (ti, out[first].time) {
+                if t - f > SERIES_SPAN.max(s.dedupe_seconds * 3.0) {
+                    return false;
+                }
+            }
+            // Same shot as a photo of the series taken just before (people move, the camera pans
+            // a little, so comparing with the last frame alone splits real bursts; comparing with
+            // frames long before would chain different groups together).
+            g.iter().rev().take(12).any(|&k| {
+                let gap = match (ti, out[k].time) {
+                    (Some(t), Some(u)) => Some((t - u).abs()),
+                    _ => None,
+                };
+                gap.is_none_or(|g| g <= s.dedupe_seconds) && items[k].is_some_and(|b| same_shot(a, b, gap))
+            })
         });
         match joined {
             Some(g) => g.push(i),
@@ -485,7 +566,8 @@ fn dedupe(items: &[Option<&Analysis>], out: &mut [Verdict], order: &[usize], s: 
     }
     for g in series.into_iter().filter(|g| g.len() > 1) {
         let mut ranked = g.clone();
-        ranked.sort_by(|&x, &y| out[y].score.total_cmp(&out[x].score).then(x.cmp(&y)));
+        let key: HashMap<usize, f32> = g.iter().map(|&i| (i, frame_rank(items[i], &out[i], s))).collect();
+        ranked.sort_by(|&x, &y| key[&y].total_cmp(&key[&x]).then(x.cmp(&y)));
         let best = ranked[0];
         let best_name = items[best].map(|a| a.name.clone()).unwrap_or_default();
         for (rank, &i) in ranked.iter().enumerate() {
@@ -494,6 +576,15 @@ fn dedupe(items: &[Option<&Analysis>], out: &mut [Verdict], order: &[usize], s: 
             if rank >= s.keep_per_series.max(1) && keepable {
                 out[i].decision = Decision::Rejected(Reason::Duplicate);
                 out[i].notes.push(format!("Trùng với {best_name} (ảnh đẹp nhất trong loạt {} ảnh)", g.len()));
+            }
+        }
+        // Several frames of one shot: Sơn meant it. Keep the best one if it is usable.
+        if s.options.keep_each_shot && g.len() >= MEANT_SHOT && !g.iter().any(|&i| out[i].decision == Decision::Selected) {
+            let usable = items[best].is_some_and(|a| !a.people.closed_eyes && !a.people.blurred_face && !flagged(a, s));
+            let near = out[best].score >= s.threshold - s.review_margin;
+            if usable && near && matches!(out[best].decision, Decision::Review | Decision::Rejected(Reason::LowScore)) {
+                out[best].decision = Decision::Selected;
+                out[best].notes.push(format!("Bạn chụp {} tấm cảnh này: giữ tấm đẹp nhất", g.len()));
             }
         }
     }
@@ -705,5 +796,88 @@ mod tests {
         s.options.stars = StarMode::Pick;
         let v = cull(&refs, &s, None);
         assert_eq!(v.iter().filter(|x| x.decision.keep()).map(|x| x.idx).collect::<Vec<_>>(), vec![1]);
+    }
+
+    /// A look vector at cosine ~`c` from look `base` (seeded noise mixed in).
+    fn look(base: u32, c: f32, seed: u32) -> Vec<i8> {
+        let v = |k: u32, i: usize| (((i as u32).wrapping_mul(2654435761).wrapping_add(k.wrapping_mul(40503)) >> 7) % 200) as f32 - 100.0;
+        let mix = (1.0 / (c * c) - 1.0).max(0.0).sqrt();
+        let raw: Vec<f32> = (0..crate::visual::FULL).map(|i| v(base, i) + mix * v(seed + 1000, i)).collect();
+        // Each part is stored at unit length (scaled to 127), like the real vectors.
+        let (d, r) = (crate::visual::DIM, crate::visual::REG);
+        let mut out = vec![];
+        for part in [&raw[..d], &raw[d..d + r], &raw[d + r..]] {
+            let n = part.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+            out.extend(part.iter().map(|x| (x / n * 127.0).round().clamp(-127.0, 127.0) as i8));
+        }
+        out
+    }
+
+    fn face(x: f32) -> crate::faces::FaceInfo {
+        crate::faces::FaceInfo { bbox: [x, 0.3, 0.06, 0.09], main: true, eye_seen: true, ..Default::default() }
+    }
+
+    fn shot(name: &str, t: f64, score: f32, base: u32, c: f32, seed: u32, people: usize) -> Analysis {
+        let mut a = photo(name, t, [score; 5], seed as u64 * 7919);
+        a.embed = look(base, c, seed);
+        a.people.faces = (0..people).map(|k| face(0.1 + k as f32 * 0.13)).collect();
+        a
+    }
+
+    #[test]
+    fn bursts_group_by_picture_and_people() {
+        // One press of the shutter, the speaker moving: frames 0.5 s apart, pictures alike.
+        let burst: Vec<Analysis> = (0..4).map(|k| shot(&format!("b{k}"), 100.0 + k as f64 * 0.5, 8.0 + k as f32 * 0.2, 1, 0.94, k, 1)).collect();
+        let c = crate::visual::similarity_content(&burst[0].embed, &burst[1].embed);
+        assert!(c > 0.78 && c < 0.86, "test frames should be in the burst-only band: {c}");
+        let refs: Vec<_> = burst.iter().map(Some).collect();
+        let v = cull(&refs, &Settings::default(), None);
+        assert_eq!(v.iter().filter(|x| x.decision == Decision::Selected).count(), 1, "{:?}", v.iter().map(|x| x.decision).collect::<Vec<_>>());
+        assert_eq!(v[3].decision, Decision::Selected);
+
+        // Award groups on one stage: same backdrop, 5, 3, 6 people, photographed a few seconds
+        // apart. Each group is its own shot.
+        let mut g = vec![];
+        for (n, people) in [5usize, 3, 6].iter().enumerate() {
+            for k in 0..3 {
+                g.push(shot(&format!("g{n}-{k}"), 200.0 + n as f64 * 6.0 + k as f64 * 0.7, 8.2 + k as f32 * 0.1, 2, 0.97, (n * 10 + k) as u32, *people));
+            }
+        }
+        let refs: Vec<_> = g.iter().map(Some).collect();
+        let v = cull(&refs, &Settings::default(), None);
+        let picked: Vec<&str> = v.iter().filter(|x| x.decision == Decision::Selected).map(|x| g[x.idx].name.as_str()).collect();
+        assert_eq!(picked, vec!["g0-2", "g1-2", "g2-2"], "{:?}", v.iter().map(|x| (g[x.idx].name.clone(), x.decision, x.series, x.score)).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_shot_taken_many_times_keeps_its_best() {
+        // Just under the pick score: one is kept anyway (he shot it three times), and in a
+        // group the frame where nobody blinks wins.
+        let mut g: Vec<Analysis> = (0..3).map(|k| shot(&format!("s{k}"), 50.0 + k as f64, 7.0, 3, 0.95, k, 4)).collect();
+        g[0].scores.exposure = 7.3;
+        g[0].people.faces[2].closed = true;
+        let refs: Vec<_> = g.iter().map(Some).collect();
+        let v = cull(&refs, &Settings::default(), None);
+        let picked: Vec<usize> = v.iter().filter(|x| x.decision == Decision::Selected).map(|x| x.idx).collect();
+        assert_eq!(picked.len(), 1, "{:?}", v.iter().map(|x| (x.decision, x.score)).collect::<Vec<_>>());
+        assert_ne!(picked[0], 0, "the frame with someone blinking loses");
+        let mut s = Settings::default();
+        s.options.keep_each_shot = false;
+        assert!(cull(&refs, &s, None).iter().all(|x| x.decision != Decision::Selected));
+    }
+
+    #[test]
+    fn a_speaker_looking_down_is_for_review() {
+        let mut a = shot("talk", 0.0, 9.0, 4, 1.0, 1, 1);
+        a.people.faces[0].down = true;
+        let mut b = shot("moment", 500.0, 9.0, 5, 1.0, 2, 3);
+        b.people.faces[0].down = true;
+        let refs = vec![Some(&a), Some(&b)];
+        let v = cull(&refs, &Settings::default(), None);
+        assert_eq!(v[0].decision, Decision::Review);
+        assert_eq!(v[1].decision, Decision::Selected, "looking down in a moment with others is fine");
+        let mut s = Settings::default();
+        s.options.speaker_head_up = false;
+        assert_eq!(cull(&refs, &s, None)[0].decision, Decision::Selected);
     }
 }

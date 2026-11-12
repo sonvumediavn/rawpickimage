@@ -97,16 +97,41 @@ trên CPU) xem từng mắt, kết hợp với phép đo độ cao tròng đen. 
 bạn sửa. Khi bạn chọn một ảnh mà AI tưởng là nhắm mắt, AI cũng coi đó là gợi ý nhẹ rằng mắt đang mở.
 Các lần sửa mắt cũng được chia sẻ qua thư mục học chung giữa các máy.
 
+**Khẩu hình, góc mặt, hướng nhìn**: cạnh từng người còn có nút bật tắt giống nút mắt: Khẩu hình
+(Đẹp / Xấu), Góc mặt (Thẳng / Nghiêng), Hướng nhìn (Ngẩng / Cúi). AI tự đoán sẵn từ các điểm mốc khuôn
+mặt (miệng há bao nhiêu, mặt quay bao nhiêu, mũi nằm thấp hay cao so với mắt và miệng). Bấm sửa khi AI
+đoán sai: ảnh đó đổi ngay, và AI học lại ngưỡng của bạn cho mọi ảnh khác (ghi «bạn sửa», bấm ↺ để trả
+về AI). Người phát biểu một mình trong khung mà cúi đầu (đọc giấy) thì vào «Cần xem lại»; nói với AI
+«người phát biểu cúi đầu vẫn giữ» để tắt.
+
 **Ảnh gắn sao trên máy ảnh**: app đọc số sao bạn gắn ngay trên máy (Canon, Nikon, Sony, Fujifilm,
 cả sao gắn sau trong Lightroom/Bridge qua file .xmp) và ảnh khóa bảo vệ. Khi thư mục có ảnh gắn sao,
 thanh công cụ hiện ô ★: «Chỉ lọc ảnh có sao» (bỏ ảnh không sao, AI lọc tiếp trong số ảnh có sao: mắt
 nhắm, mờ, trùng…) hoặc «Lấy luôn ảnh có sao» (chọn đúng những ảnh bạn gắn sao).
 
+Tab **★ Gắn sao** gom riêng ảnh có sao, lọc nhanh theo 1★ đến 5★ (ví dụ «3★ trở lên»). Trong tab có:
+- **Dạy AI theo ảnh gắn sao**: ảnh có sao (theo mức đang lọc) là ảnh bạn giữ, còn lại là ảnh bỏ, AI học
+  cả thư mục như khi bạn chọn tay.
+- **Xuất ảnh gắn sao**: chép đúng những ảnh đó (kèm RAW/JPEG/.xmp cùng tên) vào thư mục `_anh chon`.
+
+**★ Chép nhanh ảnh gắn sao…** (thanh công cụ, cần gấp khi chưa kịp lọc trên máy): chọn thẳng thẻ nhớ
+(hoặc thư mục bất kỳ) và nơi lưu, chọn mức sao. App chỉ đọc số sao, không phân tích ảnh, rồi chép những
+ảnh đó vào `<nơi lưu>/<tên thư mục nguồn>_anh sao/`, có kiểm tra checksum, ảnh trên thẻ giữ nguyên.
+Tích «Chép xong thì cho AI lọc tiếp các ảnh này» nếu muốn AI chấm tiếp.
+
 **Ảnh chụp liên tiếp**: các tấm trong một loạt được gom theo hình (cùng cảnh, cùng người, xê dịch hay zoom
-nhẹ vẫn là một loạt), mỗi loạt chỉ giữ tấm đẹp nhất (hoặc số tấm bạn đặt ở «Mỗi loạt giữ»).
+nhẹ vẫn là một loạt), mỗi loạt chỉ giữ tấm đẹp nhất (hoặc số tấm bạn đặt ở «Mỗi loạt giữ»). App so cả vị
+trí và số người trong khung: 6 nhóm lần lượt lên nhận giải trên cùng sân khấu là 6 cảnh khác nhau, không
+gộp làm một. Ảnh đông người ưu tiên tấm có nhiều người mở mắt và ngẩng đầu nhất.
+Cảnh nào bạn bấm từ 3 tấm trở lên mà AI chưa chọn tấm nào, AI giữ tấm đẹp nhất nếu dùng được (không
+nhắm mắt, không mờ mặt), để mỗi nhóm có một ảnh. Nói với AI «mỗi nhóm nhận giải giữ 1 ảnh» để bật lại
+nếu đã tắt.
 
 **Crop ảnh** (phím C trong trình xem ảnh): kéo khung giữ lại, chọn tỉ lệ (tự do, như gốc, 1:1, 3:2, 4:3,
-4:5, 16:9, 9:16…), Enter lưu. Ảnh gốc không bao giờ bị sửa; chỉ bản xuất được cắt:
+4:5, 16:9, 9:16…), Enter lưu. Giữ **Shift** khi kéo thì khung giữ nguyên tỉ lệ, chỉ to nhỏ; cuộn chuột
+cũng phóng to thu nhỏ khung. Lưu xong app hiện ảnh thành quả (bấm «Sửa crop» để chỉnh tiếp).
+**Ctrl+Z** hoàn tác, **Ctrl+Y** (hoặc Ctrl+Shift+Z, trên Mac dùng ⌘) làm lại, cả khi đang kéo khung lẫn
+với crop đã lưu. Ảnh gốc không bao giờ bị sửa; chỉ bản xuất được cắt:
 - JPEG: cắt thẳng trên dữ liệu nén, phần giữ lại giống từng điểm ảnh của file gốc, không nén lại, giữ EXIF
   và màu. Mép trái/trên có thể rộng hơn khung vài điểm ảnh (khối 8–16 px của JPEG), không bao giờ hẹp hơn.
 - RAW: file RAW chép nguyên vẹn, kèm khung crop trong file `.xmp` (Lightroom, Camera Raw, Bridge mở ra

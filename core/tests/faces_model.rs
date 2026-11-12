@@ -34,6 +34,10 @@ fn finds_the_face_and_tells_open_from_closed_eyes() {
     assert!((0.3..0.6).contains(&cx), "{:?}", f.bbox);
 
     eprintln!("mở: mạng mắt {:?}, điểm ảnh {:.2}, khả năng nhắm {:.2}", f.eye_p, f.eye_open, f.p_closed);
+    // A portrait facing the camera: not looking down, not turned.
+    eprintln!("đầu {:.3}, nghiêng {:.3}, miệng {:.3}", f.pitch, f.yaw, f.mouth_open);
+    assert!(!f.down && !f.turned, "{:?}", f);
+    assert!(f.pitch.abs() < 0.2, "pitch {}", f.pitch);
     if std::env::var("RAWPICK_REQUIRE_MODEL").as_deref() == Ok("1") {
         assert!(f.eye_p.is_some(), "thiếu mô hình mắt {}", rawpick_core::eyes::MODEL);
     }

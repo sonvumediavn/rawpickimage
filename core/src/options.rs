@@ -30,6 +30,12 @@ pub struct Options {
     pub review_open_mouth: bool,
     /// Keep only the best shot of each burst / near-identical series.
     pub dedupe: bool,
+    /// A shot Sơn took several frames of was meant: keep its best frame when it is usable,
+    /// even a little under the pick score.
+    pub keep_each_shot: bool,
+    /// A person alone in the frame (a speaker at the lectern) looking down goes to review.
+    /// Looking down in a candid moment with others is fine.
+    pub speaker_head_up: bool,
     /// Blend in what the AI learned from Sơn's earlier choices.
     pub use_learned: bool,
     /// Let the AI pick. Off: every photo still gets its score and notes, but nothing is chosen
@@ -73,6 +79,8 @@ impl Default for Options {
             reject_closed_eyes: true,
             review_open_mouth: false,
             dedupe: true,
+            keep_each_shot: true,
+            speaker_head_up: true,
             use_learned: true,
             ai_pick: true,
             stars: StarMode::Off,

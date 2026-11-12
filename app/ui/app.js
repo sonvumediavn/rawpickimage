@@ -23,6 +23,8 @@ const CORE_OPTS = [
   ["reject_closed_eyes", "Loại ảnh có người nhắm mắt"],
   ["review_open_mouth", "Ảnh nhân vật chính đang há miệng đưa vào «Cần xem lại»"],
   ["dedupe", "Lọc ảnh trùng, giữ ảnh đẹp nhất mỗi loạt"],
+  ["keep_each_shot", "Cảnh chụp nhiều tấm (nhóm nhận giải…) giữ ít nhất 1 tấm đẹp nhất"],
+  ["speaker_head_up", "Người phát biểu một mình cúi đầu: đưa vào «Cần xem lại»"],
   ["use_learned", "Dùng điều AI đã học từ lựa chọn của bạn"],
 ];
 
@@ -31,7 +33,7 @@ const st = {
   // Sessions: one folder each. `views` caches the full data of analysed sessions.
   sid: null, metas: [], views: {}, progress: {},
   session: null, verdicts: [], summary: null,
-  tab: "all", reason: "", sort: "time", view: [], cur: -1,
+  tab: "all", reason: "", sort: "time", view: [], cur: -1, starMin: 1,
 };
 const meta = (id = st.sid) => st.metas.find((m) => m.id === id);
 
@@ -500,6 +502,14 @@ function wireIn() {
   });
 
   $("btnCard").onclick = () => { $("cardDlg").hidden = false; };
+  $("btnStarCopy").onclick = () => { $("starDlg").hidden = false; };
+  $("starCancel").onclick = () => { $("starDlg").hidden = true; };
+  $("starGo").onclick = () => {
+    const src = $("starSrc").value, dest = $("starDst").value;
+    if (!src || !dest) return toast("Chọn nơi lấy ảnh và thư mục đích trước đã.");
+    $("starDlg").hidden = true;
+    copyStarred(src, dest, +$("starDlgMin").value, $("starThen").checked);
+  };
   $("cardCancel").onclick = () => { $("cardDlg").hidden = true; };
   for (const b of document.querySelectorAll("[data-pick]")) {
     b.onclick = async () => {
@@ -523,6 +533,28 @@ function wireIn() {
       toast(esc(e));
     }
   };
+}
+
+/** Copy the photos starred on the camera, straight from the card or a folder (no AI needed). */
+async function copyStarred(source, dest, min, thenCull) {
+  busy(true, "Đang đọc số sao trên ảnh…");
+  try {
+    const r = await invoke("copy_starred", { source, dest, minStars: min });
+    busy(false);
+    if (!r.starred) return toast(`Không thấy ảnh nào gắn ${min > 1 ? `từ ${min}★` : "sao"} trong ${r.photos} ảnh.`, 8000);
+    toast(
+      `Đã chép ${r.starred} ảnh gắn sao (${r.files} file, ${(r.bytes / 1e9).toFixed(2)} GB) vào <a id="openStar">${esc(r.out_dir)}</a>` +
+        (r.skipped_same ? `, bỏ qua ${r.skipped_same} file đã có` : "") +
+        (r.errors.length ? `, <b>${r.errors.length} lỗi</b>: ${esc(r.errors[0])}` : "") + ".",
+      15000
+    );
+    const a = document.getElementById("openStar");
+    if (a) a.onclick = () => T.opener.openPath(r.out_dir);
+    if (thenCull && !r.errors.length) openFolder(r.out_dir);
+  } catch (e) {
+    busy(false);
+    toast(esc(e));
+  }
 }
 
 // ---------------------------------------------------------------- results
@@ -571,7 +603,8 @@ function topWhy(p, v) {
 function computeView() {
   const P = st.session.photos;
   let idx = st.verdicts.map((v) => v.idx);
-  if (st.tab !== "all") idx = idx.filter((i) => st.verdicts[i].decision.kind === st.tab);
+  if (st.tab === "stars") idx = idx.filter((i) => isStarred(P[i]));
+  else if (st.tab !== "all") idx = idx.filter((i) => st.verdicts[i].decision.kind === st.tab);
   if (st.reason) idx = idx.filter((i) => decLabel(st.verdicts[i].decision).endsWith(st.reason));
   if (st.sort === "score") idx.sort((a, b) => st.verdicts[b].score - st.verdicts[a].score);
   else if (st.sort === "name") idx.sort((a, b) => P[a].name.localeCompare(P[b].name));
@@ -579,8 +612,29 @@ function computeView() {
   st.view = idx;
 }
 
+/** Starred on the camera with at least the chosen number of stars (or locked with protect). */
+function isStarred(p) {
+  return p.stars >= st.starMin || p.protected;
+}
+
+function renderStarBar() {
+  const on = st.tab === "stars";
+  $("starBar").hidden = !on;
+  const P = (st.session && st.session.photos) || [];
+  const n = P.filter((p) => p.stars > 0 || p.protected).length;
+  const t = [...$("tabs").children].find((b) => b.dataset.t === "stars");
+  if (t) t.textContent = n ? `★ Gắn sao (${n})` : "★ Gắn sao";
+  if (!on) return;
+  for (const b of $("starMin").children) b.setAttribute("aria-pressed", String(+b.dataset.n === st.starMin));
+  const k = P.filter(isStarred).length;
+  $("starInfo").textContent = n ? `${k} ảnh ${st.starMin > 1 ? `từ ${st.starMin}★` : "có sao"} trên máy ảnh` : "Thư mục này chưa có ảnh nào gắn sao trên máy ảnh";
+  $("btnStarLearn").disabled = !k;
+  $("btnStarExport").disabled = !k;
+}
+
 function renderGrid() {
   computeView();
+  renderStarBar();
   const P = st.session.photos;
   $("grid").innerHTML = st.view
     .map((i) => {
@@ -608,6 +662,26 @@ function wireResults() {
   }
   $("reasonSel").onchange = () => { st.reason = $("reasonSel").value; if (st.reason) { st.tab = "all"; for (const x of $("tabs").children) x.setAttribute("aria-pressed", String(x.dataset.t === "all")); } renderGrid(); };
   $("sortSel").onchange = () => { st.sort = $("sortSel").value; renderGrid(); };
+  for (const b of $("starMin").children) b.onclick = () => { st.starMin = +b.dataset.n; renderGrid(); };
+  $("btnStarExport").onclick = async () => {
+    const m = meta();
+    if (!m || !m.source) return;
+    const dest = await T.dialog.open({ directory: true, multiple: false, title: "Chọn thư mục để chép ảnh gắn sao" });
+    if (dest) copyStarred(m.source, dest, st.starMin, false);
+  };
+  $("btnStarLearn").onclick = async () => {
+    const k = st.session.photos.filter(isStarred).length, all = st.session.photos.length;
+    if (!(await ask(`AI sẽ học: ${k} ảnh gắn sao là ảnh bạn chọn, ${all - k} ảnh còn lại là ảnh bạn bỏ.\n\nChỉ nên dùng khi bạn đã gắn sao đủ cho cả show.`, { title: "Dạy AI theo ảnh gắn sao", ok: "Dạy AI" }))) return;
+    try {
+      const r = await invoke("learn_stars", { id: st.sid, minStars: st.starMin });
+      renderProfile(r.profile);
+      toast(`AI đã học ${r.kept} ảnh bạn gắn sao (giữ) và ${r.dropped} ảnh không sao (bỏ), áp dụng ngay cho loại sự kiện «${esc(st.prefs.profile)}».`, 9000);
+      const v = await invoke("get_session", { id: st.sid }).catch(() => null);
+      if (v) { st.views[st.sid] = v; st.session = null; renderMain(); }
+    } catch (e) {
+      toast(esc(e));
+    }
+  };
   $("btnExport").onclick = doExportShow;
   $("btnLearnShow").onclick = doLearnShow;
   $("btnExportOther").onclick = doExport;
@@ -827,7 +901,7 @@ async function doGather() {
 // ---------------------------------------------------------------- detail view
 
 async function openDetail(i) {
-  if (st.cur !== i) { cropEd.on = false; cropEd.drag = null; }
+  if (st.cur !== i) { cropEd.on = false; cropEd.drag = null; hideCropResult(); }
   st.cur = i;
   $("detail").hidden = false;
   renderDetail();
@@ -1116,26 +1190,50 @@ async function decide(kind) {
   applyVerdicts(await invoke("set_decision", { id: st.sid, idx: i, decision }));
 }
 
-/** One row per main face: Sơn tells the AI whether the eyes are open or closed. */
+/**
+ * One block per main face: Sơn tells the AI whether the eyes are open, the mouth looks good, the
+ * face is turned and the head bowed. Each correction is learned for every other photo.
+ */
+const FACE_MARKS = [
+  // [key, label, "no" button, "yes" button]
+  ["mouth", "Khẩu hình", "Đẹp", "Xấu"],
+  ["turned", "Góc mặt", "Thẳng", "Nghiêng"],
+  ["down", "Hướng nhìn", "Ngẩng", "Cúi"],
+];
+
 function renderEyes(i, p, mains) {
   const box = $("deyes");
-  const rows = mains.filter((x) => x.f.eyes).slice(0, 8);
+  const rows = mains.filter((x) => x.f.eyes || !x.f.small).slice(0, 8);
   box.hidden = !rows.length || !!p.error;
   if (box.hidden) { box.innerHTML = ""; return; }
-  box.innerHTML = `<div class="h"><span>Mắt</span><span class="note">AI nhìn sai? Bấm để sửa, AI nhớ cho lần sau</span></div>` + rows
-    .map(({ f, n }, k) => `<div class="eyerow" data-n="${n}">
-      <span>${rows.length > 1 || mains.length > 1 ? `Người ${mains.findIndex((x) => x.n === n) + 1}` : "Mắt"}${f.by_hand ? ' <em class="note">(bạn sửa)</em>' : ""}</span>
-      <button class="btn sm${!f.closed ? " on" : ""}" data-open="1">Mở</button>
-      <button class="btn sm${f.closed ? " on" : ""}" data-open="0">Nhắm</button>
-      ${f.by_hand ? `<button class="btn sm" data-open="" title="Để AI tự xét lại mặt này">↺</button>` : ""}
-    </div>`)
+  const btn = (on, data, text, title) => `<button class="btn sm${on ? " on" : ""}" ${data}${title ? ` title="${title}"` : ""}>${text}</button>`;
+  const again = (data) => `<button class="btn sm" ${data} title="Để AI tự xét lại">↺</button>`;
+  box.innerHTML = `<div class="h"><span>Khuôn mặt</span><span class="note">AI nhìn sai? Bấm để sửa, AI nhớ cho lần sau</span></div>` + rows
+    .map(({ f, n }) => {
+      const who = rows.length > 1 || mains.length > 1 ? `Người ${mains.findIndex((x) => x.n === n) + 1}` : "";
+      const hand = (m) => (f.hand_marks || []).includes(m);
+      const lines = [];
+      if (f.eyes) {
+        lines.push(`<div class="eyerow"><span>Mắt${f.by_hand ? ' <em class="note">(bạn sửa)</em>' : ""}</span>
+          ${btn(!f.closed, 'data-open="1"', "Mở")}${btn(f.closed, 'data-open="0"', "Nhắm")}${f.by_hand ? again('data-open=""') : ""}</div>`);
+      }
+      if (!f.small) {
+        for (const [m, label, no, yes] of FACE_MARKS) {
+          const v = !!f[m];
+          lines.push(`<div class="eyerow"><span>${label}${hand(m) ? ' <em class="note">(bạn sửa)</em>' : ""}</span>
+            ${btn(!v, `data-mark="${m}" data-yes="0"`, no)}${btn(v, `data-mark="${m}" data-yes="1"`, yes)}${hand(m) ? again(`data-mark="${m}" data-yes=""`) : ""}</div>`);
+        }
+      }
+      return `<div class="facegrp" data-n="${n}">${who ? `<div class="who">${who}</div>` : ""}${lines.join("")}</div>`;
+    })
     .join("");
-  for (const row of box.querySelectorAll(".eyerow")) {
-    const n = +row.dataset.n;
+  for (const grp of box.querySelectorAll(".facegrp")) {
+    const n = +grp.dataset.n;
     const fb = () => $("dframe").querySelector(`.fbox[data-n="${n}"]`);
-    row.onmouseenter = () => fb()?.classList.add("hl");
-    row.onmouseleave = () => fb()?.classList.remove("hl");
-    for (const b of row.querySelectorAll("button")) b.onclick = () => setEyes(i, n, b.dataset.open === "" ? null : b.dataset.open === "1");
+    grp.onmouseenter = () => fb()?.classList.add("hl");
+    grp.onmouseleave = () => fb()?.classList.remove("hl");
+    for (const b of grp.querySelectorAll("button[data-open]")) b.onclick = () => setEyes(i, n, b.dataset.open === "" ? null : b.dataset.open === "1");
+    for (const b of grp.querySelectorAll("button[data-mark]")) b.onclick = () => setMark(i, n, b.dataset.mark, b.dataset.yes === "" ? null : b.dataset.yes === "1");
   }
 }
 
@@ -1147,10 +1245,26 @@ async function setEyes(i, face, open) {
     toast(esc(String(e)));
     return;
   }
+  faceChanged(i, r, open == null ? "Đã để AI tự xét lại mắt người này." : `Đã ghi nhớ: mắt ${open ? "mở" : "nhắm"}.`);
+}
+
+async function setMark(i, face, mark, yes) {
+  let r;
+  try {
+    r = await invoke("set_mark", { id: st.sid, idx: i, face, mark, yes });
+  } catch (e) {
+    toast(esc(String(e)));
+    return;
+  }
+  const [, label, no, y] = FACE_MARKS.find((x) => x[0] === mark);
+  faceChanged(i, r, yes == null ? `Đã để AI tự xét lại ${label.toLowerCase()} người này.` : `Đã ghi nhớ: ${label.toLowerCase()} ${(yes ? y : no).toLowerCase()}.`);
+}
+
+function faceChanged(i, r, what) {
   st.session.photos[i] = r.photo;
   applyVerdicts({ verdicts: r.verdicts, summary: r.summary });
-  toast(open == null ? "Đã để AI tự xét lại mắt người này." : `Đã ghi nhớ: mắt ${open ? "mở" : "nhắm"}. AI đã học từ ${r.corrected} lần bạn sửa mắt và xét lại các ảnh khác.`, 3500);
-  // Other photos may have changed too (the eye rule learned): refresh their notes quietly.
+  toast(`${what} AI đã học từ ${r.corrected} lần bạn sửa khuôn mặt và xét lại các ảnh khác.`, 3500);
+  // Other photos may have changed too (the rule learned): refresh their notes quietly.
   const sid = st.sid;
   invoke("get_session", { id: sid }).then((v) => {
     if (st.sid !== sid || !st.session) return;
@@ -1166,18 +1280,26 @@ function step(d) {
 }
 
 function wireDetail() {
-  $("dclose").onclick = () => { cropEd.on = false; $("detail").hidden = true; st.cur = -1; zoom.idx = -1; };
+  $("dclose").onclick = () => { cropEd.on = false; hideCropResult(); $("detail").hidden = true; st.cur = -1; zoom.idx = -1; };
   wireCrop();
   for (const b of document.querySelectorAll(".dact button")) b.onclick = () => decide(b.dataset.d === "ai" ? null : b.dataset.d);
   document.addEventListener("keydown", (e) => {
     if ($("detail").hidden || e.target.matches("input,select,textarea")) return;
     const k = e.key.toLowerCase();
+    const mod = e.ctrlKey || e.metaKey;
+    if (mod && (k === "z" || k === "y")) {
+      e.preventDefault();
+      cropHistory(k === "z" && !e.shiftKey);
+      return;
+    }
     if (cropEd.on) {
       // While framing, only the crop keys count (arrows must not jump to another photo).
       if (k === "enter") { e.preventDefault(); cropSave(); }
       else if (k === "escape") cropStop();
       return;
     }
+    if (!$("cropResult").hidden && (k === "escape" || k === "enter" || k === " ")) { e.preventDefault(); hideCropResult(); return; }
+    hideCropResult();
     if (k === "c") cropBegin();
     else if (k === "escape") $("dclose").click();
     else if (k === "arrowright") step(1);
@@ -1206,7 +1328,9 @@ const CROP_ASPECTS = [
 ];
 const CROP_BADGE = `<span class="crop" title="Đã crop, khi xuất sẽ cắt bớt phần thừa">✂</span>`;
 const CROP_MIN = 0.03;
-const cropEd = { on: false, r: null, aspect: "free", drag: null };
+const cropEd = { on: false, r: null, aspect: "free", drag: null, undo: [], redo: [] };
+/** Saved crop changes, for Ctrl+Z / Ctrl+Y outside the frame tool: {sid, idx, before, after}. */
+const cropLog = { undo: [], redo: [] };
 try { cropEd.aspect = localStorage.getItem("cropAspect") || "free"; } catch {}
 const clamp = (v, a, b) => Math.min(Math.max(v, a), b);
 
@@ -1289,6 +1413,7 @@ function renderCrop() {
   $("cropStart").disabled = !!p.error;
   $("cropStart").innerHTML = `✂ ${p.crop ? "Sửa crop" : "Crop"} <kbd>C</kbd>`;
   $("cropClear").hidden = !p.crop;
+  $("cropView").hidden = !p.crop;
   $("cropInfo").textContent = p.crop ? `Khi xuất giữ ${cropPx(p, p.crop)}` : "";
   if (editing) {
     $("cropAspect").value = cropEd.aspect;
@@ -1332,7 +1457,37 @@ function cropBegin() {
   cropEd.on = true;
   const k = cropK();
   cropEd.r = p.crop ? [...p.crop] : k ? withAspect([0, 0, 1, 1], k) : [0.05, 0.05, 0.9, 0.9];
+  cropEd.undo = [];
+  cropEd.redo = [];
+  hideCropResult();
   renderCrop();
+}
+
+/** Remember the frame before a change, so Ctrl+Z can bring it back. */
+function cropMark(before) {
+  cropEd.undo.push([...before]);
+  if (cropEd.undo.length > 100) cropEd.undo.shift();
+  cropEd.redo = [];
+}
+
+/** Ctrl+Z / Ctrl+Y: while framing, steps through the frame; otherwise through saved crops. */
+async function cropHistory(back) {
+  if (cropEd.on) {
+    const from = back ? cropEd.undo : cropEd.redo, to = back ? cropEd.redo : cropEd.undo;
+    if (!from.length) return;
+    to.push([...cropEd.r]);
+    cropEd.r = from.pop();
+    return renderCrop();
+  }
+  const from = back ? cropLog.undo : cropLog.redo, to = back ? cropLog.redo : cropLog.undo;
+  const e = from[from.length - 1];
+  if (!e) return toast(back ? "Không còn gì để hoàn tác." : "Không còn gì để làm lại.", 2000);
+  if (e.sid !== st.sid) return toast("Thao tác crop này thuộc phiên khác.", 2500);
+  from.pop();
+  to.push(e);
+  if (st.cur !== e.idx) openDetail(e.idx);
+  await setCrop(back ? e.before : e.after, true);
+  toast(back ? "Đã hoàn tác crop (Ctrl+Y để làm lại)." : "Đã làm lại crop.", 2500);
 }
 
 function cropStop() {
@@ -1347,8 +1502,9 @@ async function cropSave() {
   await setCrop(full ? null : r);
 }
 
-async function setCrop(crop) {
+async function setCrop(crop, fromHistory) {
   const i = st.cur;
+  const before = st.session.photos[i].crop || null;
   let v;
   try {
     v = await invoke("set_crop", { id: st.sid, idx: i, crop });
@@ -1361,7 +1517,47 @@ async function setCrop(crop) {
   renderCrop();
   const th = $("grid").querySelector(`.card[data-i="${i}"] .th`);
   if (th) { th.querySelector(".crop")?.remove(); if (v.crop) th.insertAdjacentHTML("beforeend", CROP_BADGE); }
-  toast(v.crop ? `Đã lưu khung crop (${cropPx(v, v.crop)}). Khi xuất chỉ bản chép được cắt, ảnh gốc giữ nguyên.` : "Đã bỏ crop, ảnh sẽ được xuất nguyên khung.", 3500);
+  if (fromHistory) {
+    if (v.crop) showCropResult();
+    else hideCropResult();
+    return;
+  }
+  cropLog.undo.push({ sid: st.sid, idx: i, before, after: v.crop || null });
+  cropLog.redo = [];
+  if (v.crop) {
+    showCropResult();
+    toast(`Đã lưu khung crop (${cropPx(v, v.crop)}). Khi xuất chỉ bản chép được cắt, ảnh gốc giữ nguyên. Ctrl+Z để hoàn tác.`, 4000);
+  } else {
+    hideCropResult();
+    toast("Đã bỏ crop, ảnh sẽ được xuất nguyên khung. Ctrl+Z để hoàn tác.", 3500);
+  }
+}
+
+/** The finished crop, shown on its own over the photo (what the exported copy will look like). */
+function showCropResult() {
+  const p = st.cur >= 0 ? st.session.photos[st.cur] : null;
+  const img = $("dimg");
+  if (!p || !p.crop || !img.naturalWidth) return;
+  const [x, y, w, h] = p.crop;
+  const sw = img.naturalWidth * w, sh = img.naturalHeight * h;
+  const stage = $("dstage");
+  const maxW = stage.clientWidth - 40, maxH = stage.clientHeight - 90;
+  const s = Math.min(maxW / sw, maxH / sh);
+  const dpr = window.devicePixelRatio || 1;
+  const c = $("cropResultCanvas");
+  c.width = Math.max(1, Math.round(sw * s * dpr));
+  c.height = Math.max(1, Math.round(sh * s * dpr));
+  c.style.width = Math.round(sw * s) + "px";
+  c.style.height = Math.round(sh * s) + "px";
+  const g = c.getContext("2d");
+  g.imageSmoothingQuality = "high";
+  g.drawImage(img, img.naturalWidth * x, img.naturalHeight * y, sw, sh, 0, 0, c.width, c.height);
+  $("cropResultInfo").textContent = `Kết quả crop · ${cropPx(p, p.crop)} · phần bên trong giữ nguyên chất lượng`;
+  $("cropResult").hidden = false;
+}
+
+function hideCropResult() {
+  $("cropResult").hidden = true;
 }
 
 function wireCrop() {
@@ -1370,11 +1566,14 @@ function wireCrop() {
     cropEd.aspect = $("cropAspect").value;
     try { localStorage.setItem("cropAspect", cropEd.aspect); } catch {}
     const k = cropK();
-    if (k && cropEd.r) cropEd.r = withAspect(cropEd.r, k);
+    if (k && cropEd.r) { cropMark(cropEd.r); cropEd.r = withAspect(cropEd.r, k); }
     $("cropAspect").blur();
     renderCrop();
   };
   $("cropStart").onclick = cropBegin;
+  $("cropView").onclick = showCropResult;
+  $("cropResultClose").onclick = hideCropResult;
+  $("cropResultEdit").onclick = cropBegin;
   $("cropSave").onclick = cropSave;
   $("cropCancel").onclick = cropStop;
   $("cropClear").onclick = () => setCrop(null);
@@ -1395,7 +1594,9 @@ function wireCrop() {
   frame.addEventListener("pointermove", (e) => {
     const g = cropEd.drag;
     if (!g) return;
-    const pt = at(e), k = cropK(), [x, y, w, h] = g.r0;
+    const [x, y, w, h] = g.r0;
+    // Shift: keep the frame's own shape, only make it bigger or smaller.
+    const pt = at(e), k = e.shiftKey && g.mode !== "new" ? w / h : e.shiftKey && cropEd.r ? cropEd.r[2] / cropEd.r[3] : cropK();
     if (!g.moved && Math.hypot(pt[0] - g.start[0], pt[1] - g.start[1]) < 0.005) return;
     g.moved = true;
     if (g.mode === "move") {
@@ -1410,7 +1611,27 @@ function wireCrop() {
     }
     placeCrop();
   });
-  const end = () => { cropEd.drag = null; };
+  const end = () => {
+    const g = cropEd.drag;
+    if (g && g.moved) cropMark(g.r0);
+    cropEd.drag = null;
+  };
+  // Mouse wheel while framing: the frame grows or shrinks around its centre, same shape.
+  $("dstage").addEventListener("wheel", (e) => {
+    if (!cropEd.on || !cropEd.r) return;
+    e.preventDefault();
+    const [x, y, w, h] = cropEd.r;
+    let f = Math.exp(-e.deltaY * 0.0015);
+    f = Math.min(f, 1 / w, 1 / h);
+    const nw = Math.max(CROP_MIN, w * f), nh = (nw / w) * h;
+    if (nh < CROP_MIN) return;
+    if (!cropEd.wheel) cropMark(cropEd.r);
+    clearTimeout(cropEd.wheel);
+    cropEd.wheel = setTimeout(() => { cropEd.wheel = 0; }, 400);
+    const cx = x + w / 2, cy = y + h / 2;
+    cropEd.r = [clamp(cx - nw / 2, 0, 1 - nw), clamp(cy - nh / 2, 0, 1 - nh), nw, nh];
+    placeCrop();
+  }, { passive: false });
   frame.addEventListener("pointerup", end);
   frame.addEventListener("pointercancel", end);
 }
@@ -1420,9 +1641,9 @@ function wireCrop() {
 // Quick requests, grouped. Each one is just text the chat understands; typing works the same.
 const CHAT_GROUPS = [
   ["Loại sự kiện", ["Đây là đám cưới", "Hội nghị – hội thảo", "Sân khấu – biểu diễn", "Tiệc – gala", "Kỷ yếu – ảnh nhóm", "Thể thao"]],
-  ["Người & khuôn mặt", ["Mắt nhân vật chính phải mở", "Loại ảnh há miệng, khẩu hình xấu", "Mặt nghiêng đẹp vẫn giữ", "Ưu tiên nhân vật chính, cận mặt", "Ưu tiên ảnh có người cười", "Giữ ảnh nhắm mắt"]],
+  ["Người & khuôn mặt", ["Mắt nhân vật chính phải mở", "Loại ảnh há miệng, khẩu hình xấu", "Mặt nghiêng đẹp vẫn giữ", "Người phát biểu phải ngẩng đầu", "Người phát biểu cúi đầu vẫn giữ", "Ưu tiên nhân vật chính, cận mặt", "Ưu tiên ảnh có người cười", "Giữ ảnh nhắm mắt"]],
   ["Bố cục & kỹ thuật", ["Bố cục, góc chụp quan trọng nhất", "Độ nét quan trọng nhất", "Tôi thích ảnh tông tối", "Không quan tâm màu sắc", "Bỏ qua nhiễu hạt", "Sửa thay vì loại"]],
-  ["Số lượng", ["Chỉ giữ 300 ảnh", "Chọn nhiều hơn", "Khắt khe hơn", "Mỗi loạt giữ 2 ảnh", "Đủ khoảnh khắc", "Bỏ giới hạn số ảnh"]],
+  ["Số lượng", ["Chỉ giữ 300 ảnh", "Chọn nhiều hơn", "Khắt khe hơn", "Mỗi loạt giữ 2 ảnh", "Mỗi nhóm nhận giải giữ 1 ảnh", "Đủ khoảnh khắc", "Bỏ giới hạn số ảnh"]],
   ["Gu của tôi", ["Chọn theo phong cách của tôi", "Tin gu của tôi nhiều hơn", "AI đã học được gì từ tôi?", "Chỉ dùng tiêu chí máy, tắt gu"]],
   ["Hỏi & hoàn tác", ["Tóm tắt phiên này", "Vì sao nhiều ảnh bị loại?", "Đang chấm theo thiết lập nào?", "Hoàn tác", "Đặt lại mặc định"]],
 ];
