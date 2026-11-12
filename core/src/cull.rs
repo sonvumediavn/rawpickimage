@@ -469,6 +469,9 @@ fn same_shot(a: &Analysis, b: &Analysis, gap: Option<f64>) -> bool {
     match gap {
         // Pressed again within a second or two: the same shot even if people moved a lot.
         Some(g) if g <= BURST_GAP => content >= SAME_SHOT_BURST,
+        // The same group a few seconds later (people shifting, smiling, the photographer
+        // re-framing): the faces say it is them.
+        Some(_) if same_group(a, b) => content >= SAME_SHOT_BURST,
         Some(_) => content >= SAME_SHOT,
         None => content >= SAME_SHOT_UNTIMED && crate::visual::similarity(&a.embed, &b.embed) >= SAME_SHOT_UNTIMED - 0.03,
     }
@@ -512,6 +515,19 @@ fn other_people(a: &Analysis, b: &Analysis) -> bool {
         !near.is_empty() && near.iter().all(|g| similarity(&f.id, &g.id).unwrap_or(1.0) < OTHER_PERSON)
     };
     fa.iter().any(|f| stranger(f, &fb)) || fb.iter().any(|f| stranger(f, &fa))
+}
+
+/// Two people or more, and by their fingerprints the same people in both frames.
+fn same_group(a: &Analysis, b: &Analysis) -> bool {
+    use crate::faceid::{similarity, SAME_PERSON};
+    let (fa, fb) = (known_faces(a), known_faces(b));
+    let (lo, hi) = (fa.len().min(fb.len()), fa.len().max(fb.len()));
+    if lo < 2 || hi - lo > 1 {
+        return false;
+    }
+    let (small, big) = if fa.len() <= fb.len() { (&fa, &fb) } else { (&fb, &fa) };
+    let found = small.iter().filter(|f| big.iter().any(|g| similarity(&f.id, &g.id).unwrap_or(0.0) >= SAME_PERSON)).count();
+    found as f32 >= 0.75 * lo as f32
 }
 
 fn known_faces(x: &Analysis) -> Vec<&crate::faces::FaceInfo> {
@@ -921,6 +937,38 @@ mod tests {
         }
         let refs: Vec<_> = g.iter().map(Some).collect();
         assert_eq!(cull(&refs, &Settings::default(), None).iter().filter(|x| x.decision == Decision::Selected).count(), 1);
+    }
+
+    #[test]
+    fn one_group_shot_over_several_seconds_is_one_shot() {
+        // A group photo: 4 people, 5 frames 3 s apart, people shifting so the pictures differ
+        // more than a burst's. Then the next group, 3 s later, same backdrop.
+        let ids: Vec<Vec<i8>> = (10..18).map(person).collect();
+        let mut g = vec![];
+        for (n, who) in [&ids[0..4], &ids[4..8]].iter().enumerate() {
+            for k in 0..5 {
+                let mut a = shot(&format!("nhom{n}-{k}"), 100.0 + (n * 5 + k) as f64 * 3.0, 8.0 + k as f32 * 0.1, 5, 0.94, (n * 10 + k) as u32, 4);
+                // People moved: the pixel fingerprints differ too.
+                a.signature.bits = ((n * 5 + k) as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                for (f, id) in a.people.faces.iter_mut().zip(who.iter()) {
+                    f.id = id.clone();
+                }
+                g.push(a);
+            }
+        }
+        let c = crate::visual::similarity_content(&g[0].embed, &g[1].embed);
+        assert!(c > 0.78 && c < 0.86, "frames of one group should only match as one group: {c}");
+        let refs: Vec<_> = g.iter().map(Some).collect();
+        let v = cull(&refs, &Settings::default(), None);
+        let picked: Vec<&str> = v.iter().filter(|x| x.decision == Decision::Selected).map(|x| g[x.idx].name.as_str()).collect();
+        assert_eq!(picked, vec!["nhom0-4", "nhom1-4"], "{:?}", v.iter().map(|x| (g[x.idx].name.clone(), x.decision, x.series)).collect::<Vec<_>>());
+        // Without fingerprints the pictures alone are too different 3 s apart.
+        for a in g.iter_mut() {
+            a.people.faces.iter_mut().for_each(|f| f.id.clear());
+        }
+        let refs: Vec<_> = g.iter().map(Some).collect();
+        let v = cull(&refs, &Settings::default(), None);
+        assert!(v.iter().filter(|x| x.decision == Decision::Selected).count() > 2, "{:?}", v.iter().map(|x| (g[x.idx].name.clone(), x.decision, x.series, x.score)).collect::<Vec<_>>());
     }
 
     #[test]

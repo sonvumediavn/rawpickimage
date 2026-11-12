@@ -124,7 +124,9 @@ nhẹ vẫn là một loạt), mỗi loạt chỉ giữ tấm đẹp nhất (ho�
 trí và số người trong khung: 6 nhóm lần lượt lên nhận giải trên cùng sân khấu là 6 cảnh khác nhau, không
 gộp làm một. App còn **nhận ra từng người** (mô hình SFace, chạy trên CPU, cho tối đa 6 khuôn mặt lớn
 nhất mỗi ảnh): sinh viên lần lượt lên nhận bằng từ cùng một lãnh đạo, đứng đúng một chỗ, chụp cách nhau
-vài giây, vẫn là mỗi người một cảnh, mỗi cảnh giữ tấm đẹp nhất. Ảnh đông người ưu tiên tấm có nhiều
+vài giây, vẫn là mỗi người một cảnh, mỗi cảnh giữ tấm đẹp nhất. Ngược lại, cùng một nhóm người chụp
+kéo dài vài giây (mọi người xê dịch, đổi dáng) vẫn được gộp là một cảnh, nên không chọn thừa. App
+không dựa vào khoảng cách thời gian để tách nhóm: chỉ dựa vào hình, số người và mặt người. Ảnh đông người ưu tiên tấm có nhiều
 người mở mắt và ngẩng đầu nhất.
 Cảnh nào bạn bấm từ 3 tấm trở lên (cảnh có từ 2 người: từ 2 tấm) mà AI chưa chọn tấm nào, AI giữ tấm
 đẹp nhất nếu dùng được (không
