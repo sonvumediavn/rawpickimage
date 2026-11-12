@@ -26,6 +26,9 @@ pub struct ExportOptions {
     pub move_files: bool,
     /// What a cropped RAW photo becomes.
     pub raw_crop: RawCrop,
+    /// Chosen photos go into one sub-folder per kind of photo (Toan-canh, Phat-bieu, Chi-tiet…).
+    #[serde(default)]
+    pub by_scene: bool,
 }
 
 /// A cropped RAW photo on export: the RAW itself is never changed.
@@ -44,7 +47,7 @@ pub enum RawCrop {
 impl Default for ExportOptions {
     fn default() -> Self {
         // Sơn's call (2026-11-03): only the chosen photos, no report files.
-        Self { copy_rejected: false, copy_review: false, report: false, move_files: false, raw_crop: RawCrop::Both }
+        Self { copy_rejected: false, copy_review: false, report: false, move_files: false, raw_crop: RawCrop::Both, by_scene: false }
     }
 }
 
@@ -235,7 +238,11 @@ pub fn export(
         if !wanted {
             continue;
         }
-        let folder = out_dir.join(sub_folder(d)).join(&e.rel_dir);
+        let mut folder = out_dir.join(sub_folder(d));
+        if opts.by_scene && d == Decision::Selected {
+            folder = folder.join(e.verdict.scene.folder());
+        }
+        let folder = folder.join(&e.rel_dir);
         if let Some(r) = e.analysis.and_then(|a| a.crop).and_then(crate::crop::clean) {
             match export_cropped(e, r, &folder, opts, &mut used, &mut rep) {
                 Ok(()) => rep.cropped += 1,
@@ -538,6 +545,8 @@ mod tests {
             series: None,
             moment: 0,
             time: None,
+            scene: Default::default(),
+            key_people: vec![],
         }
     }
 
@@ -568,7 +577,7 @@ mod tests {
         assert_eq!(std::fs::read(out.join("IMG_1.CR3")).unwrap(), b"raw-bytes");
         assert!(out.join("IMG_1.JPG").exists() && !out.join("IMG_2.JPG").exists());
         assert!(!out.join("bao-cao.csv").exists() && !out.join("tong-ket.txt").exists() && !out.join("Bi-loai").exists());
-        let all = ExportOptions { copy_rejected: true, copy_review: true, report: true, move_files: false, raw_crop: RawCrop::Both };
+        let all = ExportOptions { copy_rejected: true, copy_review: true, report: true, move_files: false, raw_crop: RawCrop::Both, by_scene: false };
         let rep = export(&entries, &out, &all, &|_, _| {}, &AtomicBool::new(false)).unwrap();
         assert_eq!((rep.copied, rep.skipped_same), (1, 2), "{:?}", rep.errors);
         assert_eq!(std::fs::read(out.join("Bi-loai/Nham-mat/IMG_2.JPG")).unwrap(), b"other");

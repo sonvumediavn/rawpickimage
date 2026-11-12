@@ -72,6 +72,13 @@ pub struct Analysis {
     /// Sơn's crop for export (set by the app from the session, never cached).
     #[serde(skip)]
     pub crop: Option<crate::crop::Rect>,
+    /// What the image model sees: likeliest ImageNet classes as (class, percent).
+    #[serde(default)]
+    pub objects: Vec<(u16, u8)>,
+    /// Faces of the people Sơn marked as key people: (face number, person id). Set by the app
+    /// from his list, never cached.
+    #[serde(skip)]
+    pub key_faces: Vec<(usize, u32)>,
 }
 
 pub struct Analyzer {
@@ -186,9 +193,9 @@ impl Analyzer {
         }
 
         #[cfg(feature = "faces")]
-        let embed = self.visual.as_ref().and_then(|v| v.embed(&hi).ok()).unwrap_or_default();
+        let (embed, objects) = self.visual.as_ref().and_then(|v| v.look(&hi).ok()).unwrap_or_default();
         #[cfg(not(feature = "faces"))]
-        let embed = vec![];
+        let (embed, objects) = (vec![], vec![]);
         let thumb = self.thumbs_dir.as_ref().and_then(|d| {
             let t = metrics::resize_long(&hi, 480);
             // Named after the file, not its position, so cached thumbnails stay right
@@ -228,9 +235,11 @@ impl Analyzer {
             signature,
             thumb,
             embed,
+            objects,
             stars: 0,
             protected: false,
             crop: None,
+            key_faces: vec![],
         })
     }
 }

@@ -88,6 +88,7 @@
         <label class="chk"><input type="checkbox" id="expReview"> Gồm cả ảnh «Cần xem lại»</label>
         <label class="chk"><input type="checkbox" id="expRejected"> Gồm cả ảnh bị loại (chia theo lý do)</label>
         <label class="chk"><input type="checkbox" id="expReport"> Kèm file báo cáo (bao-cao.csv, tong-ket.txt)</label>
+        <label class="chk" title="Toan-canh, Phat-bieu, Nhan-vat, Tuong-tac, Tap-the, Hoat-dong, Chi-tiet, Khoanh-khac"><input type="checkbox" id="expByScene"> Chia ảnh chọn vào thư mục theo loại ảnh</label>
         <label class="field">Ảnh RAW đã crop
           <select id="expRawCrop">
             <option value="both">RAW gốc + khung crop cho Lightroom + JPEG đã cắt</option>
@@ -122,6 +123,8 @@
     </div>
 
     <div id="results" hidden>
+     <div class="rwrap">
+     <div class="rmain">
       <div class="summary" id="summary"></div>
       <div class="suggest" id="suggest" hidden></div>
       <div class="toolbar">
@@ -159,7 +162,22 @@
         <button class="btn" id="btnStarLearn" title="Ảnh gắn sao là ảnh bạn chọn trên máy: AI học theo (ảnh có sao = giữ, còn lại = bỏ)">Dạy AI theo ảnh gắn sao</button>
         <button class="btn primary" id="btnStarExport" title="Chép các ảnh này (kèm RAW) sang thư mục bạn chọn">Chép ảnh gắn sao…</button>
       </div>
+      <div class="filterbar" id="filterBar" hidden></div>
       <div class="grid" id="grid"></div>
+     </div>
+     <aside class="side" id="side" aria-label="Bộ lọc nhanh">
+      <div class="sbox">
+        <div class="sh">Cỡ ảnh</div>
+        <input type="range" id="thumbSize" min="140" max="420" step="10" value="190" aria-label="Cỡ ảnh thu nhỏ">
+      </div>
+      <div class="sbox"><div class="sh">Bộ lọc nhanh</div><div class="flist" id="fQuick"></div></div>
+      <div class="sbox"><div class="sh">Mức ảnh <span class="note">theo điểm AI</span></div><div class="flist" id="fGrade"></div></div>
+      <div class="sbox"><div class="sh">Loại ảnh <span class="note">AI gợi ý</span></div><div class="flist" id="fScene"></div></div>
+      <div class="sbox"><div class="sh">Nhân vật quan trọng</div><div class="faces" id="fPeople"></div></div>
+      <div class="sbox" id="fReasonBox"><div class="sh">Lý do loại</div><div class="flist" id="fReason"></div></div>
+      <button class="btn primary wide" id="btnExportSide">Xuất ảnh chọn</button>
+     </aside>
+     </div>
     </div>
   </main>
 </div>

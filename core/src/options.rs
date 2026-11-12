@@ -36,6 +36,9 @@ pub struct Options {
     /// A person alone in the frame (a speaker at the lectern) looking down goes to review.
     /// Looking down in a candid moment with others is fine.
     pub speaker_head_up: bool,
+    /// Tell the whole story: every kind of photo the event has (overview, speaker, details,
+    /// group, interaction…) keeps its best usable one, not only the prettiest kind.
+    pub story: bool,
     /// Blend in what the AI learned from Sơn's earlier choices.
     pub use_learned: bool,
     /// Let the AI pick. Off: every photo still gets its score and notes, but nothing is chosen
@@ -50,7 +53,9 @@ pub struct Options {
     // The ten extras.
     /// 1. Scene coverage: every moment of the event keeps at least one photo.
     pub moments: bool,
-    /// 2. Key people (bride, groom, speaker…): never drop their only good photo. Planned.
+    /// 2. Key people Sơn marked on a face (bride, groom, speaker, a guest of honour): found in
+    /// every photo by their face, never rejected for a minor fault, their best photo of each
+    /// moment kept.
     pub key_people: bool,
     /// 3. Fix instead of reject: slightly tilted or slightly off exposure goes to review with a fix note.
     pub fix_instead_of_reject: bool,
@@ -81,6 +86,7 @@ impl Default for Options {
             dedupe: true,
             keep_each_shot: true,
             speaker_head_up: true,
+            story: true,
             use_learned: true,
             ai_pick: true,
             stars: StarMode::Off,
@@ -115,7 +121,7 @@ pub fn catalog() -> Vec<FeatureInfo> {
     let f = |key, title, desc, phase, on_device| FeatureInfo { key, title, desc, phase, on_device };
     vec![
         f("moments", "Đủ khoảnh khắc", "Chia sự kiện theo thời gian, mỗi khoảnh khắc giữ ít nhất 1 ảnh tốt nhất", 1, true),
-        f("key_people", "Nhân vật chính", "Không bao giờ bỏ ảnh tốt duy nhất của cô dâu, chú rể, diễn giả…", 2, true),
+        f("key_people", "Nhân vật quan trọng", "Đánh dấu khuôn mặt cô dâu, chú rể, diễn giả, khách mời…: app tìm người đó trong mọi ảnh, không loại vì lỗi nhẹ, mỗi khoảnh khắc giữ ảnh đẹp nhất của họ", 1, true),
         f("fix_instead_of_reject", "Sửa thay vì loại", "Ảnh hơi nghiêng hoặc lệch sáng nhẹ đưa vào Cần xem lại kèm gợi ý sửa", 1, true),
         f("multi_camera", "Gộp nhiều máy", "Ghép ảnh nhiều máy lên một dòng thời gian, chỉnh lệch giờ từng máy", 1, true),
         f("safe_copy", "Chép thẻ an toàn", "Chép từ thẻ nhớ có kiểm tra checksum và bản sao lưu trước khi lọc", 1, true),
@@ -210,7 +216,7 @@ pub fn suggest(analyses: &[&Analysis], source: Option<&Path>) -> Vec<Suggestion>
 
     let with_faces = analyses.iter().filter(|a| !a.people.faces.is_empty()).count();
     if n > 0 && with_faces as f32 / n as f32 > 0.4 {
-        push("key_people", true, format!("{with_faces}/{n} ảnh có người: nên đánh dấu nhân vật chính (sắp có)"));
+        push("key_people", true, format!("{with_faces}/{n} ảnh có người: nên đánh dấu nhân vật quan trọng (mở ảnh, bấm ★ cạnh khuôn mặt)"));
         if n >= 300 {
             push("selfie_search", true, "Sự kiện đông người, nhiều ảnh: khách sẽ thích tự tìm ảnh bằng selfie (giai đoạn 4)".into());
         }

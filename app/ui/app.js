@@ -25,6 +25,7 @@ const CORE_OPTS = [
   ["dedupe", "Lọc ảnh trùng, giữ ảnh đẹp nhất mỗi loạt"],
   ["keep_each_shot", "Cảnh chụp nhiều tấm (nhóm nhận giải…) giữ ít nhất 1 tấm đẹp nhất"],
   ["speaker_head_up", "Người phát biểu một mình cúi đầu: đưa vào «Cần xem lại»"],
+  ["story", "Đủ loại ảnh kể câu chuyện (toàn cảnh, phát biểu, chi tiết, tập thể…)"],
   ["use_learned", "Dùng điều AI đã học từ lựa chọn của bạn"],
 ];
 
@@ -34,7 +35,30 @@ const st = {
   sid: null, metas: [], views: {}, progress: {},
   session: null, verdicts: [], summary: null,
   tab: "all", reason: "", sort: "time", view: [], cur: -1, starMin: 1,
+  // Side panel filters (combined with the tab).
+  scene: "", grade: "", person: null, people: [],
 };
+
+const SCENES = [
+  ["overview", "Toàn cảnh", "Quy mô sự kiện"],
+  ["speaker", "Phát biểu", "Người một mình ở micro, trên sân khấu"],
+  ["portrait", "Nhân vật", "Gương mặt, cảm xúc, chân dung"],
+  ["interaction", "Tương tác", "Bắt tay, trao đổi, trao quà"],
+  ["group", "Tập thể", "Nhóm người cùng nhìn máy"],
+  ["activity", "Hoạt động", "Mọi người đang tham gia chương trình"],
+  ["detail", "Chi tiết", "Bục, biểu trưng, tài liệu, trang trí"],
+  ["moment", "Khoảnh khắc", "Cười, cổ vũ, cảm xúc tự nhiên"],
+];
+const sceneLabel = (k) => (SCENES.find((x) => x[0] === k) || [k, "Khác"])[1];
+// Score out of 10 (the 100-point scale ÷ 10).
+const GRADES = [
+  ["top", "Ưu tiên chọn", (v) => v >= 9, "9–10 điểm"],
+  ["good", "Ảnh tốt", (v) => v >= 8 && v < 9, "8–8,9 điểm"],
+  ["ok", "Dùng được", (v) => v >= 6.5 && v < 8, "6,5–7,9 điểm"],
+  ["weak", "Cân nhắc loại", (v) => v < 6.5, "dưới 6,5 điểm"],
+];
+const gradeOf = (score) => GRADES.find((g) => g[2](score));
+const personName = (id) => (st.people.find((p) => p.id === id) || {}).name || "Nhân vật";
 const meta = (id = st.sid) => st.metas.find((m) => m.id === id);
 
 // ---------------------------------------------------------------- helpers
@@ -176,6 +200,7 @@ function renderRules() {
   $("expRejected").checked = st.prefs.export.copy_rejected;
   $("expReport").checked = st.prefs.export.report;
   $("expRawCrop").value = st.prefs.export.raw_crop || "both";
+  $("expByScene").checked = !!st.prefs.export.by_scene;
   renderExpMode();
 }
 
@@ -292,6 +317,7 @@ function wireRail() {
   $("expRejected").onchange = () => { st.prefs.export.copy_rejected = $("expRejected").checked; savePrefs(); };
   $("expReport").onchange = () => { st.prefs.export.report = $("expReport").checked; savePrefs(); };
   $("expRawCrop").onchange = () => { st.prefs.export.raw_crop = $("expRawCrop").value; savePrefs(); };
+  $("expByScene").onchange = () => { st.prefs.export.by_scene = $("expByScene").checked; savePrefs(); };
   for (const b of $("expMode").children) {
     b.onclick = () => { st.prefs.export.move_files = b.dataset.m === "move"; renderExpMode(); savePrefs(); };
   }
@@ -606,6 +632,9 @@ function computeView() {
   if (st.tab === "stars") idx = idx.filter((i) => isStarred(P[i]));
   else if (st.tab !== "all") idx = idx.filter((i) => st.verdicts[i].decision.kind === st.tab);
   if (st.reason) idx = idx.filter((i) => decLabel(st.verdicts[i].decision).endsWith(st.reason));
+  if (st.scene) idx = idx.filter((i) => st.verdicts[i].scene === st.scene);
+  if (st.grade) { const g = GRADES.find((x) => x[0] === st.grade); idx = idx.filter((i) => g[2](st.verdicts[i].score)); }
+  if (st.person != null) idx = idx.filter((i) => (st.verdicts[i].key_people || []).includes(st.person));
   if (st.sort === "score") idx.sort((a, b) => st.verdicts[b].score - st.verdicts[a].score);
   else if (st.sort === "name") idx.sort((a, b) => P[a].name.localeCompare(P[b].name));
   else idx.sort((a, b) => (st.verdicts[a].time ?? 1e12) - (st.verdicts[b].time ?? 1e12) || a - b);
@@ -635,13 +664,16 @@ function renderStarBar() {
 function renderGrid() {
   computeView();
   renderStarBar();
+  renderSide();
   const P = st.session.photos;
   $("grid").innerHTML = st.view
     .map((i) => {
       const p = P[i], v = st.verdicts[i], k = decKind(v.decision);
-      return `<div class="card ${k}" data-i="${i}" tabindex="0">
+      const g = gradeOf(v.score);
+      const tip = `${g[1]} · ${sceneLabel(v.scene)}${(v.key_people || []).length ? " · " + v.key_people.map(personName).join(", ") : ""}`;
+      return `<div class="card ${k}" data-i="${i}" tabindex="0" title="${esc(tip)}">
         <div class="th">${p.thumb ? `<img loading="lazy" src="${fileSrc(p.thumb)}" alt="">` : ""}
-          <span class="sc ${cls(v.score)}">${v.score.toFixed(1)}</span>${v.overridden ? `<span class="man">sửa tay</span>` : ""}${p.stars > 0 ? `<span class="star">${"★".repeat(p.stars)}</span>` : p.protected ? `<span class="star" title="Khóa bảo vệ trên máy">🔒</span>` : ""}${p.crop ? CROP_BADGE : ""}</div>
+          <span class="sc ${cls(v.score)}">${v.score.toFixed(1)}</span>${v.overridden ? `<span class="man">sửa tay</span>` : ""}${p.stars > 0 ? `<span class="star">${"★".repeat(p.stars)}</span>` : p.protected ? `<span class="star" title="Khóa bảo vệ trên máy">🔒</span>` : ""}${p.crop ? CROP_BADGE : ""}${(v.key_people || []).length ? `<span class="kp" title="Có nhân vật quan trọng">♛</span>` : ""}</div>
         <div class="cap"><div class="nm">${esc(p.name)}${v.time != null ? " · " + fmtTime(v.time) : ""}</div><div class="why">${esc(topWhy(p, v))}</div></div>
       </div>`;
     })
@@ -651,7 +683,153 @@ function renderGrid() {
   }
 }
 
+/** Right-hand panel: quick filters with counts, grades, kinds of photo, key people. */
+function renderSide() {
+  if (!st.session) return;
+  const V = st.verdicts, P = st.session.photos;
+  const count = (f) => V.filter(f).length;
+  const row = (attrs, label, n, on, title = "") => `<button class="frow${on ? " on" : ""}" ${attrs}${title ? ` title="${esc(title)}"` : ""}><span>${label}</span><b>${n}</b></button>`;
+  const quick = [
+    ["all", "Tất cả", V.length],
+    ["selected", "Đã chọn", count((v) => v.decision.kind === "selected")],
+    ["review", aiOff() ? "Chưa chọn" : "Cần xem lại", count((v) => v.decision.kind === "review")],
+    ["rejected", "Bị loại", count((v) => v.decision.kind === "rejected")],
+    ["stars", "★ Gắn sao", P.filter((p) => p.stars > 0 || p.protected).length],
+  ];
+  $("fQuick").innerHTML = quick.map(([t, l, n]) => row(`data-tab="${t}"`, `<i class="dot ${t}"></i>${l}`, n, st.tab === t)).join("");
+  $("fGrade").innerHTML = GRADES.map(([k, l, f, hint]) => row(`data-grade="${k}"`, l, count((v) => f(v.score)), st.grade === k, hint)).join("");
+  const scenes = SCENES.map(([k, l, hint]) => [k, l, hint, count((v) => v.scene === k)]).filter((x) => x[3] || st.scene === x[0]);
+  $("fScene").innerHTML = scenes.length
+    ? scenes.map(([k, l, hint, n]) => row(`data-scene="${k}"`, `${l} <small>${count((v) => v.scene === k && v.decision.kind === "selected")} chọn</small>`, n, st.scene === k, hint)).join("")
+    : `<p class="note">Mở lại thư mục để AI phân loại ảnh.</p>`;
+  const people = st.people.map((p) => [p, count((v) => (v.key_people || []).includes(p.id))]);
+  $("fPeople").innerHTML = people.length
+    ? people.map(([p, n]) => `<button class="kface${st.person === p.id ? " on" : ""}" data-person="${p.id}" title="${esc(p.name)}: ${n} ảnh. Chuột phải để đổi tên hoặc bỏ">
+        <canvas class="fc" data-face="${p.id}" width="160" height="160"></canvas><span class="nm">${esc(p.name)}</span><b>${n}</b></button>`).join("")
+    : `<p class="note">Mở ảnh, bấm <b>♛ Nhân vật quan trọng</b> cạnh khuôn mặt. App tự tìm người đó trong mọi ảnh và không loại ảnh của họ vì lỗi nhẹ.</p>`;
+  drawKeyFaces();
+  const reasons = (st.summary.by_reason || []);
+  $("fReasonBox").hidden = !reasons.length;
+  $("fReason").innerHTML = reasons.map(([r, n]) => row(`data-reason="${esc(r)}"`, esc(r), n, st.reason === r)).join("");
+  // Active filters, so a filtered grid is never a mystery.
+  const act = [];
+  if (st.grade) act.push(["grade", GRADES.find((g) => g[0] === st.grade)[1]]);
+  if (st.scene) act.push(["scene", sceneLabel(st.scene)]);
+  if (st.person != null) act.push(["person", personName(st.person)]);
+  if (st.reason) act.push(["reason", st.reason]);
+  $("filterBar").hidden = !act.length;
+  $("filterBar").innerHTML = act.length ? `<span class="note">Đang lọc (${st.view.length} ảnh):</span>` + act.map(([k, l]) => `<button class="chip" data-clear="${k}">${esc(l)} ✕</button>`).join("") + `<button class="btn sm" data-clear="all">Bỏ lọc</button>` : "";
+}
+
+/** Draw each key person's face, cut from the photo where it was marked. */
+function drawKeyFaces() {
+  for (const c of $("fPeople").querySelectorAll("canvas[data-face]")) {
+    const p = st.people.find((x) => x.id === +c.dataset.face);
+    if (!p || !p.thumb) continue;
+    const img = new Image();
+    img.onload = () => {
+      const [x, y, w, h] = p.bbox, W = img.naturalWidth, H = img.naturalHeight;
+      const side = Math.min(Math.max(w * W, h * H) * 1.6, W, H), cx = (x + w / 2) * W, cy = (y + h / 2) * H;
+      const sx = clamp(cx - side / 2, 0, W - side), sy = clamp(cy - side / 2, 0, H - side);
+      c.getContext("2d").drawImage(img, sx, sy, side, side, 0, 0, c.width, c.height);
+    };
+    img.src = fileSrc(p.thumb);
+  }
+}
+
+function setTab(t) {
+  st.tab = t;
+  for (const x of $("tabs").children) x.setAttribute("aria-pressed", String(x.dataset.t === t));
+}
+
+function wireSide() {
+  $("side").onclick = (e) => {
+    const b = e.target.closest("button");
+    if (!b) return;
+    if (b.dataset.tab) setTab(b.dataset.tab);
+    else if (b.dataset.grade) st.grade = st.grade === b.dataset.grade ? "" : b.dataset.grade;
+    else if (b.dataset.scene) st.scene = st.scene === b.dataset.scene ? "" : b.dataset.scene;
+    else if (b.dataset.person != null) { const id = +b.dataset.person; st.person = st.person === id ? null : id; }
+    else if (b.dataset.reason != null) { st.reason = st.reason === b.dataset.reason ? "" : b.dataset.reason; $("reasonSel").value = st.reason; if (st.reason) setTab("all"); }
+    else return;
+    renderGrid();
+  };
+  $("fPeople").oncontextmenu = async (e) => {
+    const b = e.target.closest("button[data-person]");
+    if (!b) return;
+    e.preventDefault();
+    editKeyPerson(+b.dataset.person);
+  };
+  $("filterBar").onclick = (e) => {
+    const k = e.target.closest("button")?.dataset.clear;
+    if (!k) return;
+    if (k === "grade" || k === "all") st.grade = "";
+    if (k === "scene" || k === "all") st.scene = "";
+    if (k === "person" || k === "all") st.person = null;
+    if (k === "reason" || k === "all") { st.reason = ""; $("reasonSel").value = ""; }
+    renderGrid();
+  };
+  $("btnExportSide").onclick = () => $("btnExport").click();
+  let size = 190;
+  try { size = +localStorage.getItem("thumbSize") || 190; } catch {}
+  const apply = (v) => document.documentElement.style.setProperty("--thumb", v + "px");
+  $("thumbSize").value = size;
+  apply(size);
+  $("thumbSize").oninput = () => { apply($("thumbSize").value); try { localStorage.setItem("thumbSize", $("thumbSize").value); } catch {} };
+}
+
+async function loadKeyPeople() {
+  try { st.people = (await invoke("key_people")).people || []; } catch { st.people = []; }
+}
+
+async function editKeyPerson(id) {
+  const p = st.people.find((x) => x.id === id);
+  if (!p) return;
+  const name = await ask(`Đổi tên nhân vật, hoặc xoá tên rồi bấm «Bỏ đánh dấu» để không coi là nhân vật quan trọng nữa.`, { value: p.name, title: "Nhân vật quan trọng", ok: "Lưu tên", cancel: "Huỷ" });
+  if (name == null) return;
+  try {
+    const r = name.trim() ? await invoke("rename_key_person", { person: id, name: name.trim() }) : await invoke("remove_key_person", { person: id });
+    keyChanged(r, name.trim() ? `Đã đổi tên thành «${esc(name.trim())}».` : `Đã bỏ đánh dấu «${esc(p.name)}».`);
+    if (!name.trim() && st.person === id) st.person = null;
+  } catch (e) {
+    toast(esc(String(e)));
+  }
+}
+
+/** After the key people list changed: every session was judged again. */
+async function keyChanged(r, what) {
+  st.people = r.people || [];
+  if (r.photo && st.session) st.session.photos[r.photo.idx] = r.photo;
+  const v = await invoke("get_session", { id: st.sid }).catch(() => null);
+  for (const k of Object.keys(st.views)) if (+k !== st.sid) delete st.views[k];
+  if (v && st.session) {
+    st.session.photos = v.photos;
+    st.views[st.sid] = v;
+    applyVerdicts({ verdicts: v.verdicts, summary: v.summary });
+  } else renderGrid();
+  if (what) toast(what, 4500);
+}
+
+async function markKeyPerson(i, face) {
+  const f = st.session.photos[i].faces[face];
+  if (f.person != null) return editKeyPerson(f.person);
+  const choices = st.people.map((p) => p.name).join(", ");
+  const name = await ask(`Đặt tên cho người này (không bắt buộc), ví dụ «Thầy Hiệu trưởng». App chỉ nhận ra người bạn đánh dấu, không tự đoán là ai.${choices ? `\n\nĐã có: ${choices}. Gõ đúng tên đó để thêm ảnh mặt cho người ấy.` : ""}`, { value: "", title: "Nhân vật quan trọng", ok: "Đánh dấu" });
+  if (name == null) return;
+  const same = st.people.find((p) => p.name.toLowerCase() === name.trim().toLowerCase());
+  try {
+    const r = await invoke("add_key_person", { id: st.sid, idx: i, face, name: name.trim(), person: same ? same.id : null });
+    if (!st.prefs.settings.options.key_people) { st.prefs.settings.options.key_people = true; savePrefs(); renderOptions(); }
+    const n = r.verdicts.filter((v) => (v.key_people || []).includes(r.person)).length;
+    const nm = (r.people.find((p) => p.id === r.person) || {}).name || "nhân vật";
+    keyChanged(r, `Đã đánh dấu «${esc(nm)}»: tìm thấy trong ${n} ảnh của thư mục này. Ảnh của họ không bị loại vì lỗi nhẹ, mỗi khoảnh khắc giữ ảnh đẹp nhất của họ.`);
+  } catch (e) {
+    toast(esc(String(e)));
+  }
+}
+
 function wireResults() {
+  wireSide();
   for (const b of $("tabs").children) {
     b.setAttribute("aria-pressed", String(b.dataset.t === st.tab));
     b.onclick = () => {
@@ -1224,7 +1402,13 @@ function renderEyes(i, p, mains) {
             ${btn(!v, `data-mark="${m}" data-yes="0"`, no)}${btn(v, `data-mark="${m}" data-yes="1"`, yes)}${hand(m) ? again(`data-mark="${m}" data-yes=""`) : ""}</div>`);
         }
       }
-      return `<div class="facegrp" data-n="${n}">${who ? `<div class="who">${who}</div>` : ""}${lines.join("")}</div>`;
+      if (f.known || f.person != null) {
+        lines.push(`<div class="eyerow"><span>Quan trọng</span>${f.person != null
+          ? `<button class="btn sm on" data-key="1" title="Bấm để đổi tên hoặc bỏ đánh dấu">♛ ${esc(personName(f.person))}</button>`
+          : `<button class="btn sm" data-key="1" title="App tìm người này trong mọi ảnh, không loại ảnh của họ vì lỗi nhẹ">♛ Nhân vật quan trọng</button>`}</div>`);
+      }
+      const whoName = f.person != null ? `${who ? who + " · " : ""}♛ ${esc(personName(f.person))}` : who;
+      return `<div class="facegrp" data-n="${n}">${whoName ? `<div class="who">${whoName}</div>` : ""}${lines.join("")}</div>`;
     })
     .join("");
   for (const grp of box.querySelectorAll(".facegrp")) {
@@ -1234,6 +1418,7 @@ function renderEyes(i, p, mains) {
     grp.onmouseleave = () => fb()?.classList.remove("hl");
     for (const b of grp.querySelectorAll("button[data-open]")) b.onclick = () => setEyes(i, n, b.dataset.open === "" ? null : b.dataset.open === "1");
     for (const b of grp.querySelectorAll("button[data-mark]")) b.onclick = () => setMark(i, n, b.dataset.mark, b.dataset.yes === "" ? null : b.dataset.yes === "1");
+    for (const b of grp.querySelectorAll("button[data-key]")) b.onclick = () => markKeyPerson(i, n);
   }
 }
 
@@ -1830,5 +2015,6 @@ function wireWeb() {
   renderSync();
   if (!st.metas.length) await newSession();
   await selectSession(st.metas[0].id);
+  await loadKeyPeople();
   restoreSessions();
 })();

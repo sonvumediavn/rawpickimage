@@ -32,6 +32,7 @@ pub struct Patch {
     pub review_open_mouth: Option<bool>,
     pub speaker_head_up: Option<bool>,
     pub keep_each_shot: Option<bool>,
+    pub story: Option<bool>,
     pub moments: Option<bool>,
     pub fix_instead_of_reject: Option<bool>,
     pub use_learned: Option<bool>,
@@ -57,6 +58,7 @@ impl Patch {
             o.review_open_mouth = d.options.review_open_mouth;
             o.speaker_head_up = d.options.speaker_head_up;
             o.keep_each_shot = d.options.keep_each_shot;
+            o.story = d.options.story;
             o.dedupe = d.options.dedupe;
             o.use_learned = d.options.use_learned;
             o.fix_instead_of_reject = d.options.fix_instead_of_reject;
@@ -130,6 +132,7 @@ impl Patch {
             "Người phát biểu (một mình trong khung) cúi đầu: đưa vào «Cần xem lại»",
             "Người phát biểu cúi đầu vẫn được chọn",
         );
+        flag(&mut o.story, self.story, "Đủ loại ảnh kể câu chuyện: mỗi loại ảnh (toàn cảnh, phát biểu, chi tiết, tập thể…) giữ tấm đẹp nhất", "Không tự thêm ảnh cho đủ loại nữa");
         flag(&mut o.keep_each_shot, self.keep_each_shot, "Cảnh nào bạn chụp nhiều tấm thì giữ ít nhất 1 tấm đẹp nhất", "Không tự giữ cảnh chụp nhiều tấm nữa");
         flag(&mut o.moments, self.moments, "Bật «Đủ khoảnh khắc»", "Tắt «Đủ khoảnh khắc»");
         flag(&mut o.fix_instead_of_reject, self.fix_instead_of_reject, "Bật «Sửa thay vì loại»", "Tắt «Sửa thay vì loại»");
@@ -315,6 +318,14 @@ pub fn understand(msg: &str, w: &[f32; 6]) -> Understood {
             } else {
                 "Ảnh một người phát biểu đang cúi đầu (đọc giấy, nhìn xuống) sẽ vào «Cần xem lại». Ảnh khoảnh khắc có nhiều người thì cúi đầu vẫn được giữ. Thấy AI nhìn sai thì bấm Ngẩng/Cúi ở ảnh đó, AI nhớ cho lần sau.".into()
             });
+            continue;
+        }
+
+        // The whole story, not only the prettiest photos.
+        if has(&f, &["cau chuyen", "ke chuyen", "du loai", "toan canh", "anh chi tiet", "tu lieu"]) {
+            let off = has(&f, &["khong can", "tat ", "bo "]);
+            p.story = Some(!off);
+            notes.push(if off { "Không tự thêm ảnh cho đủ loại nữa.".into() } else { "Mỗi loại ảnh của sự kiện (toàn cảnh, phát biểu, nhân vật, tương tác, tập thể, hoạt động, chi tiết, khoảnh khắc) giữ ít nhất tấm đẹp nhất, để kể lại đủ câu chuyện. Xem số ảnh từng loại ở cột bên phải.".into() });
             continue;
         }
 
@@ -509,6 +520,7 @@ pub fn claude_prompt(msg: &str, s: &Settings, preset: &str, ctx: Option<&Context
         "review_open_mouth": s.options.review_open_mouth,
         "speaker_head_up": s.options.speaker_head_up,
         "keep_each_shot": s.options.keep_each_shot,
+        "story": s.options.story,
         "moments": s.options.moments,
         "fix_instead_of_reject": s.options.fix_instead_of_reject,
         "use_learned": s.options.use_learned,
@@ -532,7 +544,7 @@ Trả lời DUY NHẤT một đối tượng JSON, không kèm chữ nào khác:
 {{"reply": "câu trả lời ngắn bằng tiếng Việt, giải thích bạn chỉnh gì và vì sao",
  "patch": {{ chỉ các trường cần đổi trong: "preset" ("event"|"balanced"|"portrait"|"landscape"), "weights" {{"exposure"..."people": 0-50}},
    "threshold" (5-9.5), "review_margin" (0-3), "max_selected" (0 = không giới hạn), "keep_per_series" (1-5), "dedupe_seconds",
-   "dedupe", "reject_closed_eyes", "review_open_mouth" (ảnh nhân vật chính há miệng vào «Cần xem lại»), "speaker_head_up" (người phát biểu một mình cúi đầu vào «Cần xem lại»), "keep_each_shot" (cảnh chụp nhiều tấm giữ 1 tấm đẹp nhất), "moments", "fix_instead_of_reject", "use_learned" (bool), "learned_weight" (0-0.8) }} }}
+   "dedupe", "reject_closed_eyes", "review_open_mouth" (ảnh nhân vật chính há miệng vào «Cần xem lại»), "speaker_head_up" (người phát biểu một mình cúi đầu vào «Cần xem lại»), "keep_each_shot" (cảnh chụp nhiều tấm giữ 1 tấm đẹp nhất), "story" (mỗi loại ảnh: toàn cảnh, phát biểu, chi tiết, tập thể… giữ tấm đẹp nhất), "moments", "fix_instead_of_reject", "use_learned" (bool), "learned_weight" (0-0.8) }} }}
 Nếu yêu cầu không liên quan tới chọn ảnh, trả "patch": {{}} và giải thích ngắn."#
     )
 }
@@ -607,6 +619,7 @@ mod tests {
         assert_eq!(understand("người phát biểu phải ngẩng đầu", &W).patch.speaker_head_up, Some(true));
         assert_eq!(understand("cúi đầu vẫn giữ", &W).patch.speaker_head_up, Some(false));
         assert_eq!(understand("6 nhóm nhận giải mà chọn thiếu", &W).patch.keep_each_shot, Some(true));
+        assert_eq!(understand("cần đủ ảnh kể câu chuyện sự kiện", &W).patch.story, Some(true));
         let u = understand("Mỗi nhóm nhận giải giữ 1 ảnh", &W);
         assert_eq!((u.patch.keep_each_shot, u.patch.keep_per_series), (Some(true), None), "{:?}", u.patch);
         let u = understand("mặt nghiêng đẹp vẫn giữ", &W);

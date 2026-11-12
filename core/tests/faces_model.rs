@@ -42,6 +42,12 @@ fn finds_the_face_and_tells_open_from_closed_eyes() {
         assert!(f.eye_p.is_some(), "thiếu mô hình mắt {}", rawpick_core::eyes::MODEL);
     }
 
+    // The image model also says what is in the picture (sorting photos by kind).
+    if an.visual.is_some() {
+        eprintln!("lớp ImageNet: {:?}, loại ảnh {:?}", open.objects, rawpick_core::scene::classify(&open));
+        assert!(!open.objects.is_empty());
+        assert_eq!(rawpick_core::scene::classify(&open), rawpick_core::scene::Scene::Portrait);
+    }
     let closed = an.analyze(&data.join("chan-dung-nham-mat.jpg"), vec![], 1).unwrap();
     let g = &closed.people.faces[0];
     eprintln!("nhắm: mạng mắt {:?}, điểm ảnh {:.2}, khả năng nhắm {:.2}", g.eye_p, g.eye_open, g.p_closed);

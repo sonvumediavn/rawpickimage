@@ -157,6 +157,8 @@ struct App {
     web: web::Web,
     /// Sơn's open/closed-eye corrections and the eye rule fitted to them.
     eyes: Mutex<EyeBook>,
+    /// Key people Sơn marked, found in every photo by their face.
+    keys: Mutex<rawpick_core::keypeople::KeyBook>,
     /// Profiles whose shared copy on Drive is behind (written later in one go).
     share_due: Mutex<std::collections::BTreeSet<String>>,
 }
@@ -184,6 +186,10 @@ impl App {
         let sh = self.eyes_shared();
         let b = EyeBook::load(&self.data_dir.join("eyes.json"), sh.as_ref().map(|(d, m)| (d.as_path(), m.as_str())));
         *self.eyes.lock().unwrap() = b;
+    }
+
+    fn save_keys(&self, b: &rawpick_core::keypeople::KeyBook) {
+        let _ = b.save(&self.data_dir.join(KEYS_FILE));
     }
 
     fn save_eyes(&self, b: &EyeBook) {
@@ -257,6 +263,14 @@ impl App {
                 a.crop = crop;
             }
         }
+        {
+            let keys = self.keys.lock().unwrap();
+            for it in s.items.iter_mut() {
+                if let Some(a) = it.analysis.as_mut() {
+                    keys.mark(a);
+                }
+            }
+        }
         // Eyes first: Sơn's corrections may have changed who has their eyes closed.
         {
             let book = self.eyes.lock().unwrap();
@@ -318,6 +332,10 @@ struct FaceBox {
     hand_marks: Vec<&'static str>,
     /// Too small to judge mouth and head.
     small: bool,
+    /// The key person this face is (Sơn's list).
+    person: Option<u32>,
+    /// A fingerprint exists, so it can be marked as a key person.
+    known: bool,
 }
 
 #[derive(Serialize)]
@@ -416,7 +434,7 @@ fn photo_view(idx: usize, it: &Item) -> PhotoView {
             })
             .unwrap_or_default(),
         faces: a
-            .map(|a| a.people.faces.iter().map(|f| FaceBox {
+            .map(|a| a.people.faces.iter().enumerate().map(|(i, f)| FaceBox {
                         bbox: f.bbox,
                         closed: f.closed,
                         main: f.main,
@@ -428,6 +446,8 @@ fn photo_view(idx: usize, it: &Item) -> PhotoView {
                         down: f.down,
                         hand_marks: f.hand_marks.iter().map(|m| m.key()).collect(),
                         small: f.small,
+                        person: a.key_faces.iter().find(|k| k.0 == i).map(|k| k.1),
+                        known: !f.id.is_empty(),
                     }).collect())
             .unwrap_or_default(),
         error: it.error.clone(),
@@ -866,6 +886,97 @@ fn op_set_mark(app: &Arc<App>, id: u32, idx: usize, face: usize, mark: &str, yes
     }
     let s = map.get(&id).ok_or("Phiên đã đóng")?;
     let r = EyesResult { photo: photo_view(idx, &s.items[idx]), verdicts: s.verdicts.clone(), summary: cull::summarize(&s.verdicts), corrected };
+    app.save_sessions(&map);
+    drop(map);
+    sessions_changed(app);
+    Ok(r)
+}
+
+const KEYS_FILE: &str = "key-people.json";
+
+#[derive(Serialize)]
+struct KeyPeopleView {
+    people: Vec<rawpick_core::keypeople::KeyPerson>,
+}
+
+#[derive(Serialize)]
+struct KeyResult {
+    people: Vec<rawpick_core::keypeople::KeyPerson>,
+    person: Option<u32>,
+    photo: Option<PhotoView>,
+    verdicts: Vec<Verdict>,
+    summary: cull::Summary,
+}
+
+fn op_key_people(app: &Arc<App>) -> KeyPeopleView {
+    let mut people = app.keys.lock().unwrap().people.clone();
+    people.iter_mut().for_each(|p| p.faces.clear());
+    KeyPeopleView { people }
+}
+
+/// Re-mark and re-judge every open session after the key people list changed.
+fn recull_all(app: &Arc<App>, map: &mut BTreeMap<u32, Session>) {
+    let ids: Vec<u32> = map.keys().copied().collect();
+    for sid in ids {
+        if let Some(x) = map.get_mut(&sid) {
+            if !x.items.is_empty() {
+                app.recull(x);
+            }
+        }
+    }
+}
+
+fn key_result(app: &Arc<App>, map: &BTreeMap<u32, Session>, id: Option<u32>, idx: Option<usize>, person: Option<u32>) -> KeyResult {
+    let s = id.and_then(|i| map.get(&i));
+    KeyResult {
+        people: op_key_people(app).people,
+        person,
+        photo: s.zip(idx).and_then(|(s, i)| s.items.get(i).map(|it| photo_view(i, it))),
+        verdicts: s.map(|s| s.verdicts.clone()).unwrap_or_default(),
+        summary: s.map(|s| cull::summarize(&s.verdicts)).unwrap_or_default(),
+    }
+}
+
+fn op_add_key_person(app: &Arc<App>, id: u32, idx: usize, face: usize, name: &str, to: Option<u32>) -> Result<KeyResult, String> {
+    let mut map = app.sessions.lock().unwrap();
+    let s = map.get(&id).ok_or("Phiên đã đóng")?;
+    let it = s.items.get(idx).ok_or("Sai ảnh")?;
+    let a = it.analysis.as_ref().ok_or("Ảnh chưa phân tích")?;
+    let f = a.people.faces.get(face).ok_or("Không có khuôn mặt này")?;
+    if f.id.is_empty() {
+        return Err("Mặt này quá nhỏ hoặc chưa được nhận diện (cần mở lại thư mục để phân tích bằng bản mới)".into());
+    }
+    let thumb = a.thumb.as_ref().map(|p| p.display().to_string());
+    let pid = {
+        let mut keys = app.keys.lock().unwrap();
+        let pid = keys.add(f.id.clone(), name, to, thumb, f.bbox).ok_or("Không đánh dấu được khuôn mặt này")?;
+        app.save_keys(&keys);
+        pid
+    };
+    recull_all(app, &mut map);
+    let r = key_result(app, &map, Some(id), Some(idx), Some(pid));
+    app.save_sessions(&map);
+    drop(map);
+    sessions_changed(app);
+    Ok(r)
+}
+
+/// Rename (with a name) or remove (without) a key person.
+fn op_edit_key_person(app: &Arc<App>, person: u32, name: Option<&str>) -> Result<KeyResult, String> {
+    let mut map = app.sessions.lock().unwrap();
+    {
+        let mut keys = app.keys.lock().unwrap();
+        let ok = match name {
+            Some(n) => keys.rename(person, n),
+            None => keys.remove(person),
+        };
+        if !ok {
+            return Err("Không tìm thấy nhân vật này".into());
+        }
+        app.save_keys(&keys);
+    }
+    recull_all(app, &mut map);
+    let r = key_result(app, &map, None, None, Some(person));
     app.save_sessions(&map);
     drop(map);
     sessions_changed(app);
@@ -1731,6 +1842,7 @@ struct Args {
     mark: Option<String>,
     yes: Option<bool>,
     min_stars: Option<u8>,
+    person: Option<u32>,
 }
 
 fn need<T>(v: Option<T>, what: &str) -> Result<T, String> {
@@ -1769,6 +1881,10 @@ fn dispatch(app: &Arc<App>, cmd: &str, args: serde_json::Value) -> Result<serde_
         "set_crop" => json(op_set_crop(app, need(a.id, "id")?, need(a.idx, "idx")?, a.crop)?),
         "copy_starred" => json(op_copy_starred(app, need(a.source, "source")?, need(a.dest, "dest")?, a.min_stars.unwrap_or(1))?),
         "learn_stars" => json(op_learn_stars(app, need(a.id, "id")?, a.min_stars.unwrap_or(1))?),
+        "key_people" => json(op_key_people(app)),
+        "add_key_person" => json(op_add_key_person(app, need(a.id, "id")?, need(a.idx, "idx")?, need(a.face, "face")?, a.name.as_deref().unwrap_or(""), a.person)?),
+        "rename_key_person" => json(op_edit_key_person(app, need(a.person, "person")?, a.name.as_deref())?),
+        "remove_key_person" => json(op_edit_key_person(app, need(a.person, "person")?, None)?),
         "set_mark" => json(op_set_mark(app, need(a.id, "id")?, need(a.idx, "idx")?, need(a.face, "face")?, &need(a.mark, "mark")?, a.yes)?),
         "set_eyes" => json(op_set_eyes(app, need(a.id, "id")?, need(a.idx, "idx")?, need(a.face, "face")?, a.open)?),
         "big_preview" => json(op_big_preview(app, need(a.id, "id")?, need(a.idx, "idx")?, a.full)?),
@@ -1849,9 +1965,11 @@ fn main() {
                 handle: std::sync::OnceLock::new(),
                 web: web::Web::default(),
                 eyes: Mutex::new(EyeBook::default()),
+                keys: Mutex::new(Default::default()),
                 share_due: Mutex::new(Default::default()),
             });
             app_state.load_eyes();
+            *app_state.keys.lock().unwrap() = rawpick_core::keypeople::KeyBook::load(&app_state.data_dir.join(KEYS_FILE));
             {
                 let a = app_state.clone();
                 std::thread::spawn(move || loop {
@@ -1895,6 +2013,7 @@ mod tests {
             handle: std::sync::OnceLock::new(),
             web: web::Web::default(),
             eyes: Mutex::new(EyeBook::default()),
+            keys: Mutex::new(Default::default()),
             share_due: Mutex::new(Default::default()),
         })
     }

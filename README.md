@@ -133,6 +133,26 @@ Cảnh nào bạn bấm từ 3 tấm trở lên (cảnh có từ 2 người: t�
 nhắm mắt, không mờ mặt), để mỗi nhóm có một ảnh. Nói với AI «mỗi nhóm nhận giải giữ 1 ảnh» để bật lại
 nếu đã tắt.
 
+**Cột bên phải (bộ lọc nhanh)**: số ảnh từng mục (Đã chọn, Cần xem lại, Bị loại, Gắn sao), **mức ảnh**
+theo điểm AI (Ưu tiên chọn 9–10, Ảnh tốt 8–8,9, Dùng được 6,5–7,9, Cân nhắc loại dưới 6,5; điểm 10 tương
+ứng thang 100), **loại ảnh**, **nhân vật quan trọng**, lý do loại, và thanh kéo cỡ ảnh thu nhỏ. Bấm một dòng
+để lọc, bấm lại để bỏ; các bộ lọc cộng dồn với tab đang mở.
+
+**Loại ảnh và đủ câu chuyện**: AI gợi ý mỗi ảnh thuộc loại nào: Toàn cảnh (quy mô sự kiện), Phát biểu
+(người một mình ở micro, sân khấu), Nhân vật (gương mặt, cảm xúc), Tương tác (bắt tay, trao đổi, trao quà),
+Tập thể (nhóm cùng nhìn máy), Hoạt động, Chi tiết (bục, biểu trưng, tài liệu) và Khoảnh khắc (cười, cổ vũ).
+Một sự kiện không chỉ giữ toàn ảnh đẹp: loại ảnh nào có trong show mà chưa có tấm nào được chọn thì AI giữ
+tấm đẹp nhất của loại đó nếu dùng được (tắt ở «Đủ loại ảnh kể câu chuyện»). Khi xuất có thể tích «Chia ảnh
+chọn vào thư mục theo loại ảnh» (Toan-canh, Phat-bieu, Chi-tiet…), vẫn là bản chép, ảnh gốc giữ nguyên.
+
+**Nhân vật quan trọng**: mở ảnh, bấm **♛ Nhân vật quan trọng** cạnh khuôn mặt (đặt tên nếu muốn, ví dụ
+«Thầy Hiệu trưởng»). App nhận ra người đó trong mọi ảnh, mọi show sau, bằng khuôn mặt; ảnh có họ không bị loại
+vì lỗi nhẹ (điểm thấp, bố cục, nhiễu, hơi nghiêng, lệch sáng: vào «Cần xem lại»), và mỗi khoảnh khắc giữ ảnh
+đẹp nhất của họ. App không tự đoán ai là ai: chỉ nhận ra người bạn đã đánh dấu. Chuột phải vào khuôn mặt ở
+cột bên phải để đổi tên hoặc bỏ đánh dấu.
+
+Ảnh có độ phân giải thấp (cạnh dài dưới 2000 px) được ghi chú «đủ đăng web, chưa đủ in lớn».
+
 **Crop ảnh** (phím C trong trình xem ảnh): kéo khung giữ lại, chọn tỉ lệ (tự do, như gốc, 1:1, 3:2, 4:3,
 4:5, 16:9, 9:16…), Enter lưu. Giữ **Shift** khi kéo thì khung giữ nguyên tỉ lệ, chỉ to nhỏ; cuộn chuột
 cũng phóng to thu nhỏ khung. Lưu xong app hiện ảnh thành quả (bấm «Sửa crop» để chỉnh tiếp).

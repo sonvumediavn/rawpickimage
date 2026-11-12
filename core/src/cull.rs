@@ -184,6 +184,12 @@ pub struct Verdict {
     pub moment: usize,
     /// Timeline position in seconds (camera offsets applied).
     pub time: Option<f64>,
+    /// Kind of event photo (overview, speaker, detail…), a suggestion.
+    #[serde(default)]
+    pub scene: crate::scene::Scene,
+    /// Key people Sơn marked who are in this photo.
+    #[serde(default)]
+    pub key_people: Vec<u32>,
 }
 
 fn r1(v: f32) -> f32 {
@@ -267,6 +273,8 @@ pub fn cull(items: &[Option<&Analysis>], s: &Settings, profile: Option<&Profile>
                     series: None,
                     moment: 0,
                     time: None,
+                    scene: Default::default(),
+                    key_people: vec![],
                 };
             };
             let (rule, mut notes) = rule_score(a, &s.weights, fix);
@@ -286,6 +294,18 @@ pub fn cull(items: &[Option<&Analysis>], s: &Settings, profile: Option<&Profile>
                 decision = Decision::Rejected(Reason::NotStarred);
             }
             let offset = if o.multi_camera { s.camera_offsets.get(&a.camera).copied().unwrap_or(0.0) } else { 0.0 };
+            let mut key_people: Vec<u32> = a.key_faces.iter().map(|&(_, p)| p).collect();
+            key_people.sort_unstable();
+            key_people.dedup();
+            if o.key_people && !key_people.is_empty() {
+                if let Decision::Rejected(r @ (Reason::LowScore | Reason::Composition | Reason::Noise | Reason::Tilted | Reason::Underexposed | Reason::Overexposed)) = decision {
+                    decision = Decision::Review;
+                    notes.push(format!("Có nhân vật quan trọng: không loại vì {}, để bạn xem", r.label().to_lowercase()));
+                }
+            }
+            if a.width > 0 && a.width.max(a.height) < LOW_RES {
+                notes.push(format!("Độ phân giải thấp ({}×{}): đủ đăng web, chưa đủ in lớn", a.width, a.height));
+            }
             Verdict {
                 idx,
                 score,
@@ -299,6 +319,8 @@ pub fn cull(items: &[Option<&Analysis>], s: &Settings, profile: Option<&Profile>
                 series: None,
                 moment: 0,
                 time: a.time.map(|t| t + offset),
+                scene: crate::scene::classify(a),
+                key_people,
             }
         })
         .collect();
@@ -316,6 +338,12 @@ pub fn cull(items: &[Option<&Analysis>], s: &Settings, profile: Option<&Profile>
     assign_moments(&mut out, &order, s.moment_gap_seconds);
     if o.moments {
         cover_moments(items, &mut out, s);
+    }
+    if o.key_people {
+        cover_key_people(items, &mut out, s);
+    }
+    if o.story {
+        cover_story(items, &mut out, s);
     }
     if let Some(n) = s.max_selected {
         limit(&mut out, n);
@@ -680,6 +708,54 @@ fn cover_moments(items: &[Option<&Analysis>], out: &mut [Verdict], s: &Settings)
     }
 }
 
+/// A photo that may be picked to fill a gap: not ruined, nobody important blinking.
+fn fills_gap(v: &Verdict, a: Option<&Analysis>, floor: f32, s: &Settings) -> bool {
+    v.score >= floor
+        && v.fixes.is_empty()
+        && matches!(v.decision, Decision::Review | Decision::Rejected(Reason::LowScore) | Decision::Rejected(Reason::Composition))
+        && a.is_some_and(|a| !a.people.closed_eyes && !a.people.blurred_face && !flagged(a, s))
+}
+
+/// Every key person keeps their best usable photo of each moment they are in.
+fn cover_key_people(items: &[Option<&Analysis>], out: &mut [Verdict], s: &Settings) {
+    let mut seen: Vec<(u32, usize)> = out.iter().flat_map(|v| v.key_people.iter().map(move |&p| (p, v.moment))).collect();
+    seen.sort_unstable();
+    seen.dedup();
+    let floor = s.threshold - 2.0 * s.review_margin.max(0.5);
+    for (p, m) in seen {
+        if out.iter().any(|v| v.moment == m && v.decision == Decision::Selected && v.key_people.contains(&p)) {
+            continue;
+        }
+        let best = out
+            .iter()
+            .filter(|v| v.moment == m && v.key_people.contains(&p) && fills_gap(v, items[v.idx], floor, s))
+            .max_by(|a, b| a.score.total_cmp(&b.score))
+            .map(|v| v.idx);
+        if let Some(i) = best {
+            out[i].decision = Decision::Selected;
+            out[i].notes.push("Ảnh đẹp nhất của nhân vật quan trọng trong khoảnh khắc này".into());
+        }
+    }
+}
+
+/// The event told whole: each kind of photo it has keeps its best usable one.
+fn cover_story(items: &[Option<&Analysis>], out: &mut [Verdict], s: &Settings) {
+    let floor = s.threshold - s.review_margin.max(0.5);
+    for sc in crate::scene::Scene::ALL {
+        if out.iter().any(|v| v.scene == sc && v.decision == Decision::Selected) {
+            continue;
+        }
+        let best = out.iter().filter(|v| v.scene == sc && fills_gap(v, items[v.idx], floor, s)).max_by(|a, b| a.score.total_cmp(&b.score)).map(|v| v.idx);
+        if let Some(i) = best {
+            out[i].decision = Decision::Selected;
+            out[i].notes.push(format!("Đủ loại ảnh kể câu chuyện: tấm «{}» đẹp nhất", sc.label()));
+        }
+    }
+}
+
+/// Long side (pixels) under which a photo is fine for the web but not for large prints.
+const LOW_RES: u32 = 2000;
+
 /// Keep at most `n` selected photos; each moment's best goes in first.
 fn limit(out: &mut [Verdict], n: usize) {
     let mut sel: Vec<usize> = out.iter().filter(|v| v.decision == Decision::Selected).map(|v| v.idx).collect();
@@ -972,6 +1048,38 @@ mod tests {
     }
 
     #[test]
+    fn the_story_keeps_one_of_each_kind_and_key_people_are_not_dropped() {
+        // Ten good photos of people, and one detail shot (no faces) a little under the pick score.
+        let mut g: Vec<Analysis> = (0..10).map(|k| shot(&format!("a{k}"), k as f64 * 100.0, 8.5, 10 + k, 1.0, k, 2)).collect();
+        let mut d = photo("logo", 2000.0, [7.0; 5], 99);
+        d.embed = look(50, 1.0, 1);
+        g.push(d);
+        // A key person in a weak photo of its own moment.
+        let mut kp = shot("thay", 5000.0, 5.6, 60, 1.0, 3, 1);
+        kp.key_faces = vec![(0, 7)];
+        g.push(kp);
+        let refs: Vec<_> = g.iter().map(Some).collect();
+        let mut on = Settings::default();
+        on.options.key_people = true;
+        let v = cull(&refs, &on, None);
+        assert_eq!(v[10].scene, crate::scene::Scene::Detail);
+        assert_eq!(v[10].decision, Decision::Selected, "{:?}", v[10].notes);
+        assert_eq!(v[11].key_people, vec![7]);
+        assert_eq!(v[11].decision, Decision::Selected, "{:?}", v[11].notes);
+        let mut s = Settings::default();
+        s.options.story = false;
+        s.options.key_people = false;
+        let v = cull(&refs, &s, None);
+        assert_eq!(v[10].decision, Decision::Review);
+        assert_eq!(v[11].decision, Decision::Rejected(Reason::LowScore));
+        s.options.key_people = true;
+        // Too weak to be picked for him alone, but never rejected.
+        g[11].scores = crate::analyze::Scores { exposure: 4.5, sharp: 4.5, comp: 4.5, color: 4.5, noise: 4.5, people: None };
+        let refs: Vec<_> = g.iter().map(Some).collect();
+        assert_eq!(cull(&refs, &s, None)[11].decision, Decision::Review);
+    }
+
+    #[test]
     fn a_shot_taken_many_times_keeps_its_best() {
         // Just under the pick score: one is kept anyway (he shot it three times), and in a
         // group the frame where nobody blinks wins.
@@ -985,6 +1093,7 @@ mod tests {
         assert_ne!(picked[0], 0, "the frame with someone blinking loses");
         let mut s = Settings::default();
         s.options.keep_each_shot = false;
+        s.options.story = false;
         assert!(cull(&refs, &s, None).iter().all(|x| x.decision != Decision::Selected));
     }
 

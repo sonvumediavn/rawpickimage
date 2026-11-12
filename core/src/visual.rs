@@ -58,6 +58,20 @@ fn gaussian(seed: u64, n: usize) -> Vec<f32> {
         .collect()
 }
 
+/// Softmax over the 1000 ImageNet classes, the likeliest (at least 2 %), at most 8.
+pub fn top_classes(logits: &[f32]) -> Vec<(u16, u8)> {
+    if logits.len() != 1000 {
+        return vec![];
+    }
+    let m = logits.iter().cloned().fold(f32::MIN, f32::max);
+    let e: Vec<f32> = logits.iter().map(|x| (x - m).exp()).collect();
+    let sum: f32 = e.iter().sum();
+    let mut v: Vec<(u16, u8)> = e.iter().enumerate().map(|(i, x)| (i as u16, (x / sum * 100.0).round() as u8)).filter(|&(_, p)| p >= 2).collect();
+    v.sort_by(|a, b| b.1.cmp(&a.1));
+    v.truncate(8);
+    v
+}
+
 /// Normalise to unit length and quantise.
 fn quantise(v: &[f32]) -> Vec<i8> {
     let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
@@ -204,7 +218,9 @@ impl Embedder {
         // The 7×7 feature grid that feeds the classifier's global average (kept whole, so
         // where things are in the frame is not averaged away).
         let grid = m.node_by_name("GlobalAveragePool_97")?.inputs[0];
-        m.select_output_outlets(&[grid])?;
+        // And the ImageNet classes (microphone, stage, academic gown…) for sorting photos by kind.
+        let classes = m.output_outlets()?[0];
+        m.select_output_outlets(&[grid, classes])?;
         let model = m
             .with_input_fact(0, f32::fact([1, 3, INPUT, INPUT]).into())?
             .into_optimized()?
@@ -214,6 +230,11 @@ impl Embedder {
 
     /// The whole frame squeezed to 224×224 (composition matters, so no crop).
     pub fn embed(&self, img: &RgbImage) -> anyhow::Result<Vec<i8>> {
+        Ok(self.look(img)?.0)
+    }
+
+    /// The look vector and the likeliest ImageNet classes as (class, percent), at least 2 %.
+    pub fn look(&self, img: &RgbImage) -> anyhow::Result<(Vec<i8>, Vec<(u16, u8)>)> {
         use tract_onnx::prelude::*;
         let small = crate::metrics::resize(img, INPUT as u32, INPUT as u32);
         const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
@@ -226,7 +247,8 @@ impl Embedder {
         let v = out[0].to_plain_array_view::<f32>()?;
         let grid: Vec<f32> = v.iter().copied().collect();
         anyhow::ensure!(grid.len() == FEAT * GRID * GRID, "mô hình hình ảnh trả về {} số thay vì {}", grid.len(), FEAT * GRID * GRID);
-        Ok(compress_grid(&grid))
+        let logits: Vec<f32> = out.get(1).and_then(|t| t.to_plain_array_view::<f32>().ok()).map(|v| v.iter().copied().collect()).unwrap_or_default();
+        Ok((compress_grid(&grid), top_classes(&logits)))
     }
 }
 
