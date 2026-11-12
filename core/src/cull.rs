@@ -438,18 +438,45 @@ fn lead_mouth_open(a: &Analysis) -> bool {
 }
 
 /// Group consecutive near-identical photos; keep the best `keep_per_series`.
+/// Two frames of the same shot: the quick pixel fingerprint matches, or the image model sees the
+/// same picture (it is not fooled by a turned head, a small pan or zoom, or a flash that did not
+/// fire). Without capture times to back it up, only near-identical frames count.
+fn same_shot(a: &Analysis, b: &Analysis, timed: bool) -> bool {
+    if metrics::similar(&a.signature, &b.signature) {
+        return true;
+    }
+    if (a.signature.aspect - b.signature.aspect).abs() > 0.05 {
+        return false;
+    }
+    let content = crate::visual::similarity_content(&a.embed, &b.embed);
+    if timed {
+        content >= SAME_SHOT
+    } else {
+        content >= SAME_SHOT_UNTIMED && crate::visual::similarity(&a.embed, &b.embed) >= SAME_SHOT_UNTIMED - 0.03
+    }
+}
+
+/// Image-model similarity for frames a few seconds apart to count as one shot (measured: re-framed,
+/// rotated, brightened copies of one photo score 0.84–0.99, different photos below 0.4).
+const SAME_SHOT: f32 = 0.86;
+const SAME_SHOT_UNTIMED: f32 = 0.94;
+
 fn dedupe(items: &[Option<&Analysis>], out: &mut [Verdict], order: &[usize], s: &Settings) {
     let mut series: Vec<Vec<usize>> = vec![];
     for &i in order {
         let Some(a) = items[i] else { continue };
         let joined = series.last_mut().filter(|g| {
             let &last = g.last().unwrap();
-            let Some(b) = items[last] else { return false };
-            let close = match (out[i].time, out[last].time) {
-                (Some(t1), Some(t2)) => (t1 - t2).abs() <= s.dedupe_seconds,
-                _ => true,
+            let timed = match (out[i].time, out[last].time) {
+                (Some(t1), Some(t2)) => Some((t1 - t2).abs() <= s.dedupe_seconds),
+                _ => None,
             };
-            close && metrics::similar(&a.signature, &b.signature)
+            if timed == Some(false) {
+                return false;
+            }
+            // Same shot as any photo of the series so far (people move, the camera pans a little
+            // between frames, so comparing with the last frame alone splits real bursts).
+            g.iter().rev().take(12).any(|&k| items[k].is_some_and(|b| same_shot(a, b, timed.is_some())))
         });
         match joined {
             Some(g) => g.push(i),
