@@ -69,6 +69,9 @@ pub struct Analysis {
     /// Locked ("protect") on the camera.
     #[serde(default)]
     pub protected: bool,
+    /// Sơn's crop for export (set by the app from the session, never cached).
+    #[serde(skip)]
+    pub crop: Option<crate::crop::Rect>,
 }
 
 pub struct Analyzer {
@@ -220,6 +223,7 @@ impl Analyzer {
             embed,
             stars: 0,
             protected: false,
+            crop: None,
         })
     }
 }

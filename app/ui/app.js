@@ -169,6 +169,7 @@ function renderRules() {
   $("expReview").checked = st.prefs.export.copy_review;
   $("expRejected").checked = st.prefs.export.copy_rejected;
   $("expReport").checked = st.prefs.export.report;
+  $("expRawCrop").value = st.prefs.export.raw_crop || "both";
   renderExpMode();
 }
 
@@ -284,6 +285,7 @@ function wireRail() {
   $("expReview").onchange = () => { st.prefs.export.copy_review = $("expReview").checked; savePrefs(); };
   $("expRejected").onchange = () => { st.prefs.export.copy_rejected = $("expRejected").checked; savePrefs(); };
   $("expReport").onchange = () => { st.prefs.export.report = $("expReport").checked; savePrefs(); };
+  $("expRawCrop").onchange = () => { st.prefs.export.raw_crop = $("expRawCrop").value; savePrefs(); };
   for (const b of $("expMode").children) {
     b.onclick = () => { st.prefs.export.move_files = b.dataset.m === "move"; renderExpMode(); savePrefs(); };
   }
@@ -581,7 +583,7 @@ function renderGrid() {
       const p = P[i], v = st.verdicts[i], k = decKind(v.decision);
       return `<div class="card ${k}" data-i="${i}" tabindex="0">
         <div class="th">${p.thumb ? `<img loading="lazy" src="${fileSrc(p.thumb)}" alt="">` : ""}
-          <span class="sc ${cls(v.score)}">${v.score.toFixed(1)}</span>${v.overridden ? `<span class="man">sửa tay</span>` : ""}${p.stars > 0 ? `<span class="star">${"★".repeat(p.stars)}</span>` : p.protected ? `<span class="star" title="Khóa bảo vệ trên máy">🔒</span>` : ""}</div>
+          <span class="sc ${cls(v.score)}">${v.score.toFixed(1)}</span>${v.overridden ? `<span class="man">sửa tay</span>` : ""}${p.stars > 0 ? `<span class="star">${"★".repeat(p.stars)}</span>` : p.protected ? `<span class="star" title="Khóa bảo vệ trên máy">🔒</span>` : ""}${p.crop ? CROP_BADGE : ""}</div>
         <div class="cap"><div class="nm">${esc(p.name)}${v.time != null ? " · " + fmtTime(v.time) : ""}</div><div class="why">${esc(topWhy(p, v))}</div></div>
       </div>`;
     })
@@ -641,7 +643,7 @@ async function doExportShow() {
     m.phase = "ready";
     renderProfile(r.profile);
     const rep = r.report;
-    let msg = `Đã lưu ${rep.copied + rep.moved + rep.skipped_same} file vào <a id="openArc">${esc(rep.out_dir)}</a>` + (rep.errors.length ? `, <b>${rep.errors.length} lỗi</b>: ${esc(rep.errors[0])}` : "") + ".";
+    let msg = `Đã lưu ${rep.copied + rep.moved + rep.skipped_same} file vào <a id="openArc">${esc(rep.out_dir)}</a>` + (rep.cropped ? `, ${rep.cropped} ảnh đã crop` : "") + (rep.errors.length ? `, <b>${rep.errors.length} lỗi</b>: ${esc(rep.errors[0])}` : "") + "." + cropNotes(rep);
     if (r.drive) {
       msg += `<br>Đã chép lên Google Drive, app Drive đang tải lên. `;
       msg += r.drive.link
@@ -769,8 +771,9 @@ async function doExport() {
     toast(
       `${mv ? "Đã chuyển" : "Đã chép"} ${n} file (${(rep.bytes / 1e9).toFixed(2)} GB) vào ${esc(target)}` +
         (rep.skipped_same ? `, bỏ qua ${rep.skipped_same} file đã có` : "") +
+        (rep.cropped ? `, ${rep.cropped} ảnh đã crop (ảnh gốc giữ nguyên)` : "") +
         (rep.errors.length ? `, <b>${rep.errors.length} lỗi</b>: ${esc(rep.errors[0])}` : "") +
-        ` · <a id="openOut">Mở thư mục</a>`,
+        ` · <a id="openOut">Mở thư mục</a>` + cropNotes(rep),
       15000
     );
     const a = document.getElementById("openOut");
@@ -820,6 +823,7 @@ async function doGather() {
 // ---------------------------------------------------------------- detail view
 
 async function openDetail(i) {
+  if (st.cur !== i) { cropEd.on = false; cropEd.drag = null; }
   st.cur = i;
   $("detail").hidden = false;
   renderDetail();
@@ -844,6 +848,7 @@ async function renderDetail() {
     frame.appendChild(d);
   });
   renderEyes(i, p, mains);
+  renderCrop();
   const ai = v.overridden || (aiOff() && v.ai_decision.kind !== "review")
     ? ` <span class="note">(AI ${v.overridden ? "" : "gợi ý "}: ${esc(aiOff() && v.ai_decision.kind === "review" ? "Cần xem lại" : decLabel(v.ai_decision))})</span>`
     : "";
@@ -1061,6 +1066,7 @@ function wireZoom() {
   const stage = $("dstage");
   stage.addEventListener("wheel", (e) => {
     e.preventDefault();
+    if (cropEd.on) return;
     if (!e.ctrlKey && Math.abs(e.deltaX) > Math.abs(e.deltaY) * 0.5 && zoom.s > 1) {
       // Two-finger sideways / diagonal swipe on a trackpad: pan.
       zoom.tx -= e.deltaX; zoom.ty -= e.deltaY;
@@ -1085,7 +1091,7 @@ function wireZoom() {
   const end = () => { zoom.drag = null; stage.classList.remove("dragging"); };
   stage.addEventListener("pointerup", end);
   stage.addEventListener("pointercancel", end);
-  stage.addEventListener("dblclick", (e) => { if (!e.target.closest(".zoombar")) zoom100([e.clientX, e.clientY]); });
+  stage.addEventListener("dblclick", (e) => { if (!cropEd.on && !e.target.closest(".zoombar")) zoom100([e.clientX, e.clientY]); });
   $("zIn").onclick = () => zoomTo(Math.max(zoom.s, 1) * 1.5, null);
   $("zOut").onclick = () => zoomTo(zoom.s / 1.5, null);
   $("zFit").onclick = () => zoomTo(1, null);
@@ -1156,12 +1162,20 @@ function step(d) {
 }
 
 function wireDetail() {
-  $("dclose").onclick = () => { $("detail").hidden = true; st.cur = -1; zoom.idx = -1; };
+  $("dclose").onclick = () => { cropEd.on = false; $("detail").hidden = true; st.cur = -1; zoom.idx = -1; };
+  wireCrop();
   for (const b of document.querySelectorAll(".dact button")) b.onclick = () => decide(b.dataset.d === "ai" ? null : b.dataset.d);
   document.addEventListener("keydown", (e) => {
     if ($("detail").hidden || e.target.matches("input,select,textarea")) return;
     const k = e.key.toLowerCase();
-    if (k === "escape") $("dclose").click();
+    if (cropEd.on) {
+      // While framing, only the crop keys count (arrows must not jump to another photo).
+      if (k === "enter") { e.preventDefault(); cropSave(); }
+      else if (k === "escape") cropStop();
+      return;
+    }
+    if (k === "c") cropBegin();
+    else if (k === "escape") $("dclose").click();
     else if (k === "arrowright") step(1);
     else if (k === "arrowleft") step(-1);
     else if (k === "p") decide("selected");
@@ -1172,6 +1186,229 @@ function wireDetail() {
     else if (k === "0") $("zFit").click();
     else if (k === "1" || k === "z") $("z100").click();
   });
+}
+
+// ---------------------------------------------------------------- crop
+
+/**
+ * Sơn draws the frame to keep; only the exported copy is cut (JPEG losslessly, RAW untouched
+ * with the crop for Lightroom and a cut JPEG). The frame is `[x, y, w, h]`, fractions of the
+ * upright photo.
+ */
+const CROP_ASPECTS = [
+  ["free", "Tự do"], ["orig", "Như ảnh gốc"], ["1:1", "1:1 vuông"],
+  ["3:2", "3:2 ngang"], ["2:3", "2:3 dọc"], ["4:3", "4:3 ngang"], ["3:4", "3:4 dọc"],
+  ["5:4", "5:4 ngang"], ["4:5", "4:5 dọc (Facebook, Instagram)"], ["16:9", "16:9 ngang"], ["9:16", "9:16 dọc (story, reels)"],
+];
+const CROP_BADGE = `<span class="crop" title="Đã crop, khi xuất sẽ cắt bớt phần thừa">✂</span>`;
+const CROP_MIN = 0.03;
+const cropEd = { on: false, r: null, aspect: "free", drag: null };
+try { cropEd.aspect = localStorage.getItem("cropAspect") || "free"; } catch {}
+const clamp = (v, a, b) => Math.min(Math.max(v, a), b);
+
+function photoRatio(p) {
+  const img = $("dimg");
+  return p && p.width && p.height ? p.width / p.height : (img.naturalWidth || 3) / (img.naturalHeight || 2);
+}
+
+/** The chosen aspect as width / height in fractions of the photo (null = free). */
+function cropK() {
+  const a = cropEd.aspect;
+  if (a === "free") return null;
+  if (a === "orig") return 1;
+  const [x, y] = a.split(":").map(Number);
+  return x / y / photoRatio(st.session.photos[st.cur]);
+}
+
+/** The frame turned to aspect k, about as big as before, kept inside the photo. */
+function withAspect(r, k) {
+  const area = r[2] * r[3];
+  let w = Math.sqrt(area * k), h = Math.sqrt(area / k);
+  const s = Math.min(1, 1 / w, 1 / h);
+  w *= s; h *= s;
+  const cx = r[0] + r[2] / 2, cy = r[1] + r[3] / 2;
+  return [clamp(cx - w / 2, 0, 1 - w), clamp(cy - h / 2, 0, 1 - h), w, h];
+}
+
+/** Frame from a fixed corner (ax, ay) to the pointer. */
+function cornerRect(ax, ay, px, py, k) {
+  const sx = px < ax ? -1 : 1, sy = py < ay ? -1 : 1;
+  const maxW = sx < 0 ? ax : 1 - ax, maxH = sy < 0 ? ay : 1 - ay;
+  let w = Math.min(Math.abs(px - ax), maxW), h = Math.min(Math.abs(py - ay), maxH);
+  if (k) {
+    if (w / Math.max(h, 1e-6) > k) h = w / k; else w = h * k;
+    if (w > maxW) { w = maxW; h = w / k; }
+    if (h > maxH) { h = maxH; w = h * k; }
+  }
+  w = Math.max(w, Math.min(CROP_MIN, maxW)); h = Math.max(h, Math.min(CROP_MIN, maxH));
+  return [sx < 0 ? ax - w : ax, sy < 0 ? ay - h : ay, w, h];
+}
+
+/** Frame with one side dragged; with a fixed aspect the other side follows, centred. */
+function edgeRect(r0, side, pt, k) {
+  let [x, y, w, h] = r0;
+  const cx = x + w / 2, cy = y + h / 2;
+  if (side === "e" || side === "w") {
+    const fixed = side === "e" ? x : x + w;
+    w = side === "e" ? clamp(pt[0] - fixed, CROP_MIN, 1 - fixed) : clamp(fixed - pt[0], CROP_MIN, fixed);
+    if (k) { h = w / k; const m = 2 * Math.min(cy, 1 - cy); if (h > m) { h = m; w = h * k; } y = cy - h / 2; }
+    x = side === "e" ? fixed : fixed - w;
+  } else {
+    const fixed = side === "s" ? y : y + h;
+    h = side === "s" ? clamp(pt[1] - fixed, CROP_MIN, 1 - fixed) : clamp(fixed - pt[1], CROP_MIN, fixed);
+    if (k) { w = h * k; const m = 2 * Math.min(cx, 1 - cx); if (w > m) { w = m; h = w / k; } x = cx - w / 2; }
+    y = side === "s" ? fixed : fixed - h;
+  }
+  return [x, y, w, h];
+}
+
+function cropPx(p, r) {
+  return p.width ? `${Math.round(r[2] * p.width)}×${Math.round(r[3] * p.height)} px` : `${Math.round(r[2] * 100)}% × ${Math.round(r[3] * 100)}%`;
+}
+
+function cropNotes(rep) {
+  const n = rep.notes || [];
+  return n.length ? `<br>${esc(n[0])}${n.length > 1 ? ` (và ${n.length - 1} ảnh khác)` : ""}` : "";
+}
+
+function renderCrop() {
+  const i = st.cur, p = i >= 0 ? st.session.photos[i] : null;
+  const frame = $("dframe");
+  for (const x of frame.querySelectorAll(".cropbox,.cropshade")) x.remove();
+  if (!p) return;
+  const editing = cropEd.on;
+  const r = editing ? cropEd.r : p.crop;
+  frame.classList.toggle("hascrop", !!r);
+  frame.classList.toggle("cropedit", editing);
+  $("cropIdle").hidden = editing;
+  $("cropEdit").hidden = !editing;
+  $("cropStart").disabled = !!p.error;
+  $("cropStart").innerHTML = `✂ ${p.crop ? "Sửa crop" : "Crop"} <kbd>C</kbd>`;
+  $("cropClear").hidden = !p.crop;
+  $("cropInfo").textContent = p.crop ? `Khi xuất giữ ${cropPx(p, p.crop)}` : "";
+  if (editing) {
+    $("cropAspect").value = cropEd.aspect;
+    const jpeg = p.files.some((f) => /\.jpe?g$/i.test(f));
+    const mode = st.prefs.export.raw_crop || "both";
+    $("cropNote").textContent = jpeg
+      ? "Kéo khung hoặc vẽ khung mới. JPEG được cắt thẳng từ dữ liệu gốc, phần giữ lại không bị nén lại."
+      : `Kéo khung hoặc vẽ khung mới. File RAW giữ nguyên, khi xuất kèm ${mode === "xmp" ? "khung crop cho Lightroom (.xmp)" : mode === "jpeg" ? "JPEG đã cắt" : "khung crop cho Lightroom (.xmp) và JPEG đã cắt"}.`;
+  }
+  if (!r) return;
+  const sh = document.createElement("div");
+  sh.className = "cropshade";
+  frame.appendChild(sh);
+  const d = document.createElement("div");
+  d.className = "cropbox" + (editing ? " edit" : "");
+  placeBox(d, sh, r);
+  if (editing) d.innerHTML = ["nw", "n", "ne", "e", "se", "s", "sw", "w"].map((h) => `<i data-h="${h}"></i>`).join("") + `<b>${cropPx(p, r)}</b>`;
+  frame.appendChild(d);
+}
+
+/** Position the frame and darken what will be cut away (a hole in the shade). */
+function placeBox(d, sh, r) {
+  const [x0, y0, x1, y1] = [r[0], r[1], r[0] + r[2], r[1] + r[3]].map((v) => (v * 100).toFixed(3) + "%");
+  Object.assign(d.style, { left: x0, top: y0, width: r[2] * 100 + "%", height: r[3] * 100 + "%" });
+  sh.style.clipPath = `polygon(evenodd, 0 0, 100% 0, 100% 100%, 0 100%, 0 0, ${x0} ${y0}, ${x0} ${y1}, ${x1} ${y1}, ${x1} ${y0}, ${x0} ${y0})`;
+}
+
+/** Move the frame on screen without rebuilding it (smooth while dragging). */
+function placeCrop() {
+  const f = $("dframe"), d = f.querySelector(".cropbox"), sh = f.querySelector(".cropshade"), r = cropEd.r;
+  if (!d || !sh) return renderCrop();
+  placeBox(d, sh, r);
+  const b = d.querySelector("b");
+  if (b) b.textContent = cropPx(st.session.photos[st.cur], r);
+}
+
+function cropBegin() {
+  const p = st.cur >= 0 ? st.session.photos[st.cur] : null;
+  if (!p || p.error) return;
+  zoomTo(1, null);
+  cropEd.on = true;
+  const k = cropK();
+  cropEd.r = p.crop ? [...p.crop] : k ? withAspect([0, 0, 1, 1], k) : [0.05, 0.05, 0.9, 0.9];
+  renderCrop();
+}
+
+function cropStop() {
+  cropEd.on = false;
+  cropEd.drag = null;
+  renderCrop();
+}
+
+async function cropSave() {
+  const r = cropEd.r;
+  const full = r[2] > 0.995 && r[3] > 0.995;
+  await setCrop(full ? null : r);
+}
+
+async function setCrop(crop) {
+  const i = st.cur;
+  let v;
+  try {
+    v = await invoke("set_crop", { id: st.sid, idx: i, crop });
+  } catch (e) {
+    toast(esc(String(e)));
+    return;
+  }
+  st.session.photos[i] = v;
+  cropEd.on = false;
+  renderCrop();
+  const th = $("grid").querySelector(`.card[data-i="${i}"] .th`);
+  if (th) { th.querySelector(".crop")?.remove(); if (v.crop) th.insertAdjacentHTML("beforeend", CROP_BADGE); }
+  toast(v.crop ? `Đã lưu khung crop (${cropPx(v, v.crop)}). Khi xuất chỉ bản chép được cắt, ảnh gốc giữ nguyên.` : "Đã bỏ crop, ảnh sẽ được xuất nguyên khung.", 3500);
+}
+
+function wireCrop() {
+  $("cropAspect").innerHTML = CROP_ASPECTS.map(([v, t]) => `<option value="${v}">${esc(t)}</option>`).join("");
+  $("cropAspect").onchange = () => {
+    cropEd.aspect = $("cropAspect").value;
+    try { localStorage.setItem("cropAspect", cropEd.aspect); } catch {}
+    const k = cropK();
+    if (k && cropEd.r) cropEd.r = withAspect(cropEd.r, k);
+    $("cropAspect").blur();
+    renderCrop();
+  };
+  $("cropStart").onclick = cropBegin;
+  $("cropSave").onclick = cropSave;
+  $("cropCancel").onclick = cropStop;
+  $("cropClear").onclick = () => setCrop(null);
+  const frame = $("dframe");
+  const at = (e) => {
+    const b = frame.getBoundingClientRect();
+    return [clamp((e.clientX - b.left) / b.width, 0, 1), clamp((e.clientY - b.top) / b.height, 0, 1)];
+  };
+  frame.addEventListener("pointerdown", (e) => {
+    if (!cropEd.on || e.button !== 0) return;
+    e.stopPropagation();
+    e.preventDefault();
+    const h = e.target.dataset?.h;
+    const mode = h || (e.target.closest(".cropbox") ? "move" : "new");
+    cropEd.drag = { mode, start: at(e), r0: [...cropEd.r], moved: false };
+    frame.setPointerCapture(e.pointerId);
+  });
+  frame.addEventListener("pointermove", (e) => {
+    const g = cropEd.drag;
+    if (!g) return;
+    const pt = at(e), k = cropK(), [x, y, w, h] = g.r0;
+    if (!g.moved && Math.hypot(pt[0] - g.start[0], pt[1] - g.start[1]) < 0.005) return;
+    g.moved = true;
+    if (g.mode === "move") {
+      cropEd.r = [clamp(x + pt[0] - g.start[0], 0, 1 - w), clamp(y + pt[1] - g.start[1], 0, 1 - h), w, h];
+    } else if (g.mode === "new") {
+      cropEd.r = cornerRect(g.start[0], g.start[1], pt[0], pt[1], k);
+    } else if (g.mode.length === 2) {
+      const ax = g.mode.includes("w") ? x + w : x, ay = g.mode.includes("n") ? y + h : y;
+      cropEd.r = cornerRect(ax, ay, pt[0], pt[1], k);
+    } else {
+      cropEd.r = edgeRect(g.r0, g.mode, pt, k);
+    }
+    placeCrop();
+  });
+  const end = () => { cropEd.drag = null; };
+  frame.addEventListener("pointerup", end);
+  frame.addEventListener("pointercancel", end);
 }
 
 // ---------------------------------------------------------------- chat with the AI

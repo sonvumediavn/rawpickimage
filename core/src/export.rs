@@ -24,12 +24,27 @@ pub struct ExportOptions {
     /// Move instead of copy: each original is removed only after its new copy is verified
     /// (or renamed in one step when source and destination are on the same drive).
     pub move_files: bool,
+    /// What a cropped RAW photo becomes.
+    pub raw_crop: RawCrop,
+}
+
+/// A cropped RAW photo on export: the RAW itself is never changed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RawCrop {
+    /// RAW + `.xmp` sidecar with the crop (Lightroom, Camera Raw, Bridge).
+    Xmp,
+    /// RAW + a cropped JPEG from the camera's full-size preview.
+    Jpeg,
+    /// Both.
+    #[default]
+    Both,
 }
 
 impl Default for ExportOptions {
     fn default() -> Self {
         // Sơn's call (2026-11-03): only the chosen photos, no report files.
-        Self { copy_rejected: false, copy_review: false, report: false, move_files: false }
+        Self { copy_rejected: false, copy_review: false, report: false, move_files: false, raw_crop: RawCrop::Both }
     }
 }
 
@@ -41,6 +56,12 @@ pub struct ExportReport {
     pub moved: usize,
     pub bytes: u64,
     pub errors: Vec<String>,
+    /// Photos exported with Sơn's crop.
+    #[serde(default)]
+    pub cropped: usize,
+    /// Things to know about the crops (e.g. a RAW whose preview is too small for a JPEG).
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
 
 /// Suffix of the export folder, Sơn's naming (2026-11-04): «261104_van nghe cong doan_anh chon».
@@ -215,6 +236,13 @@ pub fn export(
             continue;
         }
         let folder = out_dir.join(sub_folder(d)).join(&e.rel_dir);
+        if let Some(r) = e.analysis.and_then(|a| a.crop).and_then(crate::crop::clean) {
+            match export_cropped(e, r, &folder, opts, &mut used, &mut rep) {
+                Ok(()) => rep.cropped += 1,
+                Err(err) => rep.errors.push(format!("{err:#}")),
+            }
+            continue;
+        }
         for f in e.files {
             let name = f.file_name().unwrap_or_default();
             let mut dst = folder.join(name);
@@ -269,6 +297,132 @@ pub fn export(
         std::fs::write(out_dir.join("tong-ket.txt"), summary_text(entries, &rep))?;
     }
     Ok(rep)
+}
+
+fn is_jpeg(p: &Path) -> bool {
+    p.extension()
+        .is_some_and(|x| matches!(x.to_string_lossy().to_lowercase().as_str(), "jpg" | "jpeg"))
+}
+
+fn is_xmp(p: &Path) -> bool {
+    p.extension()
+        .is_some_and(|x| x.to_string_lossy().eq_ignore_ascii_case("xmp"))
+}
+
+/// A free name in `folder` (two cameras may both have IMG_0001).
+fn free_name(folder: &Path, stem: &str, ext: &str, used: &mut HashSet<PathBuf>) -> PathBuf {
+    let mut dst = folder.join(format!("{stem}{ext}"));
+    let mut k = 2;
+    while used.contains(&dst) {
+        dst = folder.join(format!("{stem}_{k}{ext}"));
+        k += 1;
+    }
+    used.insert(dst.clone());
+    dst
+}
+
+fn write_atomic(dst: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(d) = dst.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    let tmp = dst.with_extension("dang-ghi");
+    std::fs::write(&tmp, bytes).with_context(|| format!("ghi {}", dst.display()))?;
+    std::fs::rename(&tmp, dst)?;
+    Ok(())
+}
+
+/// Shortest long side of a RAW's embedded preview worth delivering as a cropped JPEG.
+const MIN_PREVIEW_LONG: usize = 2400;
+
+/// One cropped photo. Originals are never touched (even when moving, a cropped photo is copied).
+fn export_cropped(
+    e: &Entry,
+    r: crate::crop::Rect,
+    folder: &Path,
+    opts: &ExportOptions,
+    used: &mut HashSet<PathBuf>,
+    rep: &mut ExportReport,
+) -> Result<()> {
+    let o_raw = e.analysis.and_then(|a| a.exif.orientation).unwrap_or(1);
+    let has_jpeg = e.files.iter().any(|f| is_jpeg(f));
+    let raw = e.files.iter().find(|f| crate::preview::is_raw(f));
+    let sidecar = e.files.iter().find(|f| is_xmp(f));
+    let parts = |f: &Path| {
+        (
+            f.file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            f.extension()
+                .map(|x| format!(".{}", x.to_string_lossy()))
+                .unwrap_or_default(),
+        )
+    };
+    for f in e.files {
+        let (stem, ext) = parts(f);
+        if is_jpeg(f) {
+            let bytes = std::fs::read(f).with_context(|| format!("đọc {}", f.display()))?;
+            let o = crate::exif::jpeg_exif(&bytes)
+                .and_then(|x| x.orientation)
+                .unwrap_or(1);
+            let out = crate::crop::crop_jpeg(&bytes, r, o, false)
+                .with_context(|| format!("crop {}", f.display()))?;
+            let dst = free_name(folder, &stem, &ext, used);
+            write_atomic(&dst, &out)?;
+            rep.copied += 1;
+            rep.bytes += out.len() as u64;
+        } else if is_xmp(f) {
+            let dst = free_name(folder, &stem, &ext, used);
+            let text = std::fs::read_to_string(f).unwrap_or_default();
+            let body = if opts.raw_crop == RawCrop::Jpeg {
+                text
+            } else {
+                crate::crop::xmp_with_crop(Some(&text), r, o_raw)
+            };
+            write_atomic(&dst, body.as_bytes())?;
+        } else {
+            // RAW (or anything else): an exact, verified copy.
+            let dst = free_name(folder, &stem, &ext, used);
+            match copy_verified(f, &dst)? {
+                Some(b) => {
+                    rep.copied += 1;
+                    rep.bytes += b;
+                }
+                None => rep.skipped_same += 1,
+            }
+        }
+    }
+    let Some(raw) = raw else { return Ok(()) };
+    let (stem, _) = parts(raw);
+    if opts.raw_crop != RawCrop::Jpeg && sidecar.is_none() {
+        let dst = free_name(folder, &stem, ".xmp", used);
+        write_atomic(&dst, crate::crop::xmp_with_crop(None, r, o_raw).as_bytes())?;
+    }
+    if opts.raw_crop != RawCrop::Xmp && !has_jpeg {
+        let (bytes, o) = crate::preview::embedded_jpeg(raw)?;
+        // Canon, Nikon, Panasonic and most Fujifilm bodies embed a full-size JPEG; some (older
+        // Sony) only a small one, too small to deliver.
+        let big = turbojpeg::read_header(&bytes)
+            .map(|h| h.width.max(h.height))
+            .unwrap_or(0);
+        if big >= MIN_PREVIEW_LONG {
+            let out = crate::crop::crop_jpeg(&bytes, r, o, true)
+                .with_context(|| format!("crop {}", raw.display()))?;
+            let dst = free_name(folder, &format!("{stem}_crop"), ".jpg", used);
+            write_atomic(&dst, &out)?;
+            rep.bytes += out.len() as u64;
+        } else {
+            rep.notes.push(format!(
+                "{}: máy ảnh chỉ nhúng ảnh xem trước {big} px trong file RAW, chưa đủ để xuất JPEG đã crop; đã kèm khung crop .xmp để mở bằng Lightroom",
+                raw.file_name().unwrap_or_default().to_string_lossy()
+            ));
+            if opts.raw_crop == RawCrop::Jpeg && sidecar.is_none() {
+                let dst = free_name(folder, &stem, ".xmp", used);
+                write_atomic(&dst, crate::crop::xmp_with_crop(None, r, o_raw).as_bytes())?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn csv_field(s: &str) -> String {
@@ -414,7 +568,7 @@ mod tests {
         assert_eq!(std::fs::read(out.join("IMG_1.CR3")).unwrap(), b"raw-bytes");
         assert!(out.join("IMG_1.JPG").exists() && !out.join("IMG_2.JPG").exists());
         assert!(!out.join("bao-cao.csv").exists() && !out.join("tong-ket.txt").exists() && !out.join("Bi-loai").exists());
-        let all = ExportOptions { copy_rejected: true, copy_review: true, report: true, move_files: false };
+        let all = ExportOptions { copy_rejected: true, copy_review: true, report: true, move_files: false, raw_crop: RawCrop::Both };
         let rep = export(&entries, &out, &all, &|_, _| {}, &AtomicBool::new(false)).unwrap();
         assert_eq!((rep.copied, rep.skipped_same), (1, 2), "{:?}", rep.errors);
         assert_eq!(std::fs::read(out.join("Bi-loai/Nham-mat/IMG_2.JPG")).unwrap(), b"other");
@@ -443,5 +597,112 @@ mod tests {
         assert_eq!(rep.moved, 1, "{:?}", rep.errors);
         assert!(!a.exists());
         assert_eq!(std::fs::read(out.join("DSC_1.NEF")).unwrap(), raw);
+    }
+
+    #[test]
+    fn cropped_photos_are_cut_from_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("Show");
+        std::fs::create_dir_all(&src).unwrap();
+        let img = image::RgbImage::from_fn(3000, 2000, |x, y| {
+            image::Rgb([(x % 251) as u8, (y % 241) as u8, 90])
+        });
+        let jpg = crate::metrics::encode_jpeg(&img, 90).unwrap();
+        // A NEF-like TIFF whose full-size preview is stored sideways (orientation 6).
+        let mut nef = b"II*\0\x08\0\0\0".to_vec();
+        nef.extend(3u16.to_le_bytes());
+        for (t, ty, v) in [
+            (0x0112u16, 3u16, 6u32),
+            (0x0201, 4, 64),
+            (0x0202, 4, jpg.len() as u32),
+        ] {
+            nef.extend(t.to_le_bytes());
+            nef.extend(ty.to_le_bytes());
+            nef.extend(1u32.to_le_bytes());
+            nef.extend(v.to_le_bytes());
+        }
+        nef.extend(0u32.to_le_bytes());
+        nef.resize(64, 0);
+        nef.extend(&jpg);
+        let raw = src.join("DSC_1.NEF");
+        std::fs::write(&raw, &nef).unwrap();
+        let (twin_raw, twin_jpg) = (src.join("IMG_2.CR3"), src.join("IMG_2.JPG"));
+        std::fs::write(&twin_raw, b"cr3-bytes").unwrap();
+        std::fs::write(&twin_jpg, &jpg).unwrap();
+        let (f1, f2) = (vec![raw.clone()], vec![twin_raw.clone(), twin_jpg.clone()]);
+        let mut a1 = Analysis {
+            crop: Some([0.1, 0.1, 0.5, 0.5]),
+            ..Default::default()
+        };
+        a1.exif.orientation = Some(6);
+        let a2 = Analysis {
+            crop: Some([0.25, 0.0, 0.5, 1.0]),
+            ..Default::default()
+        };
+        let v = verdict(Decision::Selected);
+        let entries = vec![
+            Entry {
+                files: &f1,
+                analysis: Some(&a1),
+                verdict: &v,
+                rel_dir: PathBuf::new(),
+            },
+            Entry {
+                files: &f2,
+                analysis: Some(&a2),
+                verdict: &v,
+                rel_dir: PathBuf::new(),
+            },
+        ];
+        let out = dir.path().join("out");
+        let rep = export(
+            &entries,
+            &out,
+            &ExportOptions::default(),
+            &|_, _| {},
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(rep.errors.is_empty(), "{:?}", rep.errors);
+        assert_eq!(rep.cropped, 2);
+        // RAW files: untouched copies plus the crop for Lightroom.
+        assert_eq!(std::fs::read(out.join("DSC_1.NEF")).unwrap(), nef);
+        assert_eq!(std::fs::read(out.join("IMG_2.CR3")).unwrap(), b"cr3-bytes");
+        let x = std::fs::read_to_string(out.join("DSC_1.xmp")).unwrap();
+        assert!(
+            x.contains("crs:HasCrop=\"True\"") && x.contains("crs:CropLeft=\"0.100000\""),
+            "{x}"
+        );
+        assert!(out.join("IMG_2.xmp").exists());
+        // The RAW without a JPEG twin also gets a JPEG cut from its preview, upright.
+        let c =
+            image::load_from_memory(&std::fs::read(out.join("DSC_1_crop.jpg")).unwrap()).unwrap();
+        let (w, h) = (c.width() as i32, c.height() as i32);
+        assert!((w - 1000).abs() <= 16 && (h - 1500).abs() <= 16, "{w}x{h}");
+        // The JPEG twin is cut losslessly, no extra JPEG.
+        let t = image::load_from_memory(&std::fs::read(out.join("IMG_2.JPG")).unwrap()).unwrap();
+        assert!(
+            (t.width() as i32 - 1500).abs() <= 16 && t.height() == 2000,
+            "{}x{}",
+            t.width(),
+            t.height()
+        );
+        assert!(!out.join("IMG_2_crop.jpg").exists());
+        assert_eq!(std::fs::read(&twin_jpg).unwrap(), jpg, "original untouched");
+        // Only the sidecar: no JPEG.
+        let out2 = dir.path().join("out2");
+        let o2 = ExportOptions {
+            raw_crop: RawCrop::Xmp,
+            ..Default::default()
+        };
+        export(
+            &entries[..1],
+            &out2,
+            &o2,
+            &|_, _| {},
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(out2.join("DSC_1.xmp").exists() && !out2.join("DSC_1_crop.jpg").exists());
     }
 }

@@ -98,6 +98,8 @@ struct Session {
     items: Vec<Item>,
     verdicts: Vec<Verdict>,
     overrides: HashMap<String, Decision>,
+    /// Sơn's crops, by photo path: `[x, y, w, h]` fractions of the upright photo.
+    crops: HashMap<String, [f32; 4]>,
     suggestions: Vec<Suggestion>,
     timing: Option<Timing>,
     applied: Vec<String>,
@@ -113,6 +115,8 @@ struct SavedSession {
     source: Option<PathBuf>,
     prefs: Prefs,
     overrides: HashMap<String, Decision>,
+    #[serde(default)]
+    crops: HashMap<String, [f32; 4]>,
     last_export: Option<PathBuf>,
 }
 
@@ -128,6 +132,7 @@ impl Session {
             items: vec![],
             verdicts: vec![],
             overrides: HashMap::new(),
+            crops: HashMap::new(),
             suggestions: vec![],
             timing: None,
             applied: vec![],
@@ -214,6 +219,7 @@ impl App {
                 source: s.source.clone(),
                 prefs: s.prefs.clone(),
                 overrides: s.overrides.clone(),
+                crops: s.crops.clone(),
                 last_export: s.last_export.clone(),
             })
             .collect();
@@ -239,6 +245,12 @@ impl App {
 
     /// Re-decide with the session's settings and keep Sơn's manual choices.
     fn recull(&self, s: &mut Session) {
+        for it in s.items.iter_mut() {
+            let crop = s.crops.get(&it.path.display().to_string()).copied();
+            if let Some(a) = it.analysis.as_mut() {
+                a.crop = crop;
+            }
+        }
         // Eyes first: Sơn's corrections may have changed who has their eyes closed.
         {
             let book = self.eyes.lock().unwrap();
@@ -313,6 +325,8 @@ struct PhotoView {
     /// Stars given on the camera / in Lightroom, and the camera's protect lock.
     stars: u8,
     protected: bool,
+    /// Sơn's crop for export, `[x, y, w, h]` of the upright photo.
+    crop: Option<[f32; 4]>,
 }
 
 #[derive(Serialize)]
@@ -393,6 +407,7 @@ fn photo_view(idx: usize, it: &Item) -> PhotoView {
         error: it.error.clone(),
         stars: a.map(|a| a.stars).unwrap_or(0),
         protected: a.is_some_and(|a| a.protected),
+        crop: a.and_then(|a| a.crop),
     }
 }
 
@@ -615,6 +630,7 @@ fn op_analyze(app: &Arc<App>, id: u32, source: Option<String>) -> Result<Session
             }
             if s.source.as_ref() != Some(&src) {
                 s.overrides.clear();
+                s.crops.clear();
             }
             s.name = folder_name(&src);
             s.source = Some(src.clone());
@@ -773,6 +789,26 @@ fn op_set_eyes(app: &Arc<App>, id: u32, idx: usize, face: usize, open: Option<bo
     drop(map);
     sessions_changed(app);
     Ok(r)
+}
+
+/// Sơn's crop for photo `idx` (`None` removes it). Only the exported copy is cut; the original
+/// and its decision stay as they are.
+fn op_set_crop(app: &Arc<App>, id: u32, idx: usize, crop: Option<[f32; 4]>) -> Result<PhotoView, String> {
+    let mut map = app.sessions.lock().unwrap();
+    let s = map.get_mut(&id).ok_or("Phiên đã đóng")?;
+    let it = s.items.get_mut(idx).ok_or("Sai ảnh")?;
+    let key = it.path.display().to_string();
+    let crop = crop.and_then(rawpick_core::crop::clean);
+    match crop {
+        Some(c) => s.crops.insert(key, c),
+        None => s.crops.remove(&key),
+    };
+    if let Some(a) = it.analysis.as_mut() {
+        a.crop = crop;
+    }
+    let v = photo_view(idx, it);
+    app.save_sessions(&map);
+    Ok(v)
 }
 
 /// Teach the session's event-type profile from its final choices.
@@ -1555,6 +1591,7 @@ struct Args {
     tunnel_token: Option<String>,
     face: Option<usize>,
     open: Option<bool>,
+    crop: Option<[f32; 4]>,
 }
 
 fn need<T>(v: Option<T>, what: &str) -> Result<T, String> {
@@ -1590,6 +1627,7 @@ fn dispatch(app: &Arc<App>, cmd: &str, args: serde_json::Value) -> Result<serde_
         "chat" => json(op_chat(app, a.id, need(a.message, "message")?, a.use_claude)?),
         "copy_card" => json(op_copy_card(app, need(a.card, "card")?, need(a.dest, "dest")?, a.backup)?),
         "cancel" => json(op_cancel(app, a.id)),
+        "set_crop" => json(op_set_crop(app, need(a.id, "id")?, need(a.idx, "idx")?, a.crop)?),
         "set_eyes" => json(op_set_eyes(app, need(a.id, "id")?, need(a.idx, "idx")?, need(a.face, "face")?, a.open)?),
         "big_preview" => json(op_big_preview(app, need(a.id, "id")?, need(a.idx, "idx")?, a.full)?),
         "list_dir" => json(web::list_dir(a.path.as_deref())?),
@@ -1650,6 +1688,7 @@ fn main() {
                 x.name = s.name;
                 x.source = s.source;
                 x.overrides = s.overrides;
+                x.crops = s.crops;
                 x.last_export = s.last_export;
                 sessions.insert(x.id, x);
             }

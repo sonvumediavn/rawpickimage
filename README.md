@@ -102,6 +102,17 @@ cả sao gắn sau trong Lightroom/Bridge qua file .xmp) và ảnh khóa bảo v
 thanh công cụ hiện ô ★: «Chỉ lọc ảnh có sao» (bỏ ảnh không sao, AI lọc tiếp trong số ảnh có sao: mắt
 nhắm, mờ, trùng…) hoặc «Lấy luôn ảnh có sao» (chọn đúng những ảnh bạn gắn sao).
 
+**Ảnh chụp liên tiếp**: các tấm trong một loạt được gom theo hình (cùng cảnh, cùng người, xê dịch hay zoom
+nhẹ vẫn là một loạt), mỗi loạt chỉ giữ tấm đẹp nhất (hoặc số tấm bạn đặt ở «Mỗi loạt giữ»).
+
+**Crop ảnh** (phím C trong trình xem ảnh): kéo khung giữ lại, chọn tỉ lệ (tự do, như gốc, 1:1, 3:2, 4:3,
+4:5, 16:9, 9:16…), Enter lưu. Ảnh gốc không bao giờ bị sửa; chỉ bản xuất được cắt:
+- JPEG: cắt thẳng trên dữ liệu nén, phần giữ lại giống từng điểm ảnh của file gốc, không nén lại, giữ EXIF
+  và màu. Mép trái/trên có thể rộng hơn khung vài điểm ảnh (khối 8–16 px của JPEG), không bao giờ hẹp hơn.
+- RAW: file RAW chép nguyên vẹn, kèm khung crop trong file `.xmp` (Lightroom, Camera Raw, Bridge mở ra
+  là đã crop, vẫn chỉnh lại được) và một JPEG đã cắt từ ảnh JPEG cỡ lớn máy ảnh nhúng trong RAW. Chọn
+  kiểu ở mục «Khi xuất». Có file JPEG đi kèm RAW thì JPEG đó được cắt, không tạo thêm.
+
 **Học từ show cũ…**: chọn thư mục một show đã lọc xong, xếp kiểu gì cũng được. App tự nhận ra thư mục
 ảnh bạn đã chọn bằng hình (cùng giờ chụp và trông giống nhau, kể cả đã đổi tên, chỉnh màu, xuất lại),
 coi ảnh gốc có bản trong đó là ảnh bạn giữ, còn lại là ảnh bỏ, rồi học luôn cả show. Chỉ có ảnh đã chọn

@@ -87,6 +87,13 @@
         <label class="chk"><input type="checkbox" id="expReview"> Gồm cả ảnh «Cần xem lại»</label>
         <label class="chk"><input type="checkbox" id="expRejected"> Gồm cả ảnh bị loại (chia theo lý do)</label>
         <label class="chk"><input type="checkbox" id="expReport"> Kèm file báo cáo (bao-cao.csv, tong-ket.txt)</label>
+        <label class="field">Ảnh RAW đã crop
+          <select id="expRawCrop">
+            <option value="both">RAW gốc + khung crop cho Lightroom + JPEG đã cắt</option>
+            <option value="xmp">RAW gốc + khung crop cho Lightroom (.xmp)</option>
+            <option value="jpeg">RAW gốc + JPEG đã cắt</option>
+          </select>
+        </label>
       </div>
       <p class="note" id="expNote"></p>
     </section>
@@ -193,6 +200,21 @@
         <button class="btn" data-d="review">Xem lại</button>
         <button class="btn" data-d="rejected" title="Phím X">Loại <kbd>X</kbd></button>
         <button class="btn" data-d="ai" title="Phím U">Theo AI <kbd>U</kbd></button>
+      </div>
+      <div class="dcrop" id="dcrop">
+        <div class="row" id="cropIdle">
+          <button class="btn sm" id="cropStart" title="Cắt bớt phần thừa khi xuất (phím C)">✂ Crop <kbd>C</kbd></button>
+          <span class="note" id="cropInfo"></span>
+          <button class="btn sm" id="cropClear" hidden title="Xuất nguyên khung như ảnh gốc">Bỏ crop</button>
+        </div>
+        <div id="cropEdit" hidden>
+          <div class="row">
+            <select id="cropAspect" aria-label="Tỉ lệ khung"></select>
+            <button class="btn sm on" id="cropSave">Lưu <kbd>Enter</kbd></button>
+            <button class="btn sm" id="cropCancel">Huỷ <kbd>Esc</kbd></button>
+          </div>
+          <p class="note" id="cropNote"></p>
+        </div>
       </div>
       <div class="deyes" id="deyes" hidden></div>
       <div id="dcrit"></div>

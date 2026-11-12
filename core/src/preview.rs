@@ -180,6 +180,14 @@ fn raw_preview_bytes(path: &Path) -> Result<(Vec<u8>, Exif)> {
     Ok((bytes, exif))
 }
 
+/// The largest JPEG embedded in a RAW file, untouched, and the orientation that makes it upright.
+pub fn embedded_jpeg(path: &Path) -> Result<(Vec<u8>, u16)> {
+    let (bytes, exif) = raw_preview_bytes(path)?;
+    let own = exif::jpeg_exif(&bytes).unwrap_or_default();
+    let o = own.orientation.filter(|&o| o > 1).or(exif.orientation).unwrap_or(1);
+    Ok((bytes, o))
+}
+
 /// Decode a JPEG so that its long side is at least `min_long` (DCT scaling when larger).
 fn decode_jpeg_scaled(bytes: &[u8], min_long: u32) -> Result<(RgbImage, u32, u32)> {
     let mut dec = jpeg_decoder::Decoder::new(std::io::Cursor::new(bytes));
