@@ -120,7 +120,11 @@ T.event.listen("sessions-changed", async () => {
   renderTabs();
   renderMain();
 });
-$("btnCancel").onclick = () => invoke("cancel", { id: null });
+$("btnCancel").onclick = () => {
+  invoke("cancel", { id: null });
+  // Past the point where the work can stop, don't keep the window locked.
+  setTimeout(() => { if (busyOn) { busy(false); toast("Đã dừng chờ. Phần đang làm dở sẽ tự xong ở nền."); } }, 2500);
+};
 
 // ---------------------------------------------------------------- settings rail
 

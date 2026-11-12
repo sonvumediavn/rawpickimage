@@ -228,6 +228,12 @@ impl App {
 
     fn profile_view(&self, name: &str) -> ProfileView {
         let p = self.store().load(name);
+        // Read the settings first: a lock taken inside the literal below would still be held
+        // when the next field locks again, and the app would freeze.
+        let (weight, shared) = {
+            let g = self.global.lock().unwrap();
+            (g.prefs.settings.learned_weight, g.sync_dir.as_ref().is_some_and(|d| d.is_dir()))
+        };
         ProfileView {
             name: p.name.clone(),
             samples: p.samples.len(),
@@ -237,9 +243,9 @@ impl App {
             explain: p.explain(),
             min_samples: learn::MIN_SAMPLES,
             manual: p.manual_count(),
-            trust: p.trust(self.global.lock().unwrap().prefs.settings.learned_weight),
+            trust: p.trust(weight),
             seen: p.seen_count(),
-            shared: self.global.lock().unwrap().sync_dir.as_ref().is_some_and(|d| d.is_dir()),
+            shared,
         }
     }
 
@@ -1026,6 +1032,7 @@ fn op_learn_show(app: &Arc<App>, path: String, profile: String) -> Result<Lesson
         if samples.is_empty() {
             return Err("Không thấy ảnh nào đọc được trong thư mục này".into());
         }
+        on_step(lesson.photos, lesson.photos, "Đang học theo lựa chọn của bạn");
         let store = app.store();
         let mut p = store.load(&profile);
         p.add(samples);
@@ -1733,4 +1740,79 @@ fn main() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_app(dir: &Path) -> Arc<App> {
+        let (analyzer, face_warning) = Analyzer::new(None, None);
+        Arc::new(App {
+            data_dir: dir.to_path_buf(),
+            analyzer: Mutex::new(analyzer),
+            face_warning,
+            sessions: Mutex::new(BTreeMap::new()),
+            next_id: AtomicU32::new(1),
+            global: Mutex::new(Global::default()),
+            card_cancel: AtomicBool::new(false),
+            card_busy: AtomicBool::new(false),
+            handle: std::sync::OnceLock::new(),
+            web: web::Web::default(),
+            eyes: Mutex::new(EyeBook::default()),
+            share_due: Mutex::new(Default::default()),
+        })
+    }
+
+    /// Runs `f` on its own thread and fails instead of hanging.
+    fn within<T: Send + 'static>(secs: u64, f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(secs)).expect("hung")
+    }
+
+    #[test]
+    fn learning_an_old_show_finishes() {
+        let d = std::env::temp_dir().join(format!("rawpick-app-test-{}", rand_u32()));
+        let show = d.join("show");
+        let picks = show.join("gui khach");
+        std::fs::create_dir_all(&picks).unwrap();
+        for i in 0..6u32 {
+            let img = image::RgbImage::from_fn(320, 240, |x, y| image::Rgb([((x * (i + 1)) % 256) as u8, ((y * 3 + i * 40) % 256) as u8, (i * 37 % 256) as u8]));
+            let b = metrics::encode_jpeg(&img, 90).unwrap();
+            std::fs::write(show.join(format!("IMG_{i}.JPG")), &b).unwrap();
+            if i % 2 == 0 {
+                std::fs::write(picks.join(format!("IMG_{i}.JPG")), &b).unwrap();
+            }
+        }
+        let app = test_app(&d.join("data"));
+        let a = app.clone();
+        let path = show.display().to_string();
+        let r = within(60, move || dispatch(&a, "learn_show", serde_json::json!({ "path": path, "name": "Sự kiện chung" })));
+        assert!(r.is_ok(), "{r:?}");
+        let a = app.clone();
+        within(10, move || dispatch(&a, "profile_info", serde_json::json!({ "name": "Sự kiện chung" }))).unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn analysing_a_folder_finishes() {
+        let d = std::env::temp_dir().join(format!("rawpick-app-test-{}", rand_u32()));
+        let show = d.join("show");
+        std::fs::create_dir_all(&show).unwrap();
+        let img = image::RgbImage::from_fn(320, 240, |x, y| image::Rgb([(x % 256) as u8, (y % 256) as u8, 90]));
+        std::fs::write(show.join("IMG_1.JPG"), metrics::encode_jpeg(&img, 90).unwrap()).unwrap();
+        let app = test_app(&d.join("data"));
+        // Opening a folder in a session also reports what the AI has learned.
+        let a = app.clone();
+        let path = show.display().to_string();
+        let v = within(60, move || {
+            let m = dispatch(&a, "new_session", serde_json::Value::Null).unwrap();
+            dispatch(&a, "analyze", serde_json::json!({ "id": m["id"], "source": path }))
+        });
+        assert!(v.is_ok(), "{v:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }
