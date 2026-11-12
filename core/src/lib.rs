@@ -5,6 +5,7 @@ pub mod metrics;
 pub mod preview;
 pub mod faces;
 pub mod eyes;
+pub mod faceid;
 pub mod visual;
 pub mod analyze;
 pub mod cull;

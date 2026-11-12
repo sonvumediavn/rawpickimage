@@ -446,6 +446,11 @@ fn lead_mouth_open(a: &Analysis) -> bool {
 /// same picture (it is not fooled by a turned head, a small pan or zoom, or a flash that did not
 /// fire) with the same people in the same places. `gap` = seconds between them, when known.
 fn same_shot(a: &Analysis, b: &Analysis, gap: Option<f64>) -> bool {
+    // Someone at the same spot is another person (the next student shaking the same leader's
+    // hand, the next group): never one shot, however alike the pictures are.
+    if other_people(a, b) {
+        return false;
+    }
     let content = crate::visual::similarity_content(&a.embed, &b.embed);
     // Same stage, same backdrop, other people (award groups called up one after another):
     // the picture looks alike, even to the pixel fingerprint, the people do not.
@@ -487,6 +492,32 @@ fn same_people_layout(a: &Analysis, b: &Analysis) -> bool {
     matched as f32 >= 0.6 * hi as f32
 }
 
+/// Whether a face in one frame is, by its fingerprint, surely someone who is not in the other
+/// frame, while a face stands at the same spot there. Only faces seen well enough count: large,
+/// facing the camera.
+fn other_people(a: &Analysis, b: &Analysis) -> bool {
+    use crate::faceid::{similarity, OTHER_PERSON, SAME_PERSON};
+    let (fa, fb) = (known_faces(a), known_faces(b));
+    if fa.is_empty() || fb.is_empty() {
+        return false;
+    }
+    let centre = |f: &crate::faces::FaceInfo| (f.bbox[0] + f.bbox[2] / 2.0, f.bbox[1] + f.bbox[3] / 2.0);
+    let frontal = |f: &crate::faces::FaceInfo| f.yaw.abs() < 0.3 && !f.turned;
+    let stranger = |f: &crate::faces::FaceInfo, others: &[&crate::faces::FaceInfo]| {
+        if !frontal(f) || others.iter().any(|g| similarity(&f.id, &g.id).unwrap_or(0.0) >= SAME_PERSON) {
+            return false;
+        }
+        let (cx, cy) = centre(f);
+        let near: Vec<_> = others.iter().filter(|g| frontal(g) && (centre(g).0 - cx).abs() < 0.1 && (centre(g).1 - cy).abs() < 0.12).collect();
+        !near.is_empty() && near.iter().all(|g| similarity(&f.id, &g.id).unwrap_or(1.0) < OTHER_PERSON)
+    };
+    fa.iter().any(|f| stranger(f, &fb)) || fb.iter().any(|f| stranger(f, &fa))
+}
+
+fn known_faces(x: &Analysis) -> Vec<&crate::faces::FaceInfo> {
+    x.people.faces.iter().filter(|f| f.main && !f.small && !f.id.is_empty()).collect()
+}
+
 /// Image-model similarity for frames a few seconds apart to count as one shot (measured: re-framed,
 /// rotated, brightened copies of one photo score 0.84–0.99, different photos below 0.4).
 const SAME_SHOT: f32 = 0.86;
@@ -502,6 +533,8 @@ const SAME_PICTURE: f32 = 0.9;
 const SERIES_SPAN: f64 = 45.0;
 /// A shot taken this many times was meant: its best frame is kept when usable.
 const MEANT_SHOT: usize = 3;
+/// The same for a frame with two people or more.
+const MEANT_GROUP: usize = 2;
 
 /// The rules want this photo looked at by Sơn rather than picked (mouth wide open, a speaker
 /// looking down).
@@ -579,7 +612,10 @@ fn dedupe(items: &[Option<&Analysis>], out: &mut [Verdict], order: &[usize], s: 
             }
         }
         // Several frames of one shot: Sơn meant it. Keep the best one if it is usable.
-        if s.options.keep_each_shot && g.len() >= MEANT_SHOT && !g.iter().any(|&i| out[i].decision == Decision::Selected) {
+        // People called up in turn (awards, gifts, group photos) are often shot only twice each.
+        let group = items[best].is_some_and(|a| a.people.faces.iter().filter(|f| f.main && !f.small).count() >= 2);
+        let meant = if group { MEANT_GROUP } else { MEANT_SHOT };
+        if s.options.keep_each_shot && g.len() >= meant && !g.iter().any(|&i| out[i].decision == Decision::Selected) {
             let usable = items[best].is_some_and(|a| !a.people.closed_eyes && !a.people.blurred_face && !flagged(a, s));
             let near = out[best].score >= s.threshold - s.review_margin;
             if usable && near && matches!(out[best].decision, Decision::Review | Decision::Rejected(Reason::LowScore)) {
@@ -847,6 +883,44 @@ mod tests {
         let v = cull(&refs, &Settings::default(), None);
         let picked: Vec<&str> = v.iter().filter(|x| x.decision == Decision::Selected).map(|x| g[x.idx].name.as_str()).collect();
         assert_eq!(picked, vec!["g0-2", "g1-2", "g2-2"], "{:?}", v.iter().map(|x| (g[x.idx].name.clone(), x.decision, x.series, x.score)).collect::<Vec<_>>());
+    }
+
+    fn person(k: u32) -> Vec<i8> {
+        let v: Vec<f32> = (0..crate::faceid::DIM).map(|i| ((i as u32).wrapping_mul(2654435761).wrapping_add(k.wrapping_mul(40503)) as f32 * 1e-3).sin()).collect();
+        crate::faceid::quantise(&v).unwrap()
+    }
+
+    #[test]
+    fn diplomas_handed_one_after_another_keep_one_photo_each() {
+        // The same leader on the right hands a diploma to student after student at the same
+        // spot, each shot twice, a few seconds apart: the pictures are practically identical,
+        // only the student's face tells them apart.
+        let ids: Vec<Vec<i8>> = (0..6).map(person).collect();
+        assert!(crate::faceid::similarity(&ids[0], &ids[1]).unwrap() < crate::faceid::OTHER_PERSON);
+        let mut g = vec![];
+        for st in 1..6u32 {
+            for k in 0..2 {
+                let mut a = photo(&format!("sv{st}-{k}"), 300.0 + st as f64 * 4.0 + k as f64 * 0.8, [8.2 + k as f32 * 0.1; 5], 4242);
+                a.embed = look(3, 0.99, st * 10 + k);
+                let mut leader = face(0.6);
+                leader.id = ids[0].clone();
+                let mut student = face(0.35);
+                student.id = ids[st as usize].clone();
+                a.people.faces = vec![student, leader];
+                g.push(a);
+            }
+        }
+        let refs: Vec<_> = g.iter().map(Some).collect();
+        let v = cull(&refs, &Settings::default(), None);
+        let picked: Vec<&str> = v.iter().filter(|x| x.decision == Decision::Selected).map(|x| g[x.idx].name.as_str()).collect();
+        assert_eq!(picked, vec!["sv1-1", "sv2-1", "sv3-1", "sv4-1", "sv5-1"], "{:?}", v.iter().map(|x| (g[x.idx].name.clone(), x.decision, x.series)).collect::<Vec<_>>());
+
+        // Without fingerprints (older analysis) they would all be one shot.
+        for a in g.iter_mut() {
+            a.people.faces.iter_mut().for_each(|f| f.id.clear());
+        }
+        let refs: Vec<_> = g.iter().map(Some).collect();
+        assert_eq!(cull(&refs, &Settings::default(), None).iter().filter(|x| x.decision == Decision::Selected).count(), 1);
     }
 
     #[test]

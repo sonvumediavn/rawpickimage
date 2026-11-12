@@ -29,7 +29,7 @@ struct Cache {
 }
 
 /// Bump when the analysis measures something new, so cached results are redone once.
-const ANALYSIS_VERSION: u32 = 5;
+const ANALYSIS_VERSION: u32 = 6;
 
 fn cache_key(p: &Path) -> Option<String> {
     let m = std::fs::metadata(p).ok()?;

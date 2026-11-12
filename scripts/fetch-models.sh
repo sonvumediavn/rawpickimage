@@ -51,3 +51,19 @@ if [ "$sum" != "$want" ]; then
   echo "sha256 của mô hình mắt không khớp (mong đợi $want)" >&2
   exit 1
 fi
+
+# Mô hình nhận ra từng người SFace (Apache-2.0, OpenCV Zoo), 39 MB: tách các nhóm/người lên sân khấu
+# lần lượt (trao bằng, trao quà) dù cảnh giống hệt nhau.
+f=models/face_recognition_sface_2021dec.onnx
+url=https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx
+want=0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79
+if [ ! -s "$f" ]; then
+  curl -fL --retry 4 --retry-delay 3 -o "$f.tmp" "$url"
+  mv "$f.tmp" "$f"
+fi
+if command -v sha256sum >/dev/null; then sum=$(sha256sum "$f" | cut -d' ' -f1); else sum=$(shasum -a 256 "$f" | cut -d' ' -f1); fi
+echo "SFace: $(wc -c < "$f") byte, sha256 $sum"
+if [ "$sum" != "$want" ]; then
+  echo "sha256 của SFace không khớp (mong đợi $want)" >&2
+  exit 1
+fi

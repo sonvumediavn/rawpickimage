@@ -122,8 +122,12 @@ Tích «Chép xong thì cho AI lọc tiếp các ảnh này» nếu muốn AI ch
 **Ảnh chụp liên tiếp**: các tấm trong một loạt được gom theo hình (cùng cảnh, cùng người, xê dịch hay zoom
 nhẹ vẫn là một loạt), mỗi loạt chỉ giữ tấm đẹp nhất (hoặc số tấm bạn đặt ở «Mỗi loạt giữ»). App so cả vị
 trí và số người trong khung: 6 nhóm lần lượt lên nhận giải trên cùng sân khấu là 6 cảnh khác nhau, không
-gộp làm một. Ảnh đông người ưu tiên tấm có nhiều người mở mắt và ngẩng đầu nhất.
-Cảnh nào bạn bấm từ 3 tấm trở lên mà AI chưa chọn tấm nào, AI giữ tấm đẹp nhất nếu dùng được (không
+gộp làm một. App còn **nhận ra từng người** (mô hình SFace, chạy trên CPU, cho tối đa 6 khuôn mặt lớn
+nhất mỗi ảnh): sinh viên lần lượt lên nhận bằng từ cùng một lãnh đạo, đứng đúng một chỗ, chụp cách nhau
+vài giây, vẫn là mỗi người một cảnh, mỗi cảnh giữ tấm đẹp nhất. Ảnh đông người ưu tiên tấm có nhiều
+người mở mắt và ngẩng đầu nhất.
+Cảnh nào bạn bấm từ 3 tấm trở lên (cảnh có từ 2 người: từ 2 tấm) mà AI chưa chọn tấm nào, AI giữ tấm
+đẹp nhất nếu dùng được (không
 nhắm mắt, không mờ mặt), để mỗi nhóm có một ảnh. Nói với AI «mỗi nhóm nhận giải giữ 1 ảnh» để bật lại
 nếu đã tắt.
 

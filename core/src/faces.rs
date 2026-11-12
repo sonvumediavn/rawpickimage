@@ -189,6 +189,9 @@ pub struct FaceInfo {
     /// Marks Sơn set himself on this face.
     #[serde(default)]
     pub hand_marks: Vec<crate::eyes::Mark>,
+    /// Who this is: face fingerprint ([`crate::faceid`]), only for the main faces.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub id: Vec<i8>,
 }
 
 impl FaceInfo {
@@ -321,6 +324,21 @@ pub struct EyeNet;
 fn eye_net_p(net: Option<&EyeNet>, img: &RgbImage, e: (f32, f32), side: f32) -> Option<f32> {
     net?.p_closed(img, e.0, e.1, side)
 }
+/// Optional face-recognition network, only in builds with the face models.
+#[cfg(feature = "faces")]
+pub type IdNet = crate::faceid::FaceId;
+#[cfg(not(feature = "faces"))]
+pub struct IdNet;
+
+#[cfg(feature = "faces")]
+fn face_id(net: Option<&IdNet>, img: &RgbImage, lm: &[(f32, f32); 5]) -> Vec<i8> {
+    net.and_then(|n| n.describe(img, lm)).unwrap_or_default()
+}
+#[cfg(not(feature = "faces"))]
+fn face_id(_: Option<&IdNet>, _: &RgbImage, _: &[(f32, f32); 5]) -> Vec<i8> {
+    vec![]
+}
+
 #[cfg(not(feature = "faces"))]
 fn eye_net_p(_: Option<&EyeNet>, _: &RgbImage, _: (f32, f32), _: f32) -> Option<f32> {
     None
@@ -329,19 +347,24 @@ fn eye_net_p(_: Option<&EyeNet>, _: &RgbImage, _: (f32, f32), _: f32) -> Option<
 /// Measure every detected face on the high-resolution image `img`/`g`, then judge it with the
 /// starting eye rule.
 pub fn assess(img: &RgbImage, g: &Gray, raw: &[RawFace]) -> People {
-    assess_with(img, g, raw, None)
+    assess_with(img, g, raw, None, None)
 }
 
-pub fn assess_with(img: &RgbImage, g: &Gray, raw: &[RawFace], net: Option<&EyeNet>) -> People {
+pub fn assess_with(img: &RgbImage, g: &Gray, raw: &[RawFace], net: Option<&EyeNet>, ids: Option<&IdNet>) -> People {
     let (w, h) = (img.width() as f32, img.height() as f32);
     if raw.is_empty() {
         return People { notes: vec!["Không thấy khuôn mặt nào, tiêu chí này không tính vào điểm".into()], ..Default::default() };
     }
     let max_area = raw.iter().map(|f| f.w * f.h).fold(0f32, f32::max);
     let dist = |a: (f32, f32), b: (f32, f32)| ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt();
+    // Fingerprint the largest main faces only (cost grows with each face).
+    let mut big: Vec<usize> = (0..raw.len()).filter(|&i| raw[i].w >= crate::faceid::MIN_SIDE && raw[i].w * raw[i].h >= max_area * 0.25).collect();
+    big.sort_by(|&a, &b| (raw[b].w * raw[b].h).partial_cmp(&(raw[a].w * raw[a].h)).unwrap());
+    big.truncate(crate::faceid::MAX_FACES);
     let mut faces: Vec<FaceInfo> = raw
         .iter()
-        .map(|f| {
+        .enumerate()
+        .map(|(i, f)| {
             let (re, le, nose) = (f.lm[0], f.lm[1], f.lm[2]);
             let iod = dist(re, le).max(1.0);
             let ew = iod * 0.47;
@@ -410,6 +433,7 @@ pub fn assess_with(img: &RgbImage, g: &Gray, raw: &[RawFace], net: Option<&EyeNe
                 turned: false,
                 down: false,
                 hand_marks: vec![],
+                id: if big.contains(&i) { face_id(ids, img, &f.lm) } else { vec![] },
             }
         })
         .collect();

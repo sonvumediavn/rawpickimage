@@ -46,5 +46,13 @@ fn finds_the_face_and_tells_open_from_closed_eyes() {
     let g = &closed.people.faces[0];
     eprintln!("nhắm: mạng mắt {:?}, điểm ảnh {:.2}, khả năng nhắm {:.2}", g.eye_p, g.eye_open, g.p_closed);
     assert!(closed.people.closed_eyes, "{:?}", closed.people.faces);
+    // Same person with the eyes closed: the face fingerprint still says it is her.
+    if !f.id.is_empty() {
+        let same = rawpick_core::faceid::similarity(&f.id, &g.id).unwrap();
+        eprintln!("cùng người: {same:.3}");
+        assert!(same >= rawpick_core::faceid::SAME_PERSON, "{same}");
+    } else if std::env::var("RAWPICK_REQUIRE_MODEL").as_deref() == Ok("1") {
+        panic!("thiếu mô hình nhận diện người {}", rawpick_core::faceid::MODEL);
+    }
     assert!(closed.scores.people.unwrap() < open.scores.people.unwrap());
 }

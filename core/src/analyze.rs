@@ -81,6 +81,8 @@ pub struct Analyzer {
     pub visual: Option<crate::visual::Embedder>,
     #[cfg(feature = "faces")]
     pub eyes: Option<crate::eyes::EyeModel>,
+    #[cfg(feature = "faces")]
+    pub ids: Option<crate::faceid::FaceId>,
     pub thumbs_dir: Option<PathBuf>,
 }
 
@@ -107,7 +109,12 @@ impl Analyzer {
                 .map(|d| d.join(crate::eyes::MODEL))
                 .filter(|p| p.exists())
                 .and_then(|p| crate::eyes::EyeModel::load(&p).ok());
-            (Self { faces: det, visual, eyes, thumbs_dir }, warn)
+            let ids = face_model
+                .and_then(|p| p.parent())
+                .map(|d| d.join(crate::faceid::MODEL))
+                .filter(|p| p.exists())
+                .and_then(|p| crate::faceid::FaceId::load(&p).ok());
+            (Self { faces: det, visual, eyes, ids, thumbs_dir }, warn)
         }
         #[cfg(not(feature = "faces"))]
         {
@@ -142,7 +149,7 @@ impl Analyzer {
         #[cfg(feature = "faces")]
         if let (Some(det), false) = (&self.faces, ruined) {
             if let Ok(raw) = det.detect(&hi, 0.6) {
-                people = faces::assess_with(&hi, &ghi, &raw, self.eyes.as_ref());
+                people = faces::assess_with(&hi, &ghi, &raw, self.eyes.as_ref(), self.ids.as_ref());
                 faces_checked = true;
             }
         }
