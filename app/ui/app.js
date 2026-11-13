@@ -956,6 +956,7 @@ function wireResults() {
   };
   $("btnExport").onclick = doExportShow;
   $("btnLearnShow").onclick = doLearnShow;
+  $("btnLearnPair").onclick = doLearnPair;
   $("btnExportOther").onclick = doExport;
   $("optStars").onchange = () => {
     const v = $("optStars").value;
@@ -1087,6 +1088,70 @@ async function doLearnShow() {
       15000
     );
     if (st.sid) { const v = await invoke("get_session", { id: st.sid }).catch(() => null); if (v) { st.views[st.sid] = v; st.session = null; renderMain(); } }
+  } catch (e) {
+    busy(false);
+    toast(esc(e));
+  }
+}
+
+/** Ask which open session holds the originals and which the picks. Resolves to [orig, picks] or null. */
+function askPair(ready) {
+  return new Promise((resolve) => {
+    // Bigger session = originals, smaller = picks, as a first guess.
+    const bySize = [...ready].sort((a, b) => (b.summary ? b.summary.total : 0) - (a.summary ? a.summary.total : 0));
+    const opts = (sel) => ready.map((m) => `<option value="${m.id}" ${m.id === sel ? "selected" : ""}>${esc(m.name)} (${m.summary ? m.summary.total : 0} ảnh)</option>`).join("");
+    const wrap = document.createElement("div");
+    wrap.className = "modal ask";
+    wrap.innerHTML = `<form class="box">
+      <h3>Học từ 2 phiên đang mở</h3>
+      <p class="asktext">AI so từng ảnh bằng hình và giờ chụp (đổi tên, chỉnh màu, xuất lại vẫn nhận ra) để biết bạn giữ ảnh gốc nào, bỏ ảnh nào, rồi học theo cho loại sự kiện «${esc(st.prefs.profile)}». Ảnh không bị thay đổi.</p>
+      <label class="field">Phiên ảnh gốc (cả show)<select id="pairOrig">${opts(bySize[0].id)}</select></label>
+      <label class="field">Phiên ảnh bạn đã chọn<select id="pairPick">${opts(bySize[bySize.length - 1].id)}</select></label>
+      <p class="asktext err" id="pairErr" hidden>Chọn hai phiên khác nhau.</p>
+      <div class="row2 end"><button type="button" class="btn" data-no>Huỷ</button><button type="submit" class="btn primary">Học</button></div>
+    </form>`;
+    const done = (v) => { wrap.remove(); document.removeEventListener("keydown", onKey, true); resolve(v); };
+    const onKey = (e) => { if (e.key === "Escape") { e.stopPropagation(); done(null); } };
+    wrap.querySelector("form").onsubmit = (e) => {
+      e.preventDefault();
+      const o = +wrap.querySelector("#pairOrig").value, p = +wrap.querySelector("#pairPick").value;
+      if (o === p) { wrap.querySelector("#pairErr").hidden = false; return; }
+      done([o, p]);
+    };
+    wrap.querySelector("[data-no]").onclick = () => done(null);
+    wrap.onclick = (e) => { if (e.target === wrap) done(null); };
+    document.addEventListener("keydown", onKey, true);
+    document.body.append(wrap);
+    wrap.querySelector("[type=submit]").focus();
+  });
+}
+
+async function doLearnPair() {
+  const ready = st.metas.filter((m) => m.source && m.phase === "ready");
+  if (ready.length < 2) {
+    toast("Mở hai phiên trước: một phiên thư mục ảnh gốc của show và một phiên thư mục ảnh bạn đã chọn từ show đó, chờ cả hai phân tích xong rồi bấm lại.", 9000);
+    return;
+  }
+  const pair = await askPair(ready);
+  if (!pair) return;
+  busy(true, "Đang so ảnh đã chọn với ảnh gốc…");
+  try {
+    const r = await invoke("learn_pair", { id: pair[0], other: pair[1], name: st.prefs.profile });
+    busy(false);
+    renderProfile(r.profile);
+    const l = r.lesson;
+    toast(
+      `Đã học ${l.kept + l.dropped} ảnh: bạn giữ ${l.kept}, bỏ ${l.dropped}.` +
+        (l.unmatched ? ` Có ${l.unmatched} ảnh đã chọn không tìm thấy trong phiên gốc (có thể của show khác hoặc đã cắt khác nhiều).` : "") +
+        ` Giờ AI chọn ${r.ai_selected} ảnh ở phiên gốc, trúng ${r.ai_agrees}/${l.kept} ảnh bạn đã chọn.`,
+      15000
+    );
+    // Every open session of this event type was re-decided: drop cached views, reload this one.
+    for (const k of Object.keys(st.views)) delete st.views[k];
+    const v = await invoke("get_session", { id: st.sid }).catch(() => null);
+    if (v) st.views[st.sid] = v;
+    st.session = null;
+    renderMain();
   } catch (e) {
     busy(false);
     toast(esc(e));

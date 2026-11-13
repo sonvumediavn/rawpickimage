@@ -9,7 +9,7 @@
 //! kept, the other originals were dropped. With no originals around, every photo counts as a
 //! pick.
 
-use crate::analyze::{self, Analyzer};
+use crate::analyze::{self, Analysis, Analyzer};
 use crate::learn::Sample;
 use crate::pipeline::{self, Item, Progress};
 use crate::visual;
@@ -40,6 +40,8 @@ pub struct Lesson {
     pub only_picks: bool,
     /// Photos that could not be read.
     pub unreadable: usize,
+    /// Picks not found among the originals (two-session lessons only).
+    pub unmatched: usize,
 }
 
 /// Look at a whole show and return what it teaches.
@@ -66,13 +68,10 @@ pub fn lessons(items: &[Item]) -> (Vec<Sample>, Lesson) {
                 if folders[j] == folders[i] {
                     continue;
                 }
-                let b = other.analysis.as_ref().unwrap();
-                let sim = visual::similarity_content(&a.embed, &b.embed);
-                let same_time = matches!((a.time, b.time), (Some(x), Some(y)) if (x - y).abs() <= SAME_TIME);
-                let same_name = a.name.rsplit_once('.').map(|x| x.0.to_lowercase()) == b.name.rsplit_once('.').map(|x| x.0.to_lowercase());
-                let hit = (same_time && (sim >= SIM_WITH_TIME || a.embed.is_empty() || b.embed.is_empty() || same_name)) || sim >= SIM_ALONE;
-                if hit && best.is_none_or(|(_, s)| sim > s) {
-                    best = Some((j, sim));
+                if let Some(sim) = copy_of(a, other.analysis.as_ref().unwrap()) {
+                    if best.is_none_or(|(_, s)| sim > s) {
+                        best = Some((j, sim));
+                    }
                 }
             }
             best.map(|(j, _)| j)
@@ -134,10 +133,66 @@ pub fn lessons(items: &[Item]) -> (Vec<Sample>, Lesson) {
     (samples, lesson)
 }
 
+/// How alike two photos look when one is a copy of the other (same picture, maybe renamed,
+/// re-exported or colour-graded); None when they are not the same picture.
+fn copy_of(a: &Analysis, b: &Analysis) -> Option<f32> {
+    let sim = visual::similarity_content(&a.embed, &b.embed);
+    let same_time = matches!((a.time, b.time), (Some(x), Some(y)) if (x - y).abs() <= SAME_TIME);
+    let same_name = a.name.rsplit_once('.').map(|x| x.0.to_lowercase()) == b.name.rsplit_once('.').map(|x| x.0.to_lowercase());
+    let hit = (same_time && (sim >= SIM_WITH_TIME || a.embed.is_empty() || b.embed.is_empty() || same_name)) || sim >= SIM_ALONE;
+    hit.then_some(sim)
+}
+
+/// What Sơn picked out of two open sessions: `originals` is the whole show, `picks` the photos
+/// he chose from it (renamed, re-exported or graded, it doesn't matter). Returns the lessons and,
+/// for each original, whether he kept it. `Lesson::unmatched` counts picks not found among the
+/// originals.
+pub fn pair(originals: &[Item], picks: &[Item]) -> (Vec<Sample>, Lesson, Vec<bool>) {
+    let ok: Vec<(usize, &Analysis)> = originals.iter().enumerate().filter_map(|(i, it)| it.analysis.as_ref().map(|a| (i, a))).collect();
+    let chosen: Vec<&Analysis> = picks.iter().filter_map(|it| it.analysis.as_ref()).collect();
+    let mut lesson = Lesson {
+        photos: ok.len(),
+        unreadable: originals.len() - ok.len() + picks.len() - chosen.len(),
+        pick_folders: picks.iter().filter_map(|it| it.path.parent().map(Path::to_path_buf)).collect::<std::collections::BTreeSet<_>>().into_iter().collect(),
+        ..Default::default()
+    };
+    let twin: Vec<Option<usize>> = chosen
+        .par_iter()
+        .map(|p| {
+            let mut best: Option<(usize, f32)> = None;
+            for (k, (_, a)) in ok.iter().enumerate() {
+                if let Some(sim) = copy_of(p, a) {
+                    if best.is_none_or(|(_, s)| sim > s) {
+                        best = Some((k, sim));
+                    }
+                }
+            }
+            best.map(|(k, _)| k)
+        })
+        .collect();
+    let mut kept = vec![false; originals.len()];
+    for t in &twin {
+        match t {
+            Some(k) => kept[ok[*k].0] = true,
+            None => lesson.unmatched += 1,
+        }
+    }
+    let mut samples = vec![];
+    for (i, a) in &ok {
+        let k = kept[*i];
+        if k {
+            lesson.kept += 1;
+        } else {
+            lesson.dropped += 1;
+        }
+        samples.push(Sample::new(originals[*i].path.display().to_string(), a, k, k, true));
+    }
+    (samples, lesson, kept)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analyze::Analysis;
 
     fn look(seed: u32) -> Vec<i8> {
         let f: Vec<f32> = (0..1280u32).map(|i| ((i.wrapping_mul(2654435761).wrapping_add(seed.wrapping_mul(40503))) % 1000) as f32 / 100.0).collect();
@@ -171,5 +226,18 @@ mod tests {
         let items: Vec<Item> = (0..5u32).map(|i| item(&format!("/da chon/{i}.jpg"), None, i)).collect();
         let (samples, l) = lessons(&items);
         assert!(l.only_picks && samples.iter().all(|s| s.keep) && l.kept == 5);
+    }
+
+    #[test]
+    fn two_sessions_teach_which_originals_were_kept() {
+        let originals: Vec<Item> = (0..10u32).map(|i| item(&format!("/show/IMG_{i}.CR3"), Some(1000.0 + i as f64 * 5.0), i)).collect();
+        let mut picks: Vec<Item> = [1u32, 4, 8].iter().map(|i| item(&format!("/da chon/hanu_{i}.jpg"), Some(1000.0 + *i as f64 * 5.0), *i)).collect();
+        // A photo from another show slipped into the picks.
+        picks.push(item("/da chon/khac.jpg", Some(99999.0), 777));
+        let (samples, l, kept) = pair(&originals, &picks);
+        assert_eq!((l.kept, l.dropped, l.unmatched), (3, 7, 1));
+        assert_eq!(kept.iter().enumerate().filter(|x| *x.1).map(|x| x.0).collect::<Vec<_>>(), vec![1, 4, 8]);
+        assert_eq!(samples.len(), 10);
+        assert!(samples.iter().all(|s| s.manual));
     }
 }

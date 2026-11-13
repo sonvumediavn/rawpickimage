@@ -172,6 +172,11 @@ với crop đã lưu. Ảnh gốc không bao giờ bị sửa; chỉ bản xuấ
 coi ảnh gốc có bản trong đó là ảnh bạn giữ, còn lại là ảnh bỏ, rồi học luôn cả show. Chỉ có ảnh đã chọn
 thì app coi tất cả là ảnh bạn thích.
 
+**Học từ 2 phiên đang mở…**: mở một phiên thư mục ảnh gốc của show và một phiên thư mục ảnh bạn đã chọn
+từ show đó (để ở đâu cũng được), chờ phân tích xong rồi bấm nút này, chọn phiên nào là ảnh gốc, phiên nào
+là ảnh đã chọn. App so từng ảnh bằng giờ chụp và hình, học ảnh gốc nào bạn giữ, ảnh nào bạn bỏ, chấm lại
+các phiên cùng loại sự kiện và báo AI giờ chọn trúng bao nhiêu ảnh bạn đã chọn.
+
 **Làm trên nhiều máy (Win và Mac)**: ở mục «AI học theo bạn», chọn cùng một thư mục trên Google Drive ở
 mỗi máy. Mỗi máy ghi lựa chọn của mình vào file riêng trong đó (không bao giờ ghi đè nhau); khi mở hay
 chấm ảnh, app gộp lựa chọn của mọi máy rồi học lại. Cài lại hay cập nhật app không mất gì: dữ liệu học

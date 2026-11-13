@@ -1229,6 +1229,64 @@ fn op_learn_show(app: &Arc<App>, path: String, profile: String) -> Result<Lesson
     })()
 }
 
+#[derive(Serialize)]
+struct PairResult {
+    lesson: rawpick_core::lesson::Lesson,
+    profile: ProfileView,
+    /// Of the photos Sơn picked, how many the AI now picks in the originals session.
+    ai_agrees: usize,
+    /// How many photos the AI now picks in the originals session.
+    ai_selected: usize,
+}
+
+/// «Học từ 2 phiên»: one open session holds the whole show, another the photos Sơn picked from
+/// it. Learn from that pairing, then re-decide every open session of this event type.
+fn op_learn_pair(app: &Arc<App>, id: u32, other: u32, profile: String) -> Result<PairResult, String> {
+    if id == other {
+        return Err("Chọn hai phiên khác nhau".into());
+    }
+    let (originals, picks) = {
+        let map = app.sessions.lock().unwrap();
+        let get = |k: u32| -> Result<Vec<Item>, String> {
+            let s = map.get(&k).ok_or("Phiên đã đóng")?;
+            if s.phase != Phase::Ready {
+                return Err(format!("Phiên «{}» chưa phân tích xong", s.source.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()));
+            }
+            Ok(s.items.clone())
+        };
+        (get(id)?, get(other)?)
+    };
+    let (samples, lesson, kept) = rawpick_core::lesson::pair(&originals, &picks);
+    if lesson.kept == 0 {
+        return Err("Không thấy ảnh nào của phiên ảnh đã chọn trong phiên ảnh gốc. Kiểm tra lại hai phiên có đúng cùng một show không.".into());
+    }
+    let store = app.store();
+    let mut p = store.load(&profile);
+    p.add(samples);
+    p.train();
+    store.save(&p).map_err(|e| e.to_string())?;
+    let (mut ai_agrees, mut ai_selected) = (0, 0);
+    {
+        let mut map = app.sessions.lock().unwrap();
+        for s in map.values_mut().filter(|s| s.prefs.profile == profile && s.phase == Phase::Ready) {
+            app.recull(s);
+        }
+        if let Some(s) = map.get(&id) {
+            for v in &s.verdicts {
+                if matches!(v.ai_decision, Decision::Selected) {
+                    ai_selected += 1;
+                    if kept.get(v.idx).copied().unwrap_or(false) {
+                        ai_agrees += 1;
+                    }
+                }
+            }
+        }
+        app.save_sessions(&map);
+    }
+    sessions_changed(app);
+    Ok(PairResult { lesson, profile: app.profile_view(&profile), ai_agrees, ai_selected })
+}
+
 /// Copy the selected photos into a sub-folder of the source folder (originals untouched).
 fn op_gather_selected(app: &Arc<App>, id: u32, sub: String) -> Result<GatherResult, String> {
     // Snapshot, so the session stays usable (and other sessions run) while copying.
@@ -1856,6 +1914,7 @@ struct Args {
     min_stars: Option<u8>,
     person: Option<u32>,
     idxs: Option<Vec<usize>>,
+    other: Option<u32>,
 }
 
 fn need<T>(v: Option<T>, what: &str) -> Result<T, String> {
@@ -1887,6 +1946,7 @@ fn dispatch(app: &Arc<App>, cmd: &str, args: serde_json::Value) -> Result<serde_
         "set_drive_dir" => json(op_set_folder(app, "drive", a.path)?),
         "set_sync_dir" => json(op_set_folder(app, "sync", a.path)?),
         "learn_show" => json(op_learn_show(app, need(a.path, "path")?, need(a.name, "name")?)?),
+        "learn_pair" => json(op_learn_pair(app, need(a.id, "id")?, need(a.other, "other")?, need(a.name, "name")?)?),
         "gather_selected" => json(op_gather_selected(app, need(a.id, "id")?, need(a.sub, "sub")?)?),
         "claude_status" => json(op_claude_status()),
         "chat" => json(op_chat(app, a.id, need(a.message, "message")?, a.use_claude)?),
@@ -2073,10 +2133,14 @@ mod tests {
         let img = image::RgbImage::from_fn(320, 240, |x, y| image::Rgb([(x % 256) as u8, (y % 256) as u8, 90]));
         std::fs::write(show.join("IMG_1.JPG"), metrics::encode_jpeg(&img, 90).unwrap()).unwrap();
         std::fs::write(show.join("IMG_2.JPG"), metrics::encode_jpeg(&img, 80).unwrap()).unwrap();
+        let chosen = d.join("da chon");
+        std::fs::create_dir_all(&chosen).unwrap();
+        std::fs::write(chosen.join("hanu_1.jpg"), metrics::encode_jpeg(&img, 85).unwrap()).unwrap();
         let app = test_app(&d.join("data"));
         // Opening a folder in a session also reports what the AI has learned.
         let a = app.clone();
         let path = show.display().to_string();
+        let picks = chosen.display().to_string();
         let v = within(60, move || {
             let m = dispatch(&a, "new_session", serde_json::Value::Null).unwrap();
             let r = dispatch(&a, "analyze", serde_json::json!({ "id": m["id"], "source": path }));
@@ -2084,6 +2148,16 @@ mod tests {
             let b = dispatch(&a, "set_decisions", serde_json::json!({ "id": m["id"], "idxs": [0, 1], "decision": { "kind": "selected" } })).unwrap();
             let picked = b["verdicts"].as_array().unwrap().iter().filter(|v| v["decision"]["kind"] == "selected" && v["overridden"] == true).count();
             assert_eq!(picked, 2, "{b}");
+            // A second session with the photo Sơn picked (renamed) teaches the first.
+            let m2 = dispatch(&a, "new_session", serde_json::Value::Null).unwrap();
+            dispatch(&a, "analyze", serde_json::json!({ "id": m2["id"], "source": picks })).unwrap();
+            // (Without the look model in tests the photos can't be matched; the pairing itself is
+            // tested in the core.)
+            match dispatch(&a, "learn_pair", serde_json::json!({ "id": m["id"], "other": m2["id"], "name": "Sự kiện chung" })) {
+                Ok(l) => assert_eq!((l["lesson"]["kept"].as_u64(), l["lesson"]["dropped"].as_u64()), (Some(1), Some(1)), "{l}"),
+                Err(e) => assert!(e.contains("Không thấy ảnh nào"), "{e}"),
+            }
+            assert!(dispatch(&a, "learn_pair", serde_json::json!({ "id": m["id"], "other": m["id"], "name": "Sự kiện chung" })).is_err());
             r
         });
         assert!(v.is_ok(), "{v:?}");
