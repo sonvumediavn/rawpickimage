@@ -128,6 +128,7 @@
       <div class="summary" id="summary"></div>
       <div class="suggest" id="suggest" hidden></div>
       <div class="toolbar">
+        <label class="chk selall" title="Tích tất cả ảnh đang hiện (Ctrl+A), rồi chọn hoặc loại một lần"><input type="checkbox" id="selAll"> Tích tất cả</label>
         <div class="tabs" id="tabs">
           <button data-t="all">Tất cả</button>
           <button data-t="selected">Đã chọn</button>
@@ -163,6 +164,15 @@
         <button class="btn primary" id="btnStarExport" title="Chép các ảnh này (kèm RAW) sang thư mục bạn chọn">Chép ảnh gắn sao…</button>
       </div>
       <div class="filterbar" id="filterBar" hidden></div>
+      <div class="selbar" id="selBar" hidden>
+        <b id="selCount"></b>
+        <button class="btn sm primary" data-bulk="selected" title="Phím P">Chọn <kbd>P</kbd></button>
+        <button class="btn sm" data-bulk="review">Xem lại</button>
+        <button class="btn sm" data-bulk="rejected" title="Phím X">Loại <kbd>X</kbd></button>
+        <button class="btn sm" data-bulk="ai" title="Trả về quyết định của AI (phím U)">Theo AI <kbd>U</kbd></button>
+        <button class="btn sm" data-bulk="clear" title="Phím Esc">Bỏ tích</button>
+        <span class="note">Bấm ô tròn ở góc ảnh, Ctrl+bấm để tích từng ảnh, Shift+bấm để tích cả dải</span>
+      </div>
       <div class="grid" id="grid"></div>
      </div>
      <aside class="side" id="side" aria-label="Bộ lọc nhanh">

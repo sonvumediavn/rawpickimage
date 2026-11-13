@@ -751,40 +751,52 @@ fn op_analyze(app: &Arc<App>, id: u32, source: Option<String>) -> Result<Session
 
 /// Sơn's manual choice for one photo; `None` returns it to the AI's decision.
 fn op_set_decision(app: &Arc<App>, id: u32, idx: usize, decision: Option<Decision>) -> Result<VerdictsView, String> {
+    op_set_decisions(app, id, &[idx], decision)
+}
+
+/// Sơn's choice for several photos at once (ticked in the grid, or Ctrl+A): one re-judge and
+/// one round of learning for all of them.
+fn op_set_decisions(app: &Arc<App>, id: u32, idxs: &[usize], decision: Option<Decision>) -> Result<VerdictsView, String> {
     let mut map = app.sessions.lock().unwrap();
     let s = map.get_mut(&id).ok_or("Phiên đã đóng")?;
-    let key = s.items.get(idx).ok_or("Sai ảnh")?.path.display().to_string();
-    let mut profile = None;
-    match decision {
-        Some(d) => {
-            s.overrides.insert(key.clone(), d);
-            // Learn right away from every hand-made choice (no need to export first).
-            if let (Some(a), Some(v)) = (s.items[idx].analysis.as_ref(), s.verdicts.get(idx)) {
-                // Picked although the AI saw closed eyes: the eyes of the people who matter were
-                // most likely open. Taken as a soft hint for the eye rule.
-                if d.keep() && a.people.closed_eyes {
-                    let mut book = app.eyes.lock().unwrap();
-                    for fi in rawpick_core::faces::lead_faces(&a.people) {
-                        let f = &a.people.faces[fi];
-                        if f.closed && !f.by_hand && f.eye_seen {
-                            book.set(&key, fi, f.eye_features(), Some(false), false);
+    let mut samples = vec![];
+    for &idx in idxs {
+        let key = s.items.get(idx).ok_or("Sai ảnh")?.path.display().to_string();
+        match decision {
+            Some(d) => {
+                s.overrides.insert(key.clone(), d);
+                // Learn right away from every hand-made choice (no need to export first).
+                if let (Some(a), Some(v)) = (s.items[idx].analysis.as_ref(), s.verdicts.get(idx)) {
+                    // Picked although the AI saw closed eyes: the eyes of the people who matter were
+                    // most likely open. Taken as a soft hint for the eye rule.
+                    if d.keep() && a.people.closed_eyes {
+                        let mut book = app.eyes.lock().unwrap();
+                        for fi in rawpick_core::faces::lead_faces(&a.people) {
+                            let f = &a.people.faces[fi];
+                            if f.closed && !f.by_hand && f.eye_seen {
+                                book.set(&key, fi, f.eye_features(), Some(false), false);
+                            }
                         }
+                        app.save_eyes(&book);
                     }
-                    app.save_eyes(&book);
+                    samples.push(learn::Sample::new(key, a, d.keep(), v.ai_decision.keep(), true));
                 }
-                let store = app.store();
-                let mut p = store.load(&s.prefs.profile);
-                p.add(vec![learn::Sample::new(key, a, d.keep(), v.ai_decision.keep(), true)]);
-                p.train();
-                if let Ok(false) = store.save_quick(&p) {
-                    app.share_due.lock().unwrap().insert(s.prefs.profile.clone());
-                }
-                profile = Some(app.profile_view(&s.prefs.profile));
+            }
+            None => {
+                s.overrides.remove(&key);
             }
         }
-        None => {
-            s.overrides.remove(&key);
+    }
+    let mut profile = None;
+    if !samples.is_empty() {
+        let store = app.store();
+        let mut p = store.load(&s.prefs.profile);
+        p.add(samples);
+        p.train();
+        if let Ok(false) = store.save_quick(&p) {
+            app.share_due.lock().unwrap().insert(s.prefs.profile.clone());
         }
+        profile = Some(app.profile_view(&s.prefs.profile));
     }
     app.recull(s);
     let v = VerdictsView { verdicts: s.verdicts.clone(), summary: cull::summarize(&s.verdicts), profile };
@@ -1843,6 +1855,7 @@ struct Args {
     yes: Option<bool>,
     min_stars: Option<u8>,
     person: Option<u32>,
+    idxs: Option<Vec<usize>>,
 }
 
 fn need<T>(v: Option<T>, what: &str) -> Result<T, String> {
@@ -1866,6 +1879,7 @@ fn dispatch(app: &Arc<App>, cmd: &str, args: serde_json::Value) -> Result<serde_
         "profile_info" => json(op_profile_info(app, need(a.name, "name")?)),
         "analyze" => json(op_analyze(app, need(a.id, "id")?, a.source)?),
         "set_decision" => json(op_set_decision(app, need(a.id, "id")?, need(a.idx, "idx")?, a.decision)?),
+        "set_decisions" => json(op_set_decisions(app, need(a.id, "id")?, &need(a.idxs, "idxs")?, a.decision)?),
         "train" => json(op_train(app, need(a.id, "id")?)?),
         "export_target" => json(op_export_target(app, need(a.id, "id")?, need(a.parent, "parent")?)?),
         "export_folder" => json(op_export_folder(app, need(a.id, "id")?, need(a.parent, "parent")?)?),
@@ -2058,13 +2072,19 @@ mod tests {
         std::fs::create_dir_all(&show).unwrap();
         let img = image::RgbImage::from_fn(320, 240, |x, y| image::Rgb([(x % 256) as u8, (y % 256) as u8, 90]));
         std::fs::write(show.join("IMG_1.JPG"), metrics::encode_jpeg(&img, 90).unwrap()).unwrap();
+        std::fs::write(show.join("IMG_2.JPG"), metrics::encode_jpeg(&img, 80).unwrap()).unwrap();
         let app = test_app(&d.join("data"));
         // Opening a folder in a session also reports what the AI has learned.
         let a = app.clone();
         let path = show.display().to_string();
         let v = within(60, move || {
             let m = dispatch(&a, "new_session", serde_json::Value::Null).unwrap();
-            dispatch(&a, "analyze", serde_json::json!({ "id": m["id"], "source": path }))
+            let r = dispatch(&a, "analyze", serde_json::json!({ "id": m["id"], "source": path }));
+            // Ticked photos chosen in one go.
+            let b = dispatch(&a, "set_decisions", serde_json::json!({ "id": m["id"], "idxs": [0, 1], "decision": { "kind": "selected" } })).unwrap();
+            let picked = b["verdicts"].as_array().unwrap().iter().filter(|v| v["decision"]["kind"] == "selected" && v["overridden"] == true).count();
+            assert_eq!(picked, 2, "{b}");
+            r
         });
         assert!(v.is_ok(), "{v:?}");
         let _ = std::fs::remove_dir_all(&d);

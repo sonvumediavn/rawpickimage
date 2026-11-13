@@ -14,6 +14,9 @@ toàn bằng CPU, không cần card đồ hoạ, không gửi ảnh đi đâu.
 3. Bấm vào ảnh để xem điểm từng tiêu chí, khung khuôn mặt, mắt nhắm. Cuộn chuột hoặc chụm hai ngón để phóng
    to, kéo để di chuyển, nhấp đúp (hoặc phím `1`) để xem 100% kiểm tra độ nét, phím `0` về vừa khung.
    Phím `P` chọn, `X` loại, `U` trả về quyết định của AI, `←` `→` chuyển ảnh.
+   Chọn nhiều ảnh một lúc ngay ở lưới: bấm ô tròn ở góc ảnh (hoặc Ctrl+bấm), Shift+bấm để tích cả dải,
+   **Ctrl+A** hoặc ô «Tích tất cả» để tích mọi ảnh đang hiện, rồi bấm Chọn / Xem lại / Loại / Theo AI
+   (hoặc phím `P` `X` `U`) cho cả nhóm; `Esc` bỏ tích.
 4. Bấm **Trò chuyện với AI** để yêu cầu bằng lời: «ưu tiên ảnh có người cười», «chỉ giữ 300 ảnh»,
    «tôi thích ảnh tông tối», «chọn theo phong cách của tôi»… AI chỉnh cách chấm và chọn lại ngay.
    Gợi ý bấm nhanh chia 6 nhóm: loại sự kiện (đám cưới, hội nghị, sân khấu, tiệc, ảnh nhóm, thể thao),

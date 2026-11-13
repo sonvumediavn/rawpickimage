@@ -37,6 +37,8 @@ const st = {
   tab: "all", reason: "", sort: "time", view: [], cur: -1, starMin: 1,
   // Side panel filters (combined with the tab).
   scene: "", grade: "", person: null, people: [],
+  // Photos ticked in the grid (indexes), and where a Shift+click range starts.
+  sel: new Set(), anchor: null,
 };
 
 const SCENES = [
@@ -671,15 +673,86 @@ function renderGrid() {
       const p = P[i], v = st.verdicts[i], k = decKind(v.decision);
       const g = gradeOf(v.score);
       const tip = `${g[1]} · ${sceneLabel(v.scene)}${(v.key_people || []).length ? " · " + v.key_people.map(personName).join(", ") : ""}`;
-      return `<div class="card ${k}" data-i="${i}" tabindex="0" title="${esc(tip)}">
-        <div class="th">${p.thumb ? `<img loading="lazy" src="${fileSrc(p.thumb)}" alt="">` : ""}
+      return `<div class="card ${k}${st.sel.has(i) ? " ticked" : ""}" data-i="${i}" tabindex="0" title="${esc(tip)}">
+        <div class="th"><span class="tick" role="checkbox" aria-checked="${st.sel.has(i)}" aria-label="Tích ảnh này"></span>${p.thumb ? `<img loading="lazy" src="${fileSrc(p.thumb)}" alt="">` : ""}
           <span class="sc ${cls(v.score)}">${v.score.toFixed(1)}</span>${v.overridden ? `<span class="man">sửa tay</span>` : ""}${p.stars > 0 ? `<span class="star">${"★".repeat(p.stars)}</span>` : p.protected ? `<span class="star" title="Khóa bảo vệ trên máy">🔒</span>` : ""}${p.crop ? CROP_BADGE : ""}${(v.key_people || []).length ? `<span class="kp" title="Có nhân vật quan trọng">♛</span>` : ""}</div>
         <div class="cap"><div class="nm">${esc(p.name)}${v.time != null ? " · " + fmtTime(v.time) : ""}</div><div class="why">${esc(topWhy(p, v))}</div></div>
       </div>`;
     })
     .join("") || `<p class="note">Không có ảnh nào trong mục này.</p>`;
   for (const c of $("grid").children) {
-    if (c.dataset.i != null) c.onclick = () => openDetail(+c.dataset.i);
+    if (c.dataset.i != null) c.onclick = (e) => cardClick(+c.dataset.i, e);
+  }
+  // Ticks only make sense for photos on screen.
+  for (const i of [...st.sel]) if (!st.view.includes(i)) st.sel.delete(i);
+  renderSel();
+}
+
+function cardClick(i, e) {
+  if (e.shiftKey && st.anchor != null && st.view.includes(st.anchor)) {
+    const a = st.view.indexOf(st.anchor), b = st.view.indexOf(i);
+    for (const j of st.view.slice(Math.min(a, b), Math.max(a, b) + 1)) st.sel.add(j);
+    window.getSelection()?.removeAllRanges();
+  } else if (e.target.closest(".tick") || e.ctrlKey || e.metaKey) {
+    if (st.sel.has(i)) st.sel.delete(i); else st.sel.add(i);
+    st.anchor = i;
+  } else {
+    openDetail(i);
+    return;
+  }
+  renderSel();
+}
+
+/** Show the ticks without redrawing the grid. */
+function renderSel() {
+  for (const c of $("grid").children) {
+    if (c.dataset.i == null) continue;
+    const on = st.sel.has(+c.dataset.i);
+    c.classList.toggle("ticked", on);
+    c.querySelector(".tick")?.setAttribute("aria-checked", String(on));
+  }
+  const n = st.sel.size, all = st.view.length;
+  $("grid").classList.toggle("ticking", n > 0);
+  $("selAll").checked = n > 0 && n === all;
+  $("selAll").indeterminate = n > 0 && n < all;
+  $("selBar").hidden = !n;
+  $("selCount").textContent = `Đã tích ${n} ảnh`;
+}
+
+function tickAll(on) {
+  st.sel = on ? new Set(st.view) : new Set();
+  renderSel();
+}
+
+/** Sơn's choice for every ticked photo at once. */
+async function bulkDecide(kind) {
+  const idxs = [...st.sel];
+  if (!idxs.length) return;
+  // A rejected photo keeps the AI's reason when it had one (export sorts by reason).
+  const groups = new Map();
+  for (const i of idxs) {
+    let d = null;
+    if (kind === "selected" || kind === "review") d = { kind };
+    else if (kind === "rejected") {
+      const ai = st.verdicts[i].ai_decision;
+      d = { kind: "rejected", reason: ai.kind === "rejected" ? ai.reason : "low-score" };
+    }
+    const key = JSON.stringify(d);
+    if (!groups.has(key)) groups.set(key, { d, idxs: [] });
+    groups.get(key).idxs.push(i);
+  }
+  busy(true, `Đang cập nhật ${idxs.length} ảnh…`);
+  try {
+    let r;
+    for (const g of groups.values()) r = await invoke("set_decisions", { id: st.sid, idxs: g.idxs, decision: g.d });
+    st.sel = new Set();
+    applyVerdicts(r);
+    const what = { selected: "chọn", review: "đưa vào «Cần xem lại»", rejected: "loại", ai: "trả về quyết định của AI cho" }[kind || "ai"];
+    toast(`Đã ${what} ${idxs.length} ảnh.${kind && kind !== "review" ? " AI học luôn từ lựa chọn này." : ""}`, 4000);
+  } catch (e) {
+    toast(esc(String(e)));
+  } finally {
+    busy(false);
   }
 }
 
@@ -830,6 +903,27 @@ async function markKeyPerson(i, face) {
 
 function wireResults() {
   wireSide();
+  $("selAll").onchange = () => tickAll($("selAll").checked);
+  $("selBar").onclick = (e) => {
+    const k = e.target.closest("button")?.dataset.bulk;
+    if (!k) return;
+    if (k === "clear") tickAll(false);
+    else bulkDecide(k === "ai" ? null : k);
+  };
+  // Grid keys: Ctrl+A ticks every photo on screen (not the page text), P/X/U act on the ticked ones.
+  document.addEventListener("keydown", (e) => {
+    if (!$("detail").hidden || $("results").hidden || e.target.matches("input,select,textarea") || document.querySelector(".modal:not([hidden]), .busy:not([hidden])")) return;
+    if (!$("chat").hidden && $("chat").contains(e.target)) return;
+    const k = e.key.toLowerCase();
+    if ((e.ctrlKey || e.metaKey) && k === "a") { e.preventDefault(); tickAll(true); return; }
+    if (!st.sel.size || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (k === "escape") tickAll(false);
+    else if (k === "p") bulkDecide("selected");
+    else if (k === "x") bulkDecide("rejected");
+    else if (k === "u") bulkDecide(null);
+    else return;
+    e.preventDefault();
+  });
   for (const b of $("tabs").children) {
     b.setAttribute("aria-pressed", String(b.dataset.t === st.tab));
     b.onclick = () => {
