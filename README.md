@@ -172,6 +172,12 @@ với crop đã lưu. Ảnh gốc không bao giờ bị sửa; chỉ bản xuấ
 coi ảnh gốc có bản trong đó là ảnh bạn giữ, còn lại là ảnh bỏ, rồi học luôn cả show. Chỉ có ảnh đã chọn
 thì app coi tất cả là ảnh bạn thích.
 
+**AI học tấm nào bạn chọn trong một loạt**: khi học show cũ (hay khi bạn tự Chọn/Loại trong phiên), app chia
+ảnh thành từng loạt cùng cảnh (chụp liên tiếp, cùng nhóm người) và so tấm bạn giữ với tấm bạn bỏ trong cùng
+loạt: ngẩng hay cúi đầu (của từng người trong nhóm), nhìn máy hay quay đi, mắt, khẩu hình, độ nét… Khi lọc
+show mới, tấm đẹp nhất của mỗi loạt được chọn theo cách bạn chọn, kể cả khi số đo kỹ thuật của tấm khác cao
+hơn. Lựa chọn của chính bạn (tự bấm, hay từ show cũ) không bao giờ bị lựa chọn của AI ghi đè khi mở lại show đó.
+
 **Học từ 2 phiên đang mở…**: mở một phiên thư mục ảnh gốc của show và một phiên thư mục ảnh bạn đã chọn
 từ show đó (để ở đâu cũng được), chờ phân tích xong rồi bấm nút này, chọn phiên nào là ảnh gốc, phiên nào
 là ảnh đã chọn. App so từng ảnh bằng giờ chụp và hình, học ảnh gốc nào bạn giữ, ảnh nào bạn bỏ, chấm lại

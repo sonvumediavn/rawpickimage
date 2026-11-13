@@ -333,7 +333,10 @@ pub fn cull(items: &[Option<&Analysis>], s: &Settings, profile: Option<&Profile>
     });
 
     if o.dedupe {
-        dedupe(items, &mut out, &order, s);
+        // Which frame of a series Sơn keeps, once learned.
+        let gain = profile.map(|p| 2.5 * (2.0 * p.rank_acc - 1.0).max(0.0)).unwrap_or(0.0);
+        let rank: Vec<Option<f32>> = items.iter().map(|a| a.filter(|_| gain > 0.1).and_then(|a| profile.and_then(|p| p.rank(&learn::features(a))))).collect();
+        dedupe(items, &mut out, &order, s, &rank, gain);
     }
     assign_moments(&mut out, &order, s.moment_gap_seconds);
     if o.moments {
@@ -592,8 +595,11 @@ fn speaker_head_down(a: &Analysis) -> bool {
 
 /// Best frame first: a frame the rules would pick, then the score, then (with several people)
 /// the frame where everyone has their eyes open and heads up.
-fn frame_rank(a: Option<&Analysis>, v: &Verdict, s: &Settings) -> f32 {
+fn frame_rank(a: Option<&Analysis>, v: &Verdict, s: &Settings, learned: Option<f32>, gain: f32) -> f32 {
     let mut k = v.score;
+    if let Some(r) = learned {
+        k += gain * r;
+    }
     if let Some(a) = a {
         if a.people.faces.iter().filter(|f| f.main).count() >= 2 {
             k += 2.0 * (a.people.open_share() - 1.0) + 0.6 * (a.people.up_share() - 1.0);
@@ -602,26 +608,31 @@ fn frame_rank(a: Option<&Analysis>, v: &Verdict, s: &Settings) -> f32 {
             k -= 1.5;
         }
     }
-    if v.decision == Decision::Selected {
+    // Usable frames first. With Sơn's learned way of choosing inside a series, a frame the
+    // rules left for review can still be the one he would keep.
+    let usable = if learned.is_some() { matches!(v.decision, Decision::Selected | Decision::Review) } else { v.decision == Decision::Selected };
+    if usable {
         k += 100.0;
     }
     k
 }
 
-fn dedupe(items: &[Option<&Analysis>], out: &mut [Verdict], order: &[usize], s: &Settings) {
+/// Frames of the same shot, in timeline `order`: each group is one burst or one group photo
+/// taken again. `times` are capture times (with camera offsets).
+pub fn series(items: &[Option<&Analysis>], times: &[Option<f64>], order: &[usize], dedupe_seconds: f64) -> Vec<Vec<usize>> {
     let mut series: Vec<Vec<usize>> = vec![];
     for &i in order {
         let Some(a) = items[i] else { continue };
-        let ti = out[i].time;
+        let ti = times[i];
         let joined = series.last_mut().filter(|g| {
             let (&first, &last) = (g.first().unwrap(), g.last().unwrap());
-            if let (Some(t), Some(l)) = (ti, out[last].time) {
-                if (t - l).abs() > s.dedupe_seconds {
+            if let (Some(t), Some(l)) = (ti, times[last]) {
+                if (t - l).abs() > dedupe_seconds {
                     return false;
                 }
             }
-            if let (Some(t), Some(f)) = (ti, out[first].time) {
-                if t - f > SERIES_SPAN.max(s.dedupe_seconds * 3.0) {
+            if let (Some(t), Some(f)) = (ti, times[first]) {
+                if t - f > SERIES_SPAN.max(dedupe_seconds * 3.0) {
                     return false;
                 }
             }
@@ -629,11 +640,11 @@ fn dedupe(items: &[Option<&Analysis>], out: &mut [Verdict], order: &[usize], s: 
             // a little, so comparing with the last frame alone splits real bursts; comparing with
             // frames long before would chain different groups together).
             g.iter().rev().take(12).any(|&k| {
-                let gap = match (ti, out[k].time) {
+                let gap = match (ti, times[k]) {
                     (Some(t), Some(u)) => Some((t - u).abs()),
                     _ => None,
                 };
-                gap.is_none_or(|g| g <= s.dedupe_seconds) && items[k].is_some_and(|b| same_shot(a, b, gap))
+                gap.is_none_or(|g| g <= dedupe_seconds) && items[k].is_some_and(|b| same_shot(a, b, gap))
             })
         });
         match joined {
@@ -641,11 +652,22 @@ fn dedupe(items: &[Option<&Analysis>], out: &mut [Verdict], order: &[usize], s: 
             None => series.push(vec![i]),
         }
     }
+    series
+}
+
+fn dedupe(items: &[Option<&Analysis>], out: &mut [Verdict], order: &[usize], s: &Settings, rank: &[Option<f32>], rank_gain: f32) {
+    let times: Vec<Option<f64>> = out.iter().map(|v| v.time).collect();
+    let series = series(items, &times, order, s.dedupe_seconds);
     for g in series.into_iter().filter(|g| g.len() > 1) {
         let mut ranked = g.clone();
-        let key: HashMap<usize, f32> = g.iter().map(|&i| (i, frame_rank(items[i], &out[i], s))).collect();
+        let key: HashMap<usize, f32> = g.iter().map(|&i| (i, frame_rank(items[i], &out[i], s, rank[i], rank_gain))).collect();
         ranked.sort_by(|&x, &y| key[&y].total_cmp(&key[&x]).then(x.cmp(&y)));
         let best = ranked[0];
+        // The rules picked another frame of this shot, but Sơn's way of choosing prefers this one.
+        if rank[best].is_some() && out[best].decision == Decision::Review && g.iter().any(|&i| out[i].decision == Decision::Selected) {
+            out[best].decision = Decision::Selected;
+            out[best].notes.push("AI đã học: trong một loạt ảnh, bạn hay chọn tấm như tấm này".into());
+        }
         let best_name = items[best].map(|a| a.name.clone()).unwrap_or_default();
         for (rank, &i) in ranked.iter().enumerate() {
             out[i].series = Some(best);
@@ -1111,4 +1133,52 @@ mod tests {
         s.options.speaker_head_up = false;
         assert_eq!(cull(&refs, &s, None)[0].decision, Decision::Selected);
     }
+
+    #[test]
+    fn learns_which_frame_of_a_burst_he_keeps() {
+        // Old show: in each award group shot three times he kept the frame where people look up
+        // most and dropped those where they look down at the flowers, even though those measured
+        // a little better. How much heads are bowed differs a lot from one scene to the next,
+        // and whole scenes he skipped are just as upright, so "bowed" alone tells little;
+        // comparing frames of the same shot shows how he chooses.
+        let bow = |a: &mut Analysis, pitch: f32| {
+            for f in a.people.faces.iter_mut().take(2) {
+                f.pitch = pitch;
+            }
+        };
+        let mut p = Profile::new("x");
+        let mut samples = vec![];
+        for n in 0..24u32 {
+            let base = 0.2 + ((n * 7) % 7) as f32 * 0.05;
+            let skipped = n % 2 == 1;
+            for k in 0..3u32 {
+                let mut a = shot(&format!("old{n}-{k}"), 1000.0 * n as f64 + k as f64, if k == 0 { 8.0 } else { 8.4 }, 7, 0.97, n * 10 + k, 4);
+                // Scenes he skipped: everyone upright, all frames dropped.
+                bow(&mut a, if skipped { 0.0 } else if k == 0 { base } else { base + 0.15 });
+                let keep = !skipped && k == 0;
+                let mut x = learn::Sample::new(format!("/old/{n}-{k}.jpg"), &a, keep, !keep, true);
+                x.series = Some(format!("/old/{n}-0.jpg"));
+                samples.push(x);
+            }
+        }
+        p.add(samples);
+        p.train();
+        assert!(p.rank_pairs >= 15 && p.rank_acc > 0.9, "{} {}", p.rank_pairs, p.rank_acc);
+
+        // A new show: the bowed frames again measure better.
+        let mut g: Vec<Analysis> = (0..3).map(|k| shot(&format!("new{k}"), 50.0 + k as f64, if k == 1 { 8.0 } else { 8.4 }, 3, 0.97, 500 + k, 4)).collect();
+        bow(&mut g[0], 0.25);
+        bow(&mut g[1], 0.1);
+        bow(&mut g[2], 0.25);
+        let refs: Vec<_> = g.iter().map(Some).collect();
+        let mut s = Settings::default();
+        s.options.story = false;
+        let pick = |v: Vec<Verdict>| v.iter().filter(|x| x.decision == Decision::Selected).map(|x| x.idx).collect::<Vec<usize>>();
+        assert_ne!(pick(cull(&refs, &s, None)), vec![1], "the rules alone prefer a bowed frame");
+        let r: Vec<f32> = g.iter().map(|a| p.rank(&learn::features(a)).unwrap()).collect();
+        assert!(r[1] > r[0] + 1.0 && r[1] > r[2] + 1.0, "{r:?}");
+        let v = cull(&refs, &s, Some(&p));
+        assert_eq!(pick(v.clone()), vec![1], "{:?}", v.iter().map(|x| (x.decision, x.score, x.notes.clone())).collect::<Vec<_>>());
+    }
+
 }

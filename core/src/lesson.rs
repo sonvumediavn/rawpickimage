@@ -10,6 +10,7 @@
 //! pick.
 
 use crate::analyze::{self, Analysis, Analyzer};
+use crate::cull;
 use crate::learn::Sample;
 use crate::pipeline::{self, Item, Progress};
 use crate::visual;
@@ -42,6 +43,8 @@ pub struct Lesson {
     pub unreadable: usize,
     /// Picks not found among the originals (two-session lessons only).
     pub unmatched: usize,
+    /// Series (bursts, a group shot again) where he kept some frames and dropped others.
+    pub series: usize,
 }
 
 /// Look at a whole show and return what it teaches.
@@ -116,6 +119,7 @@ pub fn lessons(items: &[Item]) -> (Vec<Sample>, Lesson) {
             }
         }
     }
+    let mut shown: Vec<&Analysis> = vec![];
     for (i, it) in ok.iter().enumerate() {
         if picks.contains(&folders[i]) {
             continue;
@@ -128,9 +132,38 @@ pub fn lessons(items: &[Item]) -> (Vec<Sample>, Lesson) {
         }
         // His own decision, so it teaches like a hand-made choice.
         samples.push(Sample::new(it.path.display().to_string(), it.analysis.as_ref().unwrap(), k, k, true));
+        shown.push(it.analysis.as_ref().unwrap());
     }
+    lesson.series = tag_series(&shown, &mut samples);
     lesson.pick_folders = picks;
     (samples, lesson)
+}
+
+/// Mark frames of the same shot (`photos[i]` is the photo of `samples[i]`), so the AI learns which
+/// frame of a burst Sơn keeps. Returns how many series hold both a kept and a dropped frame.
+fn tag_series(photos: &[&Analysis], samples: &mut [Sample]) -> usize {
+    let items: Vec<Option<&Analysis>> = photos.iter().map(|a| Some(*a)).collect();
+    let times: Vec<Option<f64>> = photos.iter().map(|a| a.time).collect();
+    let mut order: Vec<usize> = (0..photos.len()).collect();
+    order.sort_by(|&x, &y| match (times[x], times[y]) {
+        (Some(a), Some(b)) => a.total_cmp(&b).then(x.cmp(&y)),
+        _ => x.cmp(&y),
+    });
+    let mut useful = 0;
+    for g in cull::series(&items, &times, &order, cull::Settings::default().dedupe_seconds) {
+        if g.len() < 2 {
+            continue;
+        }
+        let tag = samples[g[0]].name.clone();
+        let kept = g.iter().filter(|&&i| samples[i].keep).count();
+        if kept > 0 && kept < g.len() {
+            useful += 1;
+        }
+        for &i in &g {
+            samples[i].series = Some(tag.clone());
+        }
+    }
+    useful
 }
 
 /// How alike two photos look when one is a copy of the other (same picture, maybe renamed,
@@ -187,6 +220,8 @@ pub fn pair(originals: &[Item], picks: &[Item]) -> (Vec<Sample>, Lesson, Vec<boo
         }
         samples.push(Sample::new(originals[*i].path.display().to_string(), a, k, k, true));
     }
+    let shown: Vec<&Analysis> = ok.iter().map(|(_, a)| *a).collect();
+    lesson.series = tag_series(&shown, &mut samples);
     (samples, lesson, kept)
 }
 

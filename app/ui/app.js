@@ -1072,6 +1072,9 @@ function renderSync() {
   if (off) off.onclick = async () => { st.info = Object.assign(st.info, await invoke("set_sync_dir", { path: null })); renderSync(); };
 }
 
+/** What a lesson taught about choosing inside a burst. */
+const seriesNote = (l) => (l.series ? ` Có ${l.series} loạt ảnh cùng cảnh bạn giữ tấm này, bỏ tấm kia: AI học bạn chọn tấm nào trong loạt.` : "");
+
 async function doLearnShow() {
   const dir = await T.dialog.open({ directory: true, multiple: false, title: "Chọn thư mục một show cũ bạn đã lọc xong" });
   if (!dir) return;
@@ -1084,7 +1087,7 @@ async function doLearnShow() {
     toast(
       l.only_picks
         ? `Không thấy ảnh gốc trong thư mục này, nên app coi cả ${l.kept} ảnh là ảnh bạn đã chọn và học theo. Học thêm show có cả ảnh gốc để AI biết bạn hay bỏ ảnh kiểu nào.`
-        : `Đã học ${l.kept + l.dropped} ảnh của show: bạn chọn ${l.kept}, bỏ ${l.dropped}` + (l.pick_folders.length ? ` (ảnh chọn nằm ở ${l.pick_folders.map((f) => "«" + esc(f.split(/[\\/]/).pop()) + "»").join(", ")})` : "") + `. AI áp dụng ngay cho loại sự kiện «${esc(st.prefs.profile)}».`,
+        : `Đã học ${l.kept + l.dropped} ảnh của show: bạn chọn ${l.kept}, bỏ ${l.dropped}` + (l.pick_folders.length ? ` (ảnh chọn nằm ở ${l.pick_folders.map((f) => "«" + esc(f.split(/[\\/]/).pop()) + "»").join(", ")})` : "") + `.` + seriesNote(l) + ` AI áp dụng ngay cho loại sự kiện «${esc(st.prefs.profile)}».`,
       15000
     );
     if (st.sid) { const v = await invoke("get_session", { id: st.sid }).catch(() => null); if (v) { st.views[st.sid] = v; st.session = null; renderMain(); } }
@@ -1152,6 +1155,7 @@ async function doLearnPair() {
     toast(
       `Đã học ${l.kept + l.dropped} ảnh: bạn giữ ${l.kept}, bỏ ${l.dropped}.` +
         (l.unmatched ? ` Có ${l.unmatched} ảnh đã chọn không tìm thấy trong phiên gốc (có thể của show khác hoặc đã cắt khác nhiều).` : "") +
+        seriesNote(l) +
         ` Giờ AI chọn ${r.ai_selected} ảnh ở phiên gốc, trúng ${r.ai_agrees}/${l.kept} ảnh bạn đã chọn.`,
       15000
     );

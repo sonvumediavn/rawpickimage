@@ -159,7 +159,10 @@ pub fn training_samples(items: &[Item], verdicts: &[Verdict]) -> Vec<Sample> {
         .zip(verdicts)
         .filter_map(|(it, v)| {
             let a = it.analysis.as_ref()?;
-            Some(Sample::new(it.path.display().to_string(), a, v.decision.keep(), v.ai_decision.keep(), v.overridden))
+            let mut x = Sample::new(it.path.display().to_string(), a, v.decision.keep(), v.ai_decision.keep(), v.overridden);
+            // Frames of one shot: which one Sơn kept teaches the AI how he chooses in a burst.
+            x.series = v.series.and_then(|b| items.get(b)).map(|b| b.path.display().to_string());
+            Some(x)
         })
         .collect()
 }

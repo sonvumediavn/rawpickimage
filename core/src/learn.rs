@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 /// Measured features stored with each sample.
-pub const N_FEAT: usize = 20;
+pub const N_FEAT: usize = 24;
 /// Features from the pictures themselves: how close a photo looks to the ones Sơn kept, and
 /// to the ones he dropped (computed from the stored image vectors, not stored).
 pub const N_VIS: usize = 2;
@@ -29,6 +29,10 @@ const VIS_TRAIN_MAX: usize = 2500;
 const TOP_K: usize = 5;
 /// Decisions needed (with both kept and dropped photos) before the profile influences scores.
 pub const MIN_SAMPLES: usize = 20;
+/// Kept/dropped pairs of frames from the same shot before [`Profile::rank`] is used.
+pub const MIN_PAIRS: usize = 15;
+/// Pairs taken from one series at most (a long burst must not drown the others).
+const RANK_PER_SERIES: usize = 12;
 /// Each class needs at least this many examples.
 const MIN_CLASS: usize = 5;
 /// A photo Sơn decided by hand teaches more than one he let the AI decide.
@@ -72,17 +76,24 @@ pub const FEATURE_NAMES: [&str; N_ALL] = [
     "Phơi sáng", "Độ nét", "Bố cục", "Màu sắc", "Nhiễu", "Người", "Có người", "Mắt nhắm", "Nghiêng (độ)", "Cháy sáng (%)", "Số khuôn mặt",
     "Miệng mở (khẩu hình)", "Mặt nghiêng", "Cỡ nhân vật chính", "Chủ thể ở điểm mạnh", "Chủ thể sát mép", "Độ sáng tổng",
     "Cúi đầu", "Người phát biểu cúi đầu", "Tỉ lệ người mở mắt",
+    "Mọi người cúi đầu (trung bình)", "Người cúi đầu nhiều nhất", "Mọi người quay mặt đi (trung bình)", "Người quay mặt đi nhiều nhất",
     "Nhìn giống ảnh bạn hay chọn", "Nhìn giống ảnh bạn hay bỏ",
 ];
 
 /// Values for features a sample saved by an older version doesn't have.
-const NEUTRAL: [f32; N_FEAT] = [5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.46, 0.0, 0.0, 9.0];
+const NEUTRAL: [f32; N_FEAT] = [5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.46, 0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 0.0];
 
 pub fn features(a: &Analysis) -> [f32; N_FEAT] {
     let s = &a.scores;
     // The person a viewer looks at: the biggest face.
     let lead = a.people.faces.iter().max_by(|x, y| (x.bbox[2] * x.bbox[3]).total_cmp(&(y.bbox[2] * y.bbox[3])));
     let has_people = s.people.is_some();
+    // Everyone who matters in the frame (a group handed awards, a panel): who bows, who looks away.
+    let main: Vec<&crate::faces::FaceInfo> = a.people.faces.iter().filter(|f| f.main && !f.small).collect();
+    let mean = |v: &dyn Fn(&crate::faces::FaceInfo) -> f32| if main.is_empty() { 0.0 } else { main.iter().map(|f| v(f)).sum::<f32>() / main.len() as f32 };
+    let worst = |v: &dyn Fn(&crate::faces::FaceInfo) -> f32| main.iter().map(|f| v(f)).fold(0.0f32, f32::max);
+    let down = |f: &crate::faces::FaceInfo| f.pitch.max(0.0) * 10.0;
+    let away = |f: &crate::faces::FaceInfo| f.yaw.abs().min(1.0) * 10.0;
     [
         s.exposure,
         s.sharp,
@@ -106,6 +117,10 @@ pub fn features(a: &Analysis) -> [f32; N_FEAT] {
         lead.map(|f| f.pitch.max(0.0) * 10.0).unwrap_or(0.0),
         a.people.solo().map(|f| f.pitch.max(0.0) * 10.0).unwrap_or(0.0),
         a.people.open_share() * 10.0,
+        mean(&down),
+        worst(&down),
+        mean(&away),
+        worst(&away),
     ]
 }
 
@@ -130,11 +145,15 @@ pub struct Sample {
     /// compare thousands of photos again).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub v: Option<[f32; N_VIS]>,
+    /// Frames of one shot share this tag (a burst, the same group shot again): which one Sơn
+    /// kept among them teaches [`Profile::rank`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub series: Option<String>,
 }
 
 impl Sample {
     pub fn new(name: String, a: &Analysis, keep: bool, ai_keep: bool, manual: bool) -> Self {
-        Self { name, f: features(a).to_vec(), keep, ai_keep, manual, e: a.embed.clone(), origin: None, v: None }
+        Self { name, f: features(a).to_vec(), keep, ai_keep, manual, e: a.embed.clone(), origin: None, v: None, series: None }
     }
 
     /// The show (folder) the photo came from: similar frames of the same show must not vouch
@@ -170,6 +189,17 @@ pub struct Profile {
     /// Number of samples when picture-features were last all worked out again.
     #[serde(default)]
     pub vis_at: usize,
+    /// Which frame of a series Sơn keeps: weights over the measured features (divided by
+    /// `rscale`), learned from kept/dropped frames of the same shot.
+    #[serde(default)]
+    pub rw: Vec<f32>,
+    #[serde(default)]
+    pub rscale: Vec<f32>,
+    /// Kept/dropped pairs it learned from, and the share it orders right.
+    #[serde(default)]
+    pub rank_pairs: usize,
+    #[serde(default)]
+    pub rank_acc: f32,
     #[serde(skip)]
     bank: Vec<BankEntry>,
 }
@@ -203,7 +233,7 @@ impl Profile {
     pub fn fingerprint(&self) -> u64 {
         let mut h: u64 = self.samples.len() as u64;
         for s in &self.samples {
-            let x = crc32fast::hash(s.name.as_bytes()) as u64 ^ ((s.keep as u64) << 40) ^ ((!s.e.is_empty() as u64) << 41);
+            let x = crc32fast::hash(s.name.as_bytes()) as u64 ^ ((s.keep as u64) << 40) ^ ((!s.e.is_empty() as u64) << 41) ^ ((s.series.is_some() as u64) << 42);
             h = h.wrapping_mul(0x100_0000_01b3).wrapping_add(x);
         }
         h
@@ -255,6 +285,10 @@ impl Profile {
     }
 
     pub fn add(&mut self, mut s: Vec<Sample>) {
+        // What Sơn decided himself (by hand, or in a show he culled) is never replaced by what
+        // the AI decided for the same photo later, e.g. when the learned show is opened again.
+        let his: std::collections::HashSet<String> = self.samples.iter().filter(|x| x.manual).map(|x| x.name.clone()).collect();
+        s.retain(|x| x.manual || !his.contains(&x.name));
         // A photo decided again replaces its earlier sample.
         let names: std::collections::HashSet<_> = s.iter().map(|x| x.name.clone()).collect();
         self.samples.retain(|x| !names.contains(&x.name));
@@ -290,6 +324,7 @@ impl Profile {
     /// Full-batch gradient descent with L2; tiny data, so this is instant.
     pub fn train(&mut self) -> bool {
         self.build_bank();
+        self.train_rank();
         let n = self.samples.len();
         let pos = self.samples.iter().filter(|s| s.keep).count();
         if n < MIN_SAMPLES || pos < MIN_CLASS || n - pos < MIN_CLASS {
@@ -426,6 +461,74 @@ impl Profile {
         true
     }
 
+    /// Learn which frame of a series Sơn keeps. Every kept frame is compared with the dropped
+    /// frames of the same shot (at least one of the two decided by him): what differs between
+    /// them (head up or bowed, eyes, looking at the camera, mouth…) is what he chooses on.
+    fn train_rank(&mut self) {
+        let mut by: HashMap<&str, Vec<&Sample>> = HashMap::new();
+        for s in &self.samples {
+            if let Some(t) = &s.series {
+                by.entry(t.as_str()).or_default().push(s);
+            }
+        }
+        let mut diffs: Vec<[f32; N_FEAT]> = vec![];
+        for g in by.values() {
+            let mut n = 0;
+            for k in g.iter().filter(|s| s.keep) {
+                for d in g.iter().filter(|s| !s.keep && (s.manual || k.manual)) {
+                    if n >= RANK_PER_SERIES {
+                        break;
+                    }
+                    let mut x = [0f32; N_FEAT];
+                    for i in 0..N_FEAT {
+                        x[i] = k.f.get(i).copied().unwrap_or(NEUTRAL[i]) - d.f.get(i).copied().unwrap_or(NEUTRAL[i]);
+                    }
+                    diffs.push(x);
+                    n += 1;
+                }
+            }
+        }
+        self.rank_pairs = diffs.len();
+        if diffs.len() < MIN_PAIRS {
+            self.rw.clear();
+            self.rscale.clear();
+            self.rank_acc = 0.0;
+            return;
+        }
+        let m = diffs.len() as f32;
+        let scale: Vec<f32> = (0..N_FEAT).map(|i| (diffs.iter().map(|d| d[i] * d[i]).sum::<f32>() / m).sqrt().max(1e-3)).collect();
+        let x: Vec<[f32; N_FEAT]> = diffs.iter().map(|d| std::array::from_fn(|i| d[i] / scale[i])).collect();
+        // Logistic on differences without a bias: P(kept frame beats dropped) = σ(w·Δ).
+        let mut w = [0f32; N_FEAT];
+        let (lr, l2) = (0.5f32, 0.02f32);
+        for _ in 0..500 {
+            let mut g = [0f32; N_FEAT];
+            for xi in &x {
+                let z: f32 = xi.iter().zip(&w).map(|(a, b)| a * b).sum();
+                let e = 1.0 / (1.0 + (-z).exp()) - 1.0;
+                for k in 0..N_FEAT {
+                    g[k] += e * xi[k];
+                }
+            }
+            for k in 0..N_FEAT {
+                w[k] -= lr * (g[k] / m + l2 * w[k]);
+            }
+        }
+        let right = x.iter().filter(|xi| xi.iter().zip(&w).map(|(a, b)| a * b).sum::<f32>() > 0.0).count();
+        self.rank_acc = right as f32 / m;
+        self.rw = w.to_vec();
+        self.rscale = scale;
+    }
+
+    /// How much Sơn would prefer this frame within its series, in log-odds: only differences
+    /// between frames of one shot mean anything. None until enough series are learned.
+    pub fn rank(&self, f: &[f32; N_FEAT]) -> Option<f32> {
+        if self.rw.len() != N_FEAT || self.rscale.len() != N_FEAT {
+            return None;
+        }
+        Some((0..N_FEAT).map(|k| f[k] / self.rscale[k] * self.rw[k]).sum())
+    }
+
     /// Choices Sơn made by hand.
     pub fn manual_count(&self) -> usize {
         self.samples.iter().filter(|s| s.manual).count()
@@ -465,10 +568,27 @@ impl Profile {
         }
         let mut idx: Vec<usize> = (0..N_ALL).collect();
         idx.sort_by(|&a, &b| self.w[b].abs().total_cmp(&self.w[a].abs()));
-        idx.into_iter()
+        let mut out: Vec<String> = idx
+            .into_iter()
             .take(4)
             .map(|k| format!("{}: {}", FEATURE_NAMES[k], if self.w[k] > 0.0 { "càng cao càng hay được giữ" } else { "càng cao càng hay bị bỏ" }))
-            .collect()
+            .collect();
+        if self.rw.len() == N_FEAT {
+            let mut r: Vec<usize> = (0..N_FEAT).collect();
+            r.sort_by(|&a, &b| self.rw[b].abs().total_cmp(&self.rw[a].abs()));
+            let top: Vec<String> = r
+                .into_iter()
+                .take(3)
+                .map(|k| format!("{} {}", FEATURE_NAMES[k].to_lowercase(), if self.rw[k] > 0.0 { "cao hơn" } else { "thấp hơn" }))
+                .collect();
+            out.push(format!(
+                "Trong một loạt ảnh cùng cảnh ({} cặp giữ/bỏ, đoán đúng {:.0}%), bạn hay chọn tấm có: {}",
+                self.rank_pairs,
+                self.rank_acc * 100.0,
+                top.join(", ")
+            ));
+        }
+        out
     }
 }
 
@@ -683,7 +803,7 @@ mod tests {
             let mut f = vec![6.0; N_FEAT];
             f[1] = sharp;
             f[3] = ((i * 7) % 10) as f32; // irrelevant
-            s.push(Sample { name: format!("a{i}"), f, keep: sharp >= 6.0, ai_keep: true, manual: false, e: vec![], origin: None, v: None });
+            s.push(Sample { name: format!("a{i}"), f, keep: sharp >= 6.0, ai_keep: true, manual: false, e: vec![], origin: None, v: None, series: None });
         }
         p.add(s);
         assert!(p.train());
@@ -699,7 +819,7 @@ mod tests {
     #[test]
     fn stays_silent_without_enough_data() {
         let mut p = Profile::new("ít");
-        p.add(vec![Sample { name: "x".into(), f: vec![5.0; N_FEAT], keep: true, ai_keep: false, manual: false, e: vec![], origin: None, v: None }]);
+        p.add(vec![Sample { name: "x".into(), f: vec![5.0; N_FEAT], keep: true, ai_keep: false, manual: false, e: vec![], origin: None, v: None, series: None }]);
         assert!(!p.train());
         assert!(p.predict(&[5.0; N_FEAT], &[]).is_none());
         assert_eq!(p.agreement(), Some(0.0));
@@ -714,10 +834,10 @@ mod tests {
             let mut f = NEUTRAL.to_vec();
             let open = i % 2 == 0;
             f[11] = if open { 4.0 } else { 0.5 };
-            s.push(Sample { name: format!("m{i}"), f, keep: !open, ai_keep: true, manual: true, e: vec![], origin: None, v: None });
+            s.push(Sample { name: format!("m{i}"), f, keep: !open, ai_keep: true, manual: true, e: vec![], origin: None, v: None, series: None });
         }
         // Plus one sample saved by the old 11-feature version.
-        s.push(Sample { name: "old".into(), f: vec![5.0; 11], keep: true, ai_keep: true, manual: false, e: vec![], origin: None, v: None });
+        s.push(Sample { name: "old".into(), f: vec![5.0; 11], keep: true, ai_keep: true, manual: false, e: vec![], origin: None, v: None, series: None });
         p.add(s);
         p.upgrade();
         assert!(p.ready() && p.samples.iter().all(|x| x.f.len() == N_FEAT));
@@ -750,7 +870,7 @@ mod tests {
         for i in 0..60u32 {
             let keep = i % 2 == 0;
             let e = vec_like(if keep { 1 } else { 2 }, i);
-            s.push(Sample { name: format!("/show{}/p{i}.jpg", i % 6), f: NEUTRAL.to_vec(), keep, ai_keep: true, manual: true, e, origin: None, v: None });
+            s.push(Sample { name: format!("/show{}/p{i}.jpg", i % 6), f: NEUTRAL.to_vec(), keep, ai_keep: true, manual: true, e, origin: None, v: None, series: None });
         }
         p.add(s);
         assert!(p.train());
@@ -767,7 +887,7 @@ mod tests {
         for show in 0..10u32 {
             for i in 0..1200u32 {
                 let keep = i % 6 == 0;
-                s.push(Sample { name: format!("/show{show}/p{i}.jpg"), f: NEUTRAL.to_vec(), keep, ai_keep: true, manual: true, e: full(vec_like(if keep { 1 } else { 2 }, i)), origin: None, v: None });
+                s.push(Sample { name: format!("/show{show}/p{i}.jpg"), f: NEUTRAL.to_vec(), keep, ai_keep: true, manual: true, e: full(vec_like(if keep { 1 } else { 2 }, i)), origin: None, v: None, series: None });
             }
         }
         p.add(s);
@@ -780,7 +900,7 @@ mod tests {
         assert!(p.train());
         eprintln!("train {} samples: {:?}", p.samples.len(), t.elapsed());
         // One more click: only the new photo is compared.
-        p.add(vec![Sample { name: "/show0/new.jpg".into(), f: NEUTRAL.to_vec(), keep: true, ai_keep: false, manual: true, e: full(vec_like(1, 5)), origin: None, v: None }]);
+        p.add(vec![Sample { name: "/show0/new.jpg".into(), f: NEUTRAL.to_vec(), keep: true, ai_keep: false, manual: true, e: full(vec_like(1, 5)), origin: None, v: None, series: None }]);
         let t = std::time::Instant::now();
         assert!(p.train());
         eprintln!("one more click: {:?}", t.elapsed());
@@ -803,7 +923,7 @@ mod tests {
         let sh = |m: &str| Some(Shared { dir: drive.clone(), machine: m.to_string(), label: m.to_string() });
         let win = Store::new(d.path().join("win")).with_shared(sh("win00001"));
         let mac = Store::new(d.path().join("mac")).with_shared(sh("mac00001"));
-        let mk = |n: &str, keep: bool| Sample { name: n.into(), f: NEUTRAL.to_vec(), keep, ai_keep: keep, manual: true, e: vec![], origin: None, v: None };
+        let mk = |n: &str, keep: bool| Sample { name: n.into(), f: NEUTRAL.to_vec(), keep, ai_keep: keep, manual: true, e: vec![], origin: None, v: None, series: None };
         let mut p = win.load("cưới");
         p.add((0..12).map(|i| mk(&format!("w{i}"), i % 2 == 0)).collect());
         win.save(&p).unwrap();
