@@ -1,0 +1,2166 @@
+// No console window on Windows release builds.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+use rawpick_core::analyze::{Analyzer, Scores};
+use rawpick_core::cull::{self, Decision, Settings, Summary, Verdict};
+use rawpick_core::export::{ExportOptions, ExportReport};
+use rawpick_core::ingest::{self, CopyReport};
+use rawpick_core::learn::{self, Store};
+use rawpick_core::options::{self, FeatureInfo, Suggestion};
+use rawpick_core::pipeline::{self, Item, Progress, Timing};
+use rawpick_core::eyes::EyeBook;
+use rawpick_core::{metrics, preview};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use tauri::{AppHandle, Emitter, Manager, State};
+
+mod web;
+
+/// Long side of the preview shown at fit size.
+const BIG_LONG: u32 = 2560;
+const FACE_MODEL: &str = "face_detection_yunet_2023mar.onnx";
+
+/// Settings of one session. New sessions start from the last settings used.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct Prefs {
+    settings: Settings,
+    export: ExportOptions,
+    /// Event type whose learned profile is used and trained.
+    profile: String,
+    recursive: bool,
+    preset: String,
+    /// Settings revision, to apply changed defaults once to saved settings.
+    rev: u32,
+}
+
+/// 1: export only the chosen photos, without report files (Sơn, 2026-11-03).
+const PREFS_REV: u32 = 1;
+
+impl Prefs {
+    fn upgrade(mut self) -> Self {
+        if self.rev < 1 {
+            self.export.copy_rejected = false;
+            self.export.copy_review = false;
+            self.export.report = false;
+        }
+        self.rev = PREFS_REV;
+        self
+    }
+}
+
+impl Default for Prefs {
+    fn default() -> Self {
+        Self { settings: Settings::default(), export: ExportOptions::default(), profile: "Sự kiện chung".into(), recursive: true, preset: "event".into(), rev: PREFS_REV }
+    }
+}
+
+/// App-wide settings file.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct Global {
+    /// Defaults for a new session.
+    prefs: Prefs,
+    /// Folder last chosen for exports.
+    export_parent: Option<PathBuf>,
+    /// The web version served by this app.
+    web: web::WebPrefs,
+    /// Folder on Google Drive (synced by the Drive app) where each export is also copied, to
+    /// send clients a link. Chosen once by Sơn.
+    drive_dir: Option<PathBuf>,
+    /// Folder on Google Drive where this computer and the others share what the AI learned.
+    sync_dir: Option<PathBuf>,
+    /// Random id of this computer, for the shared learning files.
+    machine_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum Phase {
+    Empty,
+    Waiting,
+    Analyzing,
+    Ready,
+    Exporting,
+    Failed,
+}
+
+struct Session {
+    id: u32,
+    name: String,
+    source: Option<PathBuf>,
+    prefs: Prefs,
+    phase: Phase,
+    error: Option<String>,
+    items: Vec<Item>,
+    verdicts: Vec<Verdict>,
+    overrides: HashMap<String, Decision>,
+    /// Sơn's crops, by photo path: `[x, y, w, h]` fractions of the upright photo.
+    crops: HashMap<String, [f32; 4]>,
+    suggestions: Vec<Suggestion>,
+    timing: Option<Timing>,
+    applied: Vec<String>,
+    last_export: Option<PathBuf>,
+    cancel: Arc<AtomicBool>,
+}
+
+/// What survives a restart: the folder, its settings and Sơn's manual choices.
+#[derive(Serialize, Deserialize)]
+struct SavedSession {
+    id: u32,
+    name: String,
+    source: Option<PathBuf>,
+    prefs: Prefs,
+    overrides: HashMap<String, Decision>,
+    #[serde(default)]
+    crops: HashMap<String, [f32; 4]>,
+    last_export: Option<PathBuf>,
+}
+
+impl Session {
+    fn new(id: u32, prefs: Prefs) -> Self {
+        Self {
+            id,
+            name: format!("Phiên {id}"),
+            source: None,
+            prefs,
+            phase: Phase::Empty,
+            error: None,
+            items: vec![],
+            verdicts: vec![],
+            overrides: HashMap::new(),
+            crops: HashMap::new(),
+            suggestions: vec![],
+            timing: None,
+            applied: vec![],
+            last_export: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+struct App {
+    data_dir: PathBuf,
+    /// One analysis at a time (old CPUs): waiting on this lock is the queue.
+    analyzer: Mutex<Analyzer>,
+    face_warning: Option<String>,
+    sessions: Mutex<BTreeMap<u32, Session>>,
+    next_id: AtomicU32,
+    global: Mutex<Global>,
+    card_cancel: AtomicBool,
+    card_busy: AtomicBool,
+    /// The desktop window; events also go to every open web page.
+    handle: std::sync::OnceLock<AppHandle>,
+    web: web::Web,
+    /// Sơn's open/closed-eye corrections and the eye rule fitted to them.
+    eyes: Mutex<EyeBook>,
+    /// Key people Sơn marked, found in every photo by their face.
+    keys: Mutex<rawpick_core::keypeople::KeyBook>,
+    /// Profiles whose shared copy on Drive is behind (written later in one go).
+    share_due: Mutex<std::collections::BTreeSet<String>>,
+}
+
+impl App {
+    fn emit<S: Serialize + Clone>(&self, event: &str, payload: S) {
+        if let Some(h) = self.handle.get() {
+            let _ = h.emit(event, payload.clone());
+        }
+        self.web.broadcast(event, &payload);
+    }
+
+    fn store(&self) -> Store {
+        let g = self.global.lock().unwrap();
+        let shared = g.sync_dir.as_ref().filter(|d| d.is_dir()).map(|d| learn::Shared { dir: d.clone(), machine: g.machine_id.clone(), label: machine_label() });
+        Store::new(learn::default_dir(&self.data_dir)).with_shared(shared)
+    }
+
+    fn eyes_shared(&self) -> Option<(PathBuf, String)> {
+        let g = self.global.lock().unwrap();
+        g.sync_dir.as_ref().filter(|d| d.is_dir()).map(|d| (d.clone(), g.machine_id.clone()))
+    }
+
+    fn load_eyes(&self) {
+        let sh = self.eyes_shared();
+        let b = EyeBook::load(&self.data_dir.join("eyes.json"), sh.as_ref().map(|(d, m)| (d.as_path(), m.as_str())));
+        *self.eyes.lock().unwrap() = b;
+    }
+
+    fn save_keys(&self, b: &rawpick_core::keypeople::KeyBook) {
+        let _ = b.save(&self.data_dir.join(KEYS_FILE));
+    }
+
+    fn save_eyes(&self, b: &EyeBook) {
+        let sh = self.eyes_shared();
+        let _ = b.save(&self.data_dir.join("eyes.json"), sh.as_ref().map(|(d, m)| (d.as_path(), m.as_str())));
+    }
+
+    /// Bring the shared copies on Drive up to date with this computer's latest choices.
+    fn flush_shared(&self) {
+        let due: Vec<String> = std::mem::take(&mut *self.share_due.lock().unwrap()).into_iter().collect();
+        if due.is_empty() {
+            return;
+        }
+        let store = self.store();
+        for name in due {
+            let p = store.load(&name);
+            let _ = store.save(&p);
+        }
+    }
+
+    fn save_global(&self) {
+        let g = self.global.lock().unwrap().clone();
+        let _ = std::fs::create_dir_all(&self.data_dir);
+        let _ = std::fs::write(self.data_dir.join("settings.json"), serde_json::to_vec_pretty(&g).unwrap_or_default());
+    }
+
+    fn save_sessions(&self, map: &BTreeMap<u32, Session>) {
+        let saved: Vec<SavedSession> = map
+            .values()
+            .map(|s| SavedSession {
+                id: s.id,
+                name: s.name.clone(),
+                source: s.source.clone(),
+                prefs: s.prefs.clone(),
+                overrides: s.overrides.clone(),
+                crops: s.crops.clone(),
+                last_export: s.last_export.clone(),
+            })
+            .collect();
+        let _ = std::fs::write(self.data_dir.join("sessions.json"), serde_json::to_vec_pretty(&saved).unwrap_or_default());
+    }
+
+    fn profile_view(&self, name: &str) -> ProfileView {
+        let p = self.store().load(name);
+        // Read the settings first: a lock taken inside the literal below would still be held
+        // when the next field locks again, and the app would freeze.
+        let (weight, shared) = {
+            let g = self.global.lock().unwrap();
+            (g.prefs.settings.learned_weight, g.sync_dir.as_ref().is_some_and(|d| d.is_dir()))
+        };
+        ProfileView {
+            name: p.name.clone(),
+            samples: p.samples.len(),
+            ready: p.ready(),
+            accuracy: p.ready().then_some(p.accuracy),
+            agreement: p.agreement(),
+            explain: p.explain(),
+            min_samples: learn::MIN_SAMPLES,
+            manual: p.manual_count(),
+            trust: p.trust(weight),
+            seen: p.seen_count(),
+            shared,
+        }
+    }
+
+    /// Re-decide with the session's settings and keep Sơn's manual choices.
+    fn recull(&self, s: &mut Session) {
+        for it in s.items.iter_mut() {
+            let crop = s.crops.get(&it.path.display().to_string()).copied();
+            if let Some(a) = it.analysis.as_mut() {
+                a.crop = crop;
+            }
+        }
+        {
+            let keys = self.keys.lock().unwrap();
+            for it in s.items.iter_mut() {
+                if let Some(a) = it.analysis.as_mut() {
+                    keys.mark(a);
+                }
+            }
+        }
+        // Eyes first: Sơn's corrections may have changed who has their eyes closed.
+        {
+            let book = self.eyes.lock().unwrap();
+            for it in s.items.iter_mut() {
+                let key = it.path.display().to_string();
+                if let Some(a) = it.analysis.as_mut() {
+                    rawpick_core::analyze::rejudge(a, &book, &key);
+                }
+            }
+        }
+        let prof = self.store().load(&s.prefs.profile);
+        s.verdicts = pipeline::decide(&s.items, &s.prefs.settings, Some(&prof));
+        pipeline::apply_overrides(&mut s.verdicts, &s.items, &s.overrides);
+    }
+}
+
+#[derive(Serialize, Clone)]
+struct ProgressEvent {
+    session: Option<u32>,
+    done: usize,
+    total: usize,
+    stage: String,
+}
+
+#[derive(Serialize)]
+struct ProfileView {
+    name: String,
+    samples: usize,
+    ready: bool,
+    accuracy: Option<f32>,
+    agreement: Option<f32>,
+    explain: Vec<String>,
+    min_samples: usize,
+    /// Photos Sơn decided by hand.
+    manual: usize,
+    /// Share of the score that comes from his learned taste.
+    trust: f32,
+    /// Photos the AI can compare by look.
+    seen: usize,
+    /// Learning shared with other computers through Google Drive.
+    shared: bool,
+}
+
+#[derive(Serialize)]
+struct FaceBox {
+    bbox: [f32; 4],
+    closed: bool,
+    main: bool,
+    issues: Vec<String>,
+    /// Eyes can be judged (and corrected): face not too small.
+    eyes: bool,
+    /// Sơn corrected these eyes himself.
+    by_hand: bool,
+    /// Unflattering mouth, face turned, looking down (as judged now).
+    mouth: bool,
+    turned: bool,
+    down: bool,
+    /// Which of those Sơn set himself ("mouth", "turned", "down").
+    hand_marks: Vec<&'static str>,
+    /// Too small to judge mouth and head.
+    small: bool,
+    /// The key person this face is (Sơn's list).
+    person: Option<u32>,
+    /// A fingerprint exists, so it can be marked as a key person.
+    known: bool,
+}
+
+#[derive(Serialize)]
+struct PhotoView {
+    idx: usize,
+    name: String,
+    path: String,
+    files: Vec<String>,
+    thumb: Option<String>,
+    camera: String,
+    time: Option<f64>,
+    width: u32,
+    height: u32,
+    scores: Option<Scores>,
+    /// Per-criterion explanations, in `CRITERIA` order.
+    notes: Vec<(String, Vec<String>)>,
+    faces: Vec<FaceBox>,
+    error: Option<String>,
+    /// Stars given on the camera / in Lightroom, and the camera's protect lock.
+    stars: u8,
+    protected: bool,
+    /// Sơn's crop for export, `[x, y, w, h]` of the upright photo.
+    crop: Option<[f32; 4]>,
+}
+
+#[derive(Serialize)]
+struct VerdictsView {
+    verdicts: Vec<Verdict>,
+    summary: Summary,
+    /// After a hand-made choice: what the AI has learned so far.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile: Option<ProfileView>,
+}
+
+/// Small description of a session for the tab bar.
+#[derive(Serialize)]
+struct SessionMeta {
+    id: u32,
+    name: String,
+    source: Option<String>,
+    phase: Phase,
+    error: Option<String>,
+    summary: Option<Summary>,
+    prefs: Prefs,
+    last_export: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SessionView {
+    meta: SessionMeta,
+    photos: Vec<PhotoView>,
+    verdicts: Vec<Verdict>,
+    summary: Summary,
+    suggestions: Vec<Suggestion>,
+    applied: Vec<String>,
+    timing: Option<Timing>,
+    profile: ProfileView,
+}
+
+fn meta(s: &Session) -> SessionMeta {
+    SessionMeta {
+        id: s.id,
+        name: s.name.clone(),
+        source: s.source.as_ref().map(|p| p.display().to_string()),
+        phase: s.phase,
+        error: s.error.clone(),
+        summary: (s.phase == Phase::Ready || s.phase == Phase::Exporting).then(|| cull::summarize(&s.verdicts)),
+        prefs: s.prefs.clone(),
+        last_export: s.last_export.as_ref().map(|p| p.display().to_string()),
+    }
+}
+
+fn photo_view(idx: usize, it: &Item) -> PhotoView {
+    let a = it.analysis.as_ref();
+    PhotoView {
+        idx,
+        name: it.path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+        path: it.path.display().to_string(),
+        files: it.files.iter().map(|p| p.display().to_string()).collect(),
+        thumb: a.and_then(|a| a.thumb.as_ref()).map(|p| p.display().to_string()),
+        camera: a.map(|a| a.camera.clone()).unwrap_or_default(),
+        time: a.and_then(|a| a.time),
+        width: a.map(|a| a.width).unwrap_or(0),
+        height: a.map(|a| a.height).unwrap_or(0),
+        scores: a.map(|a| a.scores),
+        notes: a
+            .map(|a| {
+                vec![
+                    ("exposure".into(), a.exposure.notes.clone()),
+                    ("sharp".into(), a.sharp.notes.clone()),
+                    ("comp".into(), a.comp.notes.clone()),
+                    ("color".into(), a.color.notes.clone()),
+                    ("noise".into(), a.noise.notes.clone()),
+                    ("people".into(), a.people.notes.clone()),
+                ]
+            })
+            .unwrap_or_default(),
+        faces: a
+            .map(|a| a.people.faces.iter().enumerate().map(|(i, f)| FaceBox {
+                        bbox: f.bbox,
+                        closed: f.closed,
+                        main: f.main,
+                        issues: f.issues.clone(),
+                        eyes: f.eye_seen,
+                        by_hand: f.by_hand,
+                        mouth: f.mouth_bad,
+                        turned: f.turned,
+                        down: f.down,
+                        hand_marks: f.hand_marks.iter().map(|m| m.key()).collect(),
+                        small: f.small,
+                        person: a.key_faces.iter().find(|k| k.0 == i).map(|k| k.1),
+                        known: !f.id.is_empty(),
+                    }).collect())
+            .unwrap_or_default(),
+        error: it.error.clone(),
+        stars: a.map(|a| a.stars).unwrap_or(0),
+        protected: a.is_some_and(|a| a.protected),
+        crop: a.and_then(|a| a.crop),
+    }
+}
+
+fn session_view(app: &App, s: &Session) -> SessionView {
+    SessionView {
+        meta: meta(s),
+        photos: s.items.iter().enumerate().map(|(i, it)| photo_view(i, it)).collect(),
+        verdicts: s.verdicts.clone(),
+        summary: cull::summarize(&s.verdicts),
+        suggestions: s.suggestions.clone(),
+        applied: s.applied.clone(),
+        timing: s.timing.clone(),
+        profile: app.profile_view(&s.prefs.profile),
+    }
+}
+
+fn emitter(app: &App, session: Option<u32>) -> impl Fn(usize, usize, &str) + Sync + '_ {
+    move |done, total, stage| {
+        app.emit("progress", ProgressEvent { session, done, total, stage: stage.to_string() });
+    }
+}
+
+fn sessions_changed(app: &App) {
+    app.emit("sessions-changed", ());
+}
+
+/// Name of this computer, shown next to its shared learning file.
+fn machine_label() -> String {
+    for k in ["COMPUTERNAME", "HOSTNAME"] {
+        if let Ok(v) = std::env::var(k) {
+            if !v.trim().is_empty() {
+                return v.trim().to_string();
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if let Ok(o) = std::process::Command::new("scutil").args(["--get", "ComputerName"]).output() {
+        let v = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        if !v.is_empty() {
+            return v;
+        }
+    }
+    if cfg!(target_os = "macos") { "Mac".into() } else { "May-tinh".into() }
+}
+
+/// Google Drive folders the Drive app shows on this computer (to open the folder picker there).
+fn drive_roots() -> Vec<PathBuf> {
+    #[allow(unused_mut)]
+    let mut out = vec![];
+    #[cfg(windows)]
+    for l in b'D'..=b'Z' {
+        for n in ["My Drive", "Drive của tôi"] {
+            let p = PathBuf::from(format!("{}:\\{n}", l as char));
+            if p.is_dir() {
+                out.push(p);
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(h) = std::env::var_os("HOME") {
+        if let Ok(rd) = std::fs::read_dir(Path::new(&h).join("Library/CloudStorage")) {
+            for e in rd.flatten() {
+                if e.file_name().to_string_lossy().starts_with("GoogleDrive") {
+                    for n in ["My Drive", "Drive của tôi"] {
+                        let p = e.path().join(n);
+                        if p.is_dir() {
+                            out.push(p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Link of a folder synced by Google Drive for desktop, when the Drive app tells us its id
+/// (macOS keeps it in an extended attribute; elsewhere we can only open the folder).
+fn drive_link(dir: &Path) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let o = std::process::Command::new("xattr").args(["-p", "com.google.drivefs.item-id#S"]).arg(dir).output().ok()?;
+        let id = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        if o.status.success() && !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            return Some(format!("https://drive.google.com/drive/folders/{id}"));
+        }
+    }
+    let _ = dir;
+    None
+}
+
+fn folder_name(p: &Path) -> String {
+    p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| p.display().to_string())
+}
+
+#[derive(Serialize)]
+struct AppInfo {
+    version: String,
+    threads: usize,
+    data_dir: String,
+    face_ok: bool,
+    face_warning: Option<String>,
+    catalog: Vec<FeatureInfo>,
+    criteria: Vec<&'static str>,
+    defaults: Prefs,
+    profiles: Vec<String>,
+    export_parent: Option<String>,
+    drive_dir: Option<String>,
+    sync_dir: Option<String>,
+    drive_roots: Vec<String>,
+    machine: String,
+    sessions: Vec<SessionMeta>,
+}
+
+fn op_app_info(app: &Arc<App>) -> AppInfo {
+    let g = app.global.lock().unwrap().clone();
+    let sessions: Vec<SessionMeta> = app.sessions.lock().unwrap().values().map(meta).collect();
+    let mut profiles = app.store().list();
+    for s in &sessions {
+        if !profiles.contains(&s.prefs.profile) {
+            profiles.push(s.prefs.profile.clone());
+        }
+    }
+    if !profiles.contains(&g.prefs.profile) {
+        profiles.insert(0, g.prefs.profile.clone());
+    }
+    AppInfo {
+        version: env!("CARGO_PKG_VERSION").into(),
+        threads: pipeline::threads(),
+        data_dir: app.data_dir.display().to_string(),
+        face_ok: app.face_warning.is_none(),
+        face_warning: app.face_warning.clone(),
+        catalog: options::catalog(),
+        criteria: rawpick_core::analyze::CRITERIA.to_vec(),
+        defaults: g.prefs,
+        profiles,
+        export_parent: g.export_parent.map(|p| p.display().to_string()),
+        drive_dir: g.drive_dir.map(|p| p.display().to_string()),
+        sync_dir: g.sync_dir.map(|p| p.display().to_string()),
+        drive_roots: drive_roots().into_iter().map(|p| p.display().to_string()).collect(),
+        machine: machine_label(),
+        sessions,
+    }
+}
+
+fn op_new_session(app: &Arc<App>) -> SessionMeta {
+    let id = app.next_id.fetch_add(1, Ordering::SeqCst);
+    let prefs = app.global.lock().unwrap().prefs.clone();
+    let mut map = app.sessions.lock().unwrap();
+    let s = Session::new(id, prefs);
+    let m = meta(&s);
+    map.insert(id, s);
+    app.save_sessions(&map);
+    drop(map);
+    sessions_changed(app);
+    m
+}
+
+fn op_close_session(app: &Arc<App>, id: u32) {
+    let mut map = app.sessions.lock().unwrap();
+    if let Some(s) = map.remove(&id) {
+        s.cancel.store(true, Ordering::SeqCst);
+    }
+    app.save_sessions(&map);
+    drop(map);
+    sessions_changed(app);
+}
+
+fn op_list_sessions(app: &Arc<App>) -> Vec<SessionMeta> {
+    app.sessions.lock().unwrap().values().map(meta).collect()
+}
+
+fn op_get_session(app: &Arc<App>, id: u32) -> Result<SessionView, String> {
+    let map = app.sessions.lock().unwrap();
+    let s = map.get(&id).ok_or("Phiên đã đóng")?;
+    Ok(session_view(&app, s))
+}
+
+/// Save a session's settings (they also become the defaults for new sessions)
+/// and re-decide instantly; no re-analysis needed.
+fn op_save_prefs(app: &Arc<App>, id: Option<u32>, prefs: Prefs) -> Option<VerdictsView> {
+    app.global.lock().unwrap().prefs = prefs.clone();
+    app.save_global();
+    let mut map = app.sessions.lock().unwrap();
+    let s = map.get_mut(&id?)?;
+    s.prefs = prefs;
+    let out = if s.phase == Phase::Ready {
+        app.recull(s);
+        Some(VerdictsView { verdicts: s.verdicts.clone(), summary: cull::summarize(&s.verdicts), profile: None })
+    } else {
+        None
+    };
+    app.save_sessions(&map);
+    out
+}
+
+fn op_profile_info(app: &Arc<App>, name: String) -> ProfileView {
+    app.profile_view(&name)
+}
+
+/// Analyse a folder in a session. With `source` = None the session's saved folder is reopened
+/// (instant thanks to the cache). Several calls queue up and run one after another.
+fn op_analyze(app: &Arc<App>, id: u32, source: Option<String>) -> Result<SessionView, String> {
+    let app = app.clone();
+    (move || {
+        let (source, prefs, cancel) = {
+            let mut map = app.sessions.lock().unwrap();
+            let s = map.get_mut(&id).ok_or("Phiên đã đóng")?;
+            if matches!(s.phase, Phase::Waiting | Phase::Analyzing | Phase::Exporting) {
+                return Err("Phiên này đang chạy, đợi xong hoặc bấm Dừng".to_string());
+            }
+            let src = match source {
+                Some(p) => PathBuf::from(p),
+                None => s.source.clone().ok_or("Phiên chưa có thư mục")?,
+            };
+            if !src.is_dir() {
+                s.phase = if s.items.is_empty() { Phase::Failed } else { Phase::Ready };
+                s.error = Some(format!("Không tìm thấy thư mục {}", src.display()));
+                return Err(s.error.clone().unwrap());
+            }
+            if s.source.as_ref() != Some(&src) {
+                s.overrides.clear();
+                s.crops.clear();
+            }
+            s.name = folder_name(&src);
+            s.source = Some(src.clone());
+            s.phase = Phase::Waiting;
+            s.error = None;
+            s.cancel.store(false, Ordering::SeqCst);
+            let out = (src, s.prefs.clone(), s.cancel.clone());
+            app.save_sessions(&map);
+            out
+        };
+        sessions_changed(&app);
+        let on_step = emitter(&app, Some(id));
+        on_step(0, 0, "Đang chờ phiên khác phân tích xong");
+
+        let work = pipeline::work_dir(&app.data_dir, &source);
+        let result = (|| {
+            let thumbs = work.join("thumbs");
+            std::fs::create_dir_all(&thumbs).map_err(|e| e.to_string())?;
+            let mut an = app.analyzer.lock().unwrap();
+            if cancel.load(Ordering::SeqCst) {
+                return Err("Đã dừng".to_string());
+            }
+            if let Some(s) = app.sessions.lock().unwrap().get_mut(&id) {
+                s.phase = Phase::Analyzing;
+            }
+            sessions_changed(&app);
+            an.thumbs_dir = Some(thumbs);
+            let p = Progress { on_step: &on_step, cancel: &cancel };
+            pipeline::analyze_all(&source, prefs.recursive, &an, Some(&work), &p).map_err(|e| format!("{e:#}"))
+        })();
+
+        let mut map = app.sessions.lock().unwrap();
+        let s = map.get_mut(&id).ok_or("Phiên đã đóng")?;
+        let (items, timing) = match result {
+            Ok(r) if cancel.load(Ordering::SeqCst) => {
+                drop(r);
+                s.phase = if s.items.is_empty() { Phase::Empty } else { Phase::Ready };
+                drop(map);
+                sessions_changed(&app);
+                return Err("Đã dừng".into());
+            }
+            Ok(r) => r,
+            Err(e) => {
+                s.phase = Phase::Failed;
+                s.error = Some(e.clone());
+                drop(map);
+                sessions_changed(&app);
+                return Err(e);
+            }
+        };
+        if items.is_empty() {
+            s.phase = Phase::Failed;
+            s.error = Some("Thư mục không có ảnh RAW hoặc JPEG nào".into());
+            let e = s.error.clone().unwrap();
+            drop(map);
+            sessions_changed(&app);
+            return Err(e);
+        }
+        s.suggestions = pipeline::suggestions(&items, &source);
+        s.applied = options::auto_apply(&mut s.prefs.settings.options, &s.suggestions);
+        s.items = items;
+        s.timing = Some(timing);
+        s.phase = Phase::Ready;
+        app.recull(s);
+        let view = session_view(&app, s);
+        app.save_sessions(&map);
+        drop(map);
+        sessions_changed(&app);
+        Ok(view)
+    })()
+}
+
+/// Sơn's manual choice for one photo; `None` returns it to the AI's decision.
+fn op_set_decision(app: &Arc<App>, id: u32, idx: usize, decision: Option<Decision>) -> Result<VerdictsView, String> {
+    op_set_decisions(app, id, &[idx], decision)
+}
+
+/// Sơn's choice for several photos at once (ticked in the grid, or Ctrl+A): one re-judge and
+/// one round of learning for all of them.
+fn op_set_decisions(app: &Arc<App>, id: u32, idxs: &[usize], decision: Option<Decision>) -> Result<VerdictsView, String> {
+    let mut map = app.sessions.lock().unwrap();
+    let s = map.get_mut(&id).ok_or("Phiên đã đóng")?;
+    let mut samples = vec![];
+    for &idx in idxs {
+        let key = s.items.get(idx).ok_or("Sai ảnh")?.path.display().to_string();
+        match decision {
+            Some(d) => {
+                s.overrides.insert(key.clone(), d);
+                // Learn right away from every hand-made choice (no need to export first).
+                if let (Some(a), Some(v)) = (s.items[idx].analysis.as_ref(), s.verdicts.get(idx)) {
+                    // Picked although the AI saw closed eyes: the eyes of the people who matter were
+                    // most likely open. Taken as a soft hint for the eye rule.
+                    if d.keep() && a.people.closed_eyes {
+                        let mut book = app.eyes.lock().unwrap();
+                        for fi in rawpick_core::faces::lead_faces(&a.people) {
+                            let f = &a.people.faces[fi];
+                            if f.closed && !f.by_hand && f.eye_seen {
+                                book.set(&key, fi, f.eye_features(), Some(false), false);
+                            }
+                        }
+                        app.save_eyes(&book);
+                    }
+                    samples.push(learn::Sample::new(key, a, d.keep(), v.ai_decision.keep(), true));
+                }
+            }
+            None => {
+                s.overrides.remove(&key);
+            }
+        }
+    }
+    let mut profile = None;
+    if !samples.is_empty() {
+        let store = app.store();
+        let mut p = store.load(&s.prefs.profile);
+        p.add(samples);
+        p.train();
+        if let Ok(false) = store.save_quick(&p) {
+            app.share_due.lock().unwrap().insert(s.prefs.profile.clone());
+        }
+        profile = Some(app.profile_view(&s.prefs.profile));
+    }
+    app.recull(s);
+    let v = VerdictsView { verdicts: s.verdicts.clone(), summary: cull::summarize(&s.verdicts), profile };
+    app.save_sessions(&map);
+    Ok(v)
+}
+
+#[derive(Serialize)]
+struct EyesResult {
+    photo: PhotoView,
+    verdicts: Vec<Verdict>,
+    summary: Summary,
+    /// Faces Sơn has corrected so far (all shows).
+    corrected: usize,
+}
+
+/// Sơn says the eyes of face `face` in photo `idx` are open (`open = true`), closed, or lets the
+/// AI decide again (`None`). The photo changes at once; the eye rule learns from it for every
+/// other photo.
+fn op_set_eyes(app: &Arc<App>, id: u32, idx: usize, face: usize, open: Option<bool>) -> Result<EyesResult, String> {
+    let mut map = app.sessions.lock().unwrap();
+    let s = map.get_mut(&id).ok_or("Phiên đã đóng")?;
+    let it = s.items.get(idx).ok_or("Sai ảnh")?;
+    let key = it.path.display().to_string();
+    let f = it.analysis.as_ref().and_then(|a| a.people.faces.get(face)).ok_or("Không có khuôn mặt này")?;
+    if !f.eye_seen {
+        return Err("Mặt này quá nhỏ để xét mắt".into());
+    }
+    let x = f.eye_features();
+    let corrected = {
+        let mut book = app.eyes.lock().unwrap();
+        book.set(&key, face, x, open.map(|o| !o), true);
+        app.save_eyes(&book);
+        book.manual_count()
+    };
+    // Re-decide every open session: the new rule applies to all of them.
+    let ids: Vec<u32> = map.keys().copied().collect();
+    for sid in ids {
+        if let Some(x) = map.get_mut(&sid) {
+            if !x.items.is_empty() {
+                app.recull(x);
+            }
+        }
+    }
+    let s = map.get(&id).ok_or("Phiên đã đóng")?;
+    let r = EyesResult { photo: photo_view(idx, &s.items[idx]), verdicts: s.verdicts.clone(), summary: cull::summarize(&s.verdicts), corrected };
+    app.save_sessions(&map);
+    drop(map);
+    sessions_changed(app);
+    Ok(r)
+}
+
+/// Sơn's crop for photo `idx` (`None` removes it). Only the exported copy is cut; the original
+/// and its decision stay as they are.
+fn op_set_crop(app: &Arc<App>, id: u32, idx: usize, crop: Option<[f32; 4]>) -> Result<PhotoView, String> {
+    let mut map = app.sessions.lock().unwrap();
+    let s = map.get_mut(&id).ok_or("Phiên đã đóng")?;
+    let it = s.items.get_mut(idx).ok_or("Sai ảnh")?;
+    let key = it.path.display().to_string();
+    let crop = crop.and_then(rawpick_core::crop::clean);
+    match crop {
+        Some(c) => s.crops.insert(key, c),
+        None => s.crops.remove(&key),
+    };
+    if let Some(a) = it.analysis.as_mut() {
+        a.crop = crop;
+    }
+    let v = photo_view(idx, it);
+    app.save_sessions(&map);
+    Ok(v)
+}
+
+/// Sơn says face `face` of photo `idx` has (`yes = true`) or has not an unflattering mouth /
+/// a turned face / a bowed head, or lets the AI judge again (`None`). Learned for every photo.
+fn op_set_mark(app: &Arc<App>, id: u32, idx: usize, face: usize, mark: &str, yes: Option<bool>) -> Result<EyesResult, String> {
+    let m = rawpick_core::eyes::Mark::from_key(mark).ok_or("Sai loại")?;
+    let mut map = app.sessions.lock().unwrap();
+    let s = map.get_mut(&id).ok_or("Phiên đã đóng")?;
+    let it = s.items.get(idx).ok_or("Sai ảnh")?;
+    let key = it.path.display().to_string();
+    let f = it.analysis.as_ref().and_then(|a| a.people.faces.get(face)).ok_or("Không có khuôn mặt này")?;
+    if f.small {
+        return Err("Mặt này quá nhỏ để xét".into());
+    }
+    let x = rawpick_core::eyes::mark_features(m, f.mouth_open, f.yaw, f.pitch);
+    let corrected = {
+        let mut book = app.eyes.lock().unwrap();
+        book.set_mark(m, &key, face, x, yes);
+        app.save_eyes(&book);
+        book.manual_count()
+    };
+    let ids: Vec<u32> = map.keys().copied().collect();
+    for sid in ids {
+        if let Some(x) = map.get_mut(&sid) {
+            if !x.items.is_empty() {
+                app.recull(x);
+            }
+        }
+    }
+    let s = map.get(&id).ok_or("Phiên đã đóng")?;
+    let r = EyesResult { photo: photo_view(idx, &s.items[idx]), verdicts: s.verdicts.clone(), summary: cull::summarize(&s.verdicts), corrected };
+    app.save_sessions(&map);
+    drop(map);
+    sessions_changed(app);
+    Ok(r)
+}
+
+const KEYS_FILE: &str = "key-people.json";
+
+#[derive(Serialize)]
+struct KeyPeopleView {
+    people: Vec<rawpick_core::keypeople::KeyPerson>,
+}
+
+#[derive(Serialize)]
+struct KeyResult {
+    people: Vec<rawpick_core::keypeople::KeyPerson>,
+    person: Option<u32>,
+    photo: Option<PhotoView>,
+    verdicts: Vec<Verdict>,
+    summary: cull::Summary,
+}
+
+fn op_key_people(app: &Arc<App>) -> KeyPeopleView {
+    let mut people = app.keys.lock().unwrap().people.clone();
+    people.iter_mut().for_each(|p| p.faces.clear());
+    KeyPeopleView { people }
+}
+
+/// Re-mark and re-judge every open session after the key people list changed.
+fn recull_all(app: &Arc<App>, map: &mut BTreeMap<u32, Session>) {
+    let ids: Vec<u32> = map.keys().copied().collect();
+    for sid in ids {
+        if let Some(x) = map.get_mut(&sid) {
+            if !x.items.is_empty() {
+                app.recull(x);
+            }
+        }
+    }
+}
+
+fn key_result(app: &Arc<App>, map: &BTreeMap<u32, Session>, id: Option<u32>, idx: Option<usize>, person: Option<u32>) -> KeyResult {
+    let s = id.and_then(|i| map.get(&i));
+    KeyResult {
+        people: op_key_people(app).people,
+        person,
+        photo: s.zip(idx).and_then(|(s, i)| s.items.get(i).map(|it| photo_view(i, it))),
+        verdicts: s.map(|s| s.verdicts.clone()).unwrap_or_default(),
+        summary: s.map(|s| cull::summarize(&s.verdicts)).unwrap_or_default(),
+    }
+}
+
+fn op_add_key_person(app: &Arc<App>, id: u32, idx: usize, face: usize, name: &str, to: Option<u32>) -> Result<KeyResult, String> {
+    let mut map = app.sessions.lock().unwrap();
+    let s = map.get(&id).ok_or("Phiên đã đóng")?;
+    let it = s.items.get(idx).ok_or("Sai ảnh")?;
+    let a = it.analysis.as_ref().ok_or("Ảnh chưa phân tích")?;
+    let f = a.people.faces.get(face).ok_or("Không có khuôn mặt này")?;
+    if f.id.is_empty() {
+        return Err("Mặt này quá nhỏ hoặc chưa được nhận diện (cần mở lại thư mục để phân tích bằng bản mới)".into());
+    }
+    let thumb = a.thumb.as_ref().map(|p| p.display().to_string());
+    let pid = {
+        let mut keys = app.keys.lock().unwrap();
+        let pid = keys.add(f.id.clone(), name, to, thumb, f.bbox).ok_or("Không đánh dấu được khuôn mặt này")?;
+        app.save_keys(&keys);
+        pid
+    };
+    recull_all(app, &mut map);
+    let r = key_result(app, &map, Some(id), Some(idx), Some(pid));
+    app.save_sessions(&map);
+    drop(map);
+    sessions_changed(app);
+    Ok(r)
+}
+
+/// Rename (with a name) or remove (without) a key person.
+fn op_edit_key_person(app: &Arc<App>, person: u32, name: Option<&str>) -> Result<KeyResult, String> {
+    let mut map = app.sessions.lock().unwrap();
+    {
+        let mut keys = app.keys.lock().unwrap();
+        let ok = match name {
+            Some(n) => keys.rename(person, n),
+            None => keys.remove(person),
+        };
+        if !ok {
+            return Err("Không tìm thấy nhân vật này".into());
+        }
+        app.save_keys(&keys);
+    }
+    recull_all(app, &mut map);
+    let r = key_result(app, &map, None, None, Some(person));
+    app.save_sessions(&map);
+    drop(map);
+    sessions_changed(app);
+    Ok(r)
+}
+
+/// Teach the session's event-type profile from its final choices.
+fn learn_from(app: &App, profile: &str, items: &[Item], verdicts: &[Verdict]) -> ProfileView {
+    let store = app.store();
+    let mut p = store.load(profile);
+    p.add(pipeline::training_samples(items, verdicts));
+    p.train();
+    let _ = store.save(&p);
+    app.profile_view(profile)
+}
+
+fn op_train(app: &Arc<App>, id: u32) -> Result<ProfileView, String> {
+    let map = app.sessions.lock().unwrap();
+    let s = map.get(&id).ok_or("Phiên đã đóng")?;
+    Ok(learn_from(&app, &s.prefs.profile, &s.items, &s.verdicts))
+}
+
+#[derive(Serialize)]
+struct ExportResult {
+    report: ExportReport,
+    profile: ProfileView,
+}
+
+/// The folder an export into `parent` will create.
+fn op_export_target(app: &Arc<App>, id: u32, parent: String) -> Result<String, String> {
+    let map = app.sessions.lock().unwrap();
+    let s = map.get(&id).ok_or("Phiên đã đóng")?;
+    let src = s.source.as_ref().ok_or("Phiên chưa có thư mục")?;
+    Ok(Path::new(&parent).join(rawpick_core::export::out_name(src)).display().to_string())
+}
+
+/// Export into `<parent>/<folder name> - Anh chon`, `parent` chosen by Sơn.
+fn op_export_folder(app: &Arc<App>, id: u32, parent: String) -> Result<ExportResult, String> {
+    let app = app.clone();
+    (move || {
+        let parent = PathBuf::from(parent);
+        if !parent.is_dir() {
+            return Err(format!("Không tìm thấy thư mục {}", parent.display()));
+        }
+        // Snapshot the session so it stays usable (and other sessions run) while copying.
+        let (source, items, verdicts, opts, profile, cancel) = {
+            let mut map = app.sessions.lock().unwrap();
+            let s = map.get_mut(&id).ok_or("Phiên đã đóng")?;
+            if s.phase != Phase::Ready {
+                return Err("Phiên này chưa phân tích xong".into());
+            }
+            s.phase = Phase::Exporting;
+            s.cancel.store(false, Ordering::SeqCst);
+            let mut opts = s.prefs.export.clone();
+            opts.report = opts.report && s.prefs.settings.options.report;
+            (s.source.clone().unwrap(), s.items.clone(), s.verdicts.clone(), opts, s.prefs.profile.clone(), s.cancel.clone())
+        };
+        sessions_changed(&app);
+        let out = parent.join(rawpick_core::export::out_name(&source));
+        let on_step = emitter(&app, Some(id));
+        let p = Progress { on_step: &on_step, cancel: &cancel };
+        let res = pipeline::export_all(&source, &items, &verdicts, &out, &opts, &p).map_err(|e| format!("{e:#}"));
+        {
+            let mut map = app.sessions.lock().unwrap();
+            if let Some(s) = map.get_mut(&id) {
+                s.phase = Phase::Ready;
+                if res.is_ok() {
+                    s.last_export = Some(out.clone());
+                }
+            }
+            app.save_sessions(&map);
+        }
+        {
+            let mut g = app.global.lock().unwrap();
+            g.export_parent = Some(parent);
+        }
+        app.save_global();
+        sessions_changed(&app);
+        let report = res?;
+        // Every export teaches the AI what Sơn finally kept.
+        let profile = learn_from(&app, &profile, &items, &verdicts);
+        Ok(ExportResult { report, profile })
+    })()
+}
+
+#[derive(Serialize)]
+struct GatherResult {
+    report: pipeline::GatherReport,
+    view: SessionView,
+}
+
+#[derive(Serialize)]
+struct DriveCopy {
+    dir: PathBuf,
+    /// Shareable link when the Drive app tells us the folder's id.
+    link: Option<String>,
+    report: ExportReport,
+}
+
+#[derive(Serialize)]
+struct ShowExport {
+    /// The archive inside the source folder.
+    report: ExportReport,
+    drive: Option<DriveCopy>,
+    /// Why the copy to Google Drive did not happen.
+    drive_error: Option<String>,
+    profile: ProfileView,
+}
+
+/// Sơn's one-click export (2026-11-04): the picks go into `<source>/<source>_anh chon` to be
+/// archived with the show, then the same folder is copied to his Google Drive folder, which the
+/// Drive app uploads, so he can send clients a link.
+fn op_export_show(app: &Arc<App>, id: u32) -> Result<ShowExport, String> {
+    let app = app.clone();
+    (move || {
+        let (source, items, verdicts, opts, profile, cancel) = {
+            let mut map = app.sessions.lock().unwrap();
+            let s = map.get_mut(&id).ok_or("Phiên đã đóng")?;
+            if s.phase != Phase::Ready {
+                return Err("Phiên này chưa phân tích xong".into());
+            }
+            s.phase = Phase::Exporting;
+            s.cancel.store(false, Ordering::SeqCst);
+            let mut opts = s.prefs.export.clone();
+            opts.report = opts.report && s.prefs.settings.options.report;
+            (s.source.clone().unwrap(), s.items.clone(), s.verdicts.clone(), opts, s.prefs.profile.clone(), s.cancel.clone())
+        };
+        sessions_changed(&app);
+        let name = rawpick_core::export::out_name(&source);
+        let archive = source.join(&name);
+        let on_step = emitter(&app, Some(id));
+        let p = Progress { on_step: &on_step, cancel: &cancel };
+        let res = pipeline::export_all(&source, &items, &verdicts, &archive, &opts, &p).map_err(|e| format!("{e:#}"));
+        let drive_dir = app.global.lock().unwrap().drive_dir.clone();
+        let mut drive = None;
+        let mut drive_error = None;
+        if let (Ok(_), Some(d)) = (&res, drive_dir) {
+            if !d.is_dir() {
+                drive_error = Some(format!("Không thấy thư mục Google Drive {}. App Google Drive đã mở và đăng nhập chưa?", d.display()));
+            } else if !cancel.load(Ordering::SeqCst) {
+                let step = |n: usize, t: usize, _: &str| on_step(n, t, "Đang chép lên Google Drive");
+                let p2 = Progress { on_step: &step, cancel: &cancel };
+                // Always a copy: the archive keeps the photos, Drive gets its own.
+                let o2 = ExportOptions { move_files: false, ..opts.clone() };
+                let out = d.join(&name);
+                match pipeline::export_all(&source, &items, &verdicts, &out, &o2, &p2) {
+                    Ok(r) => drive = Some(DriveCopy { link: drive_link(&out), dir: out, report: r }),
+                    Err(e) => drive_error = Some(format!("Chép lên Google Drive lỗi: {e:#}")),
+                }
+            }
+        }
+        {
+            let mut map = app.sessions.lock().unwrap();
+            if let Some(s) = map.get_mut(&id) {
+                s.phase = Phase::Ready;
+                if res.is_ok() {
+                    s.last_export = Some(archive.clone());
+                }
+            }
+            app.save_sessions(&map);
+        }
+        sessions_changed(&app);
+        let report = res?;
+        let profile = learn_from(&app, &profile, &items, &verdicts);
+        Ok(ShowExport { report, drive, drive_error, profile })
+    })()
+}
+
+/// Remember (or forget, with `None`) a folder in Global: the Google Drive export folder or the
+/// shared learning folder.
+fn op_set_folder(app: &Arc<App>, which: &str, path: Option<String>) -> Result<AppInfo, String> {
+    let p = path.filter(|p| !p.trim().is_empty()).map(PathBuf::from);
+    if let Some(d) = &p {
+        if !d.is_dir() {
+            return Err(format!("Không tìm thấy thư mục {}", d.display()));
+        }
+    }
+    {
+        let mut g = app.global.lock().unwrap();
+        match which {
+            "drive" => g.drive_dir = p,
+            _ => g.sync_dir = p,
+        }
+    }
+    app.save_global();
+    if which != "drive" {
+        app.load_eyes();
+    }
+    Ok(op_app_info(app))
+}
+
+#[derive(Serialize)]
+struct LessonResult {
+    lesson: rawpick_core::lesson::Lesson,
+    profile: ProfileView,
+}
+
+/// «Học từ show cũ»: look at an old, already culled show and learn Sơn's picks from it.
+fn op_learn_show(app: &Arc<App>, path: String, profile: String) -> Result<LessonResult, String> {
+    let app = app.clone();
+    (move || {
+        let dir = PathBuf::from(&path);
+        if !dir.is_dir() {
+            return Err(format!("Không tìm thấy thư mục {path}"));
+        }
+        let on_step = emitter(&app, None);
+        on_step(0, 0, "Đang chờ phiên khác phân tích xong");
+        app.card_cancel.store(false, Ordering::SeqCst);
+        let work = pipeline::work_dir(&app.data_dir, &dir);
+        let (samples, lesson) = {
+            let mut an = app.analyzer.lock().unwrap();
+            an.thumbs_dir = None;
+            let p = Progress { on_step: &on_step, cancel: &app.card_cancel };
+            rawpick_core::lesson::learn_show(&dir, &an, Some(&work), &p).map_err(|e| format!("{e:#}"))?
+        };
+        if app.card_cancel.load(Ordering::SeqCst) {
+            return Err("Đã dừng".into());
+        }
+        if samples.is_empty() {
+            return Err("Không thấy ảnh nào đọc được trong thư mục này".into());
+        }
+        on_step(lesson.photos, lesson.photos, "Đang học theo lựa chọn của bạn");
+        let store = app.store();
+        let mut p = store.load(&profile);
+        p.add(samples);
+        p.train();
+        store.save(&p).map_err(|e| e.to_string())?;
+        // Already-open sessions of this event type use the new knowledge right away.
+        {
+            let mut map = app.sessions.lock().unwrap();
+            for s in map.values_mut().filter(|s| s.prefs.profile == profile && s.phase == Phase::Ready) {
+                app.recull(s);
+            }
+            app.save_sessions(&map);
+        }
+        sessions_changed(&app);
+        Ok(LessonResult { lesson, profile: app.profile_view(&profile) })
+    })()
+}
+
+#[derive(Serialize)]
+struct PairResult {
+    lesson: rawpick_core::lesson::Lesson,
+    profile: ProfileView,
+    /// Of the photos Sơn picked, how many the AI now picks in the originals session.
+    ai_agrees: usize,
+    /// How many photos the AI now picks in the originals session.
+    ai_selected: usize,
+}
+
+/// «Học từ 2 phiên»: one open session holds the whole show, another the photos Sơn picked from
+/// it. Learn from that pairing, then re-decide every open session of this event type.
+fn op_learn_pair(app: &Arc<App>, id: u32, other: u32, profile: String) -> Result<PairResult, String> {
+    if id == other {
+        return Err("Chọn hai phiên khác nhau".into());
+    }
+    let (originals, picks) = {
+        let map = app.sessions.lock().unwrap();
+        let get = |k: u32| -> Result<Vec<Item>, String> {
+            let s = map.get(&k).ok_or("Phiên đã đóng")?;
+            if s.phase != Phase::Ready {
+                return Err(format!("Phiên «{}» chưa phân tích xong", s.source.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()));
+            }
+            Ok(s.items.clone())
+        };
+        (get(id)?, get(other)?)
+    };
+    let (samples, lesson, kept) = rawpick_core::lesson::pair(&originals, &picks);
+    if lesson.kept == 0 {
+        return Err("Không thấy ảnh nào của phiên ảnh đã chọn trong phiên ảnh gốc. Kiểm tra lại hai phiên có đúng cùng một show không.".into());
+    }
+    let store = app.store();
+    let mut p = store.load(&profile);
+    p.add(samples);
+    p.train();
+    store.save(&p).map_err(|e| e.to_string())?;
+    let (mut ai_agrees, mut ai_selected) = (0, 0);
+    {
+        let mut map = app.sessions.lock().unwrap();
+        for s in map.values_mut().filter(|s| s.prefs.profile == profile && s.phase == Phase::Ready) {
+            app.recull(s);
+        }
+        if let Some(s) = map.get(&id) {
+            for v in &s.verdicts {
+                if matches!(v.ai_decision, Decision::Selected) {
+                    ai_selected += 1;
+                    if kept.get(v.idx).copied().unwrap_or(false) {
+                        ai_agrees += 1;
+                    }
+                }
+            }
+        }
+        app.save_sessions(&map);
+    }
+    sessions_changed(app);
+    Ok(PairResult { lesson, profile: app.profile_view(&profile), ai_agrees, ai_selected })
+}
+
+/// Copy the selected photos into a sub-folder of the source folder (originals untouched).
+fn op_gather_selected(app: &Arc<App>, id: u32, sub: String) -> Result<GatherResult, String> {
+    // Snapshot, so the session stays usable (and other sessions run) while copying.
+    let (source, items, verdicts, cancel) = {
+        let mut map = app.sessions.lock().unwrap();
+        let s = map.get_mut(&id).ok_or("Phiên đã đóng")?;
+        if s.phase != Phase::Ready {
+            return Err("Phiên này chưa phân tích xong".into());
+        }
+        s.phase = Phase::Exporting;
+        s.cancel.store(false, Ordering::SeqCst);
+        (s.source.clone().ok_or("Phiên chưa có thư mục")?, s.items.clone(), s.verdicts.clone(), s.cancel.clone())
+    };
+    sessions_changed(app);
+    let on_step = emitter(app, Some(id));
+    let p = Progress { on_step: &on_step, cancel: &cancel };
+    let res = pipeline::gather_selected(&source, &items, &verdicts, &sub, &p).map_err(|e| format!("{e:#}"));
+    let mut map = app.sessions.lock().unwrap();
+    let s = map.get_mut(&id).ok_or("Phiên đã đóng")?;
+    s.phase = Phase::Ready;
+    let view = session_view(app, s);
+    drop(map);
+    sessions_changed(app);
+    Ok(GatherResult { report: res?, view })
+}
+
+// ---------------------------------------------------------------- chat
+
+/// Run Claude Code (signed in with the user's own Claude account) in print mode.
+/// Unix: through a login shell so the user's PATH (Homebrew, ~/.local/bin, nvm…) applies,
+/// since apps started from the Dock/Finder don't get it.
+/// Where Claude Code is installed and the PATH it needs (npm installs need `node` next to it).
+#[derive(Clone)]
+struct ClaudeBin {
+    exe: std::path::PathBuf,
+    path: std::ffi::OsString,
+}
+
+static CLAUDE_BIN: std::sync::Mutex<Option<ClaudeBin>> = std::sync::Mutex::new(None);
+
+/// Find Claude Code. Apps opened from Finder / the Start menu don't get the PATH a terminal has,
+/// so look where the installers put it and ask the user's shell for its PATH.
+fn locate_claude() -> Option<ClaudeBin> {
+    let mut dirs: Vec<std::path::PathBuf> = vec![];
+    let home = dirs_home();
+    #[cfg(not(windows))]
+    {
+        // PATH as an interactive login shell sees it (.zprofile and .zshrc both loaded).
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+        let mut c = std::process::Command::new(shell);
+        c.arg("-ilc").arg("printf '\\n__RP__%s__RP__\\n' \"$PATH\"");
+        if let Ok(o) = run_with_timeout(c, None, 10) {
+            let out = String::from_utf8_lossy(&o.stdout).to_string();
+            if let Some(p) = out.split("__RP__").nth(1) {
+                dirs.extend(std::env::split_paths(p));
+            }
+        }
+        for d in [".local/bin", ".claude/local", ".npm-global/bin", ".volta/bin", ".bun/bin", "bin"] {
+            dirs.push(home.join(d));
+        }
+        dirs.push("/opt/homebrew/bin".into());
+        dirs.push("/usr/local/bin".into());
+        if let Ok(rd) = std::fs::read_dir(home.join(".nvm/versions/node")) {
+            dirs.extend(rd.flatten().map(|e| e.path().join("bin")));
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        dirs.push(home.join(".local").join("bin"));
+        if let Ok(a) = std::env::var("APPDATA") {
+            dirs.push(std::path::Path::new(&a).join("npm"));
+        }
+        // The user PATH as saved in the registry: an installer may have changed it after the app started.
+        let mut c = std::process::Command::new("reg");
+        c.args(["query", "HKCU\\Environment", "/v", "Path"]).creation_flags(0x0800_0000);
+        if let Ok(o) = run_with_timeout(c, None, 10) {
+            let out = String::from_utf8_lossy(&o.stdout).to_string();
+            if let Some(line) = out.lines().find(|l| l.trim_start().starts_with("Path")) {
+                if let Some(v) = line.split("REG_").nth(1).and_then(|r| r.split_once("    ")).map(|(_, v)| v.trim().to_string()) {
+                    let mut v = v.replace("%USERPROFILE%", &home.to_string_lossy());
+                    for k in ["LOCALAPPDATA", "APPDATA"] {
+                        if let Ok(x) = std::env::var(k) {
+                            v = v.replace(&format!("%{k}%"), &x);
+                        }
+                    }
+                    dirs.extend(std::env::split_paths(&v));
+                }
+            }
+        }
+    }
+    if let Some(p) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&p));
+    }
+    let mut seen = std::collections::HashSet::new();
+    dirs.retain(|d| !d.as_os_str().is_empty() && seen.insert(d.clone()));
+    // Last resort on Windows: the copy bundled with the Claude desktop app
+    // (%APPDATA%\Claude\claude-code\<version>\<build>\claude.exe), newest first.
+    #[cfg(windows)]
+    if let Ok(a) = std::env::var("APPDATA") {
+        let mut bundled: Vec<std::path::PathBuf> = std::fs::read_dir(std::path::Path::new(&a).join("Claude").join("claude-code"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .flat_map(|v| std::fs::read_dir(v.path()).into_iter().flatten().flatten().map(|b| b.path()))
+            .filter(|d| d.join("claude.exe").is_file())
+            .collect();
+        bundled.sort_by_key(|d| std::fs::metadata(d.join("claude.exe")).and_then(|m| m.modified()).ok());
+        dirs.extend(bundled.into_iter().rev());
+    }
+    let names: &[&str] = if cfg!(windows) { &["claude.exe", "claude.cmd"] } else { &["claude"] };
+    let exe = dirs.iter().flat_map(|d| names.iter().map(move |n| d.join(n))).find(|p| p.is_file())?;
+    let path = std::env::join_paths(std::iter::once(exe.parent().unwrap().to_path_buf()).chain(dirs)).ok()?;
+    Some(ClaudeBin { exe, path })
+}
+
+fn dirs_home() -> std::path::PathBuf {
+    std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(Into::into).unwrap_or_default()
+}
+
+fn claude_command(args: &[&str]) -> std::process::Command {
+    let cached = CLAUDE_BIN.lock().unwrap().clone();
+    let found = cached.or_else(|| {
+        let b = locate_claude();
+        *CLAUDE_BIN.lock().unwrap() = b.clone();
+        b
+    });
+    match found {
+        Some(b) => {
+            #[cfg(windows)]
+            let mut c = {
+                use std::os::windows::process::CommandExt;
+                // Rust runs .cmd files through cmd.exe itself, with safe quoting.
+                let mut c = std::process::Command::new(&b.exe);
+                c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+                c
+            };
+            #[cfg(not(windows))]
+            let mut c = std::process::Command::new(&b.exe);
+            c.args(args).env("PATH", &b.path);
+            c
+        }
+        None => {
+            // Not found: let the shell try, so the error says what went wrong.
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                let mut c = std::process::Command::new("cmd");
+                c.arg("/C").arg("claude").args(args);
+                c.creation_flags(0x0800_0000);
+                c
+            }
+            #[cfg(not(windows))]
+            {
+                let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+                let mut c = std::process::Command::new(shell);
+                c.arg("-ilc").arg(format!("exec claude {}", args.join(" ")));
+                c
+            }
+        }
+    }
+}
+
+fn run_with_timeout(mut cmd: std::process::Command, input: Option<String>, secs: u64) -> Result<std::process::Output, String> {
+    use std::io::Write;
+    use std::process::Stdio;
+    cmd.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() }).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| format!("Không chạy được Claude Code: {e}"))?;
+    if let (Some(text), Some(mut stdin)) = (input, child.stdin.take()) {
+        let _ = stdin.write_all(text.as_bytes());
+    }
+    let id = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
+        Ok(r) => r.map_err(|e| e.to_string()),
+        Err(_) => {
+            #[cfg(windows)]
+            let _ = std::process::Command::new("taskkill").args(["/PID", &id.to_string(), "/T", "/F"]).output();
+            #[cfg(not(windows))]
+            let _ = std::process::Command::new("kill").arg(id.to_string()).output();
+            Err("Claude trả lời quá lâu, thử lại sau".into())
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ClaudeStatus {
+    found: bool,
+    version: Option<String>,
+    hint: String,
+}
+
+fn op_claude_status() -> ClaudeStatus {
+    // Look again every time: Claude Code may have been installed while the app was open.
+    *CLAUDE_BIN.lock().unwrap() = locate_claude();
+    match run_with_timeout(claude_command(&["--version"]), None, 20) {
+        Ok(o) if o.status.success() => ClaudeStatus {
+            found: true,
+            version: Some(String::from_utf8_lossy(&o.stdout).trim().to_string()),
+            hint: "Dùng Claude Code đã đăng nhập trên máy này (tài khoản Claude của bạn)".into(),
+        },
+        _ => ClaudeStatus {
+            found: false,
+            version: None,
+            hint: "Chưa thấy Claude Code trên máy này. Cài Claude Code, mở Terminal gõ «claude» và đăng nhập một lần, rồi bấm «Kiểm tra lại». Không có Claude thì AI trong máy vẫn dùng bình thường.".into(),
+        },
+    }
+}
+
+#[derive(Serialize)]
+struct ChatResult {
+    reply: String,
+    changes: Vec<String>,
+    by: &'static str,
+    prefs: Option<Prefs>,
+    verdicts: Option<VerdictsView>,
+    before: Option<usize>,
+    after: Option<usize>,
+}
+
+fn chat_context(s: &Session) -> Option<rawpick_core::chat::Context> {
+    if s.items.is_empty() {
+        return None;
+    }
+    let mut sum = [0f32; 6];
+    let mut n = [0usize; 6];
+    let mut cams = std::collections::BTreeSet::new();
+    let mut times = vec![];
+    for a in s.items.iter().filter_map(|i| i.analysis.as_ref()) {
+        for (k, c) in rawpick_core::analyze::CRITERIA.iter().enumerate() {
+            if let Some(v) = a.scores.get(c) {
+                sum[k] += v;
+                n[k] += 1;
+            }
+        }
+        cams.insert(a.camera.clone());
+        if let Some(t) = a.time {
+            times.push(t);
+        }
+    }
+    times.sort_by(f64::total_cmp);
+    let mut mean = [0f32; 6];
+    for k in 0..6 {
+        mean[k] = if n[k] > 0 { (sum[k] / n[k] as f32 * 10.0).round() / 10.0 } else { 0.0 };
+    }
+    Some(rawpick_core::chat::Context {
+        summary: cull::summarize(&s.verdicts),
+        mean_scores: mean,
+        with_people: n[5],
+        cameras: cams.into_iter().collect(),
+        hours: times.last().zip(times.first()).map(|(b, a)| ((b - a) / 3600.0) as f32).unwrap_or(0.0),
+    })
+}
+
+/// One chat message: understand it (offline, or with Claude), change the session's settings,
+/// re-decide, and say what changed.
+fn op_chat(app: &Arc<App>, id: Option<u32>, message: String, use_claude: bool) -> Result<ChatResult, String> {
+    use rawpick_core::chat;
+    let app = app.clone();
+    (move || {
+        let (mut prefs, ctx) = {
+            let map = app.sessions.lock().unwrap();
+            match id.and_then(|i| map.get(&i)) {
+                Some(s) => (s.prefs.clone(), chat_context(s)),
+                None => (app.global.lock().unwrap().prefs.clone(), None),
+            }
+        };
+        // Questions about the folder or the AI are answered from the data, even with Claude on.
+        let local = chat::understand(&message, &prefs.settings.weights);
+        if let Some(q) = local.question {
+            let reply = chat_answer(&app, q, &prefs, ctx.as_ref());
+            return Ok(ChatResult { reply, changes: vec![], by: "local", prefs: None, verdicts: None, before: None, after: None });
+        }
+        let (patch, mut notes, by) = if use_claude {
+            let ready = app.store().load(&prefs.profile).ready();
+            let prompt = chat::claude_prompt(&message, &prefs.settings, &prefs.preset, ctx.as_ref(), ready);
+            let dir = app.data_dir.join("claude-chat");
+            let _ = std::fs::create_dir_all(&dir);
+            // Answer-only: no shell, no file edits, no web. Runs in an empty folder.
+            let mut cmd = claude_command(&["-p", "--output-format", "json", "--disallowedTools", "Bash", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch"]);
+            cmd.current_dir(&dir);
+            let out = run_with_timeout(cmd, Some(prompt), 180)?;
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            if !out.status.success() && stdout.trim().is_empty() {
+                let err = String::from_utf8_lossy(&out.stderr);
+                return Err(format!("Claude Code báo lỗi: {}. Nếu chưa đăng nhập, mở Terminal gõ «claude» để đăng nhập.", err.trim().chars().take(300).collect::<String>()));
+            }
+            let ans = chat::parse_claude_answer(&stdout).map_err(|e| format!("{e}. Nếu chưa đăng nhập, mở Terminal gõ «claude» để đăng nhập."))?;
+            (ans.patch, vec![ans.reply], "claude")
+        } else {
+            (local.patch, local.notes, "local")
+        };
+        if patch.is_empty() {
+            let reply = if by == "local" && notes.is_empty() { chat::HELP.to_string() } else { notes.join("\n") };
+            return Ok(ChatResult { reply, changes: vec![], by, prefs: None, verdicts: None, before: None, after: None });
+        }
+        let changes = patch.apply(&mut prefs.settings, &mut prefs.preset);
+        {
+            let mut g = app.global.lock().unwrap();
+            g.prefs = prefs.clone();
+        }
+        app.save_global();
+        let mut map = app.sessions.lock().unwrap();
+        let (verdicts, before, after) = match id.and_then(|i| map.get_mut(&i)) {
+            Some(s) => {
+                s.prefs = prefs.clone();
+                if s.phase == Phase::Ready {
+                    let before = s.verdicts.iter().filter(|v| v.decision == Decision::Selected).count();
+                    app.recull(s);
+                    let after = s.verdicts.iter().filter(|v| v.decision == Decision::Selected).count();
+                    (Some(VerdictsView { verdicts: s.verdicts.clone(), summary: cull::summarize(&s.verdicts), profile: None }), Some(before), Some(after))
+                } else {
+                    (None, None, None)
+                }
+            }
+            None => (None, None, None),
+        };
+        app.save_sessions(&map);
+        drop(map);
+        let mut reply = String::new();
+        if by == "claude" {
+            reply += &notes.remove(0);
+        } else {
+            reply += "Đã chỉnh theo yêu cầu.";
+            for n in notes {
+                reply += "\n";
+                reply += &n;
+            }
+        }
+        if let (Some(b), Some(a)) = (before, after) {
+            reply += &format!("\nẢnh đã chọn: {b} → {a}.");
+        }
+        Ok(ChatResult { reply, changes, by, prefs: Some(prefs), verdicts, before, after })
+    })()
+}
+
+/// Answer a question about the open folder, the settings or what the AI learned, in Vietnamese.
+fn chat_answer(app: &App, q: rawpick_core::chat::Question, prefs: &Prefs, ctx: Option<&rawpick_core::chat::Context>) -> String {
+    use rawpick_core::chat::Question;
+    const LABEL: [&str; 6] = ["Phơi sáng", "Độ nét", "Bố cục", "Màu sắc", "Nhiễu", "Người"];
+    let pct = |n: usize, t: usize| if t > 0 { n * 100 / t } else { 0 };
+    match q {
+        Question::Summary | Question::Reasons => {
+            let Some(c) = ctx else {
+                return "Chưa có thư mục nào được phân tích trong phiên này. Mở một thư mục ảnh rồi hỏi lại nhé.".into();
+            };
+            let m = &c.summary;
+            let mut out = if q == Question::Summary {
+                let mut t = format!(
+                    "Thư mục có {} ảnh: chọn {} ({}%), cần xem lại {}, bị loại {}.",
+                    m.total,
+                    m.selected,
+                    pct(m.selected, m.total),
+                    m.review,
+                    m.rejected
+                );
+                if m.series > 0 {
+                    t += &format!(" Có {} loạt chụp liên tiếp, {} khoảnh khắc.", m.series, m.moments);
+                }
+                if c.with_people > 0 {
+                    t += &format!(" {} ảnh có người.", c.with_people);
+                }
+                t
+            } else {
+                String::new()
+            };
+            if m.by_reason.is_empty() {
+                out += if q == Question::Reasons { "Chưa có ảnh nào bị loại." } else { "" };
+                return out.trim().to_string();
+            }
+            let mut by = m.by_reason.clone();
+            by.sort_by(|a, b| b.1.cmp(&a.1));
+            out += if q == Question::Summary { "\nLý do loại nhiều nhất:" } else { "Ảnh bị loại vì:" };
+            for (r, n) in by.iter().take(6) {
+                out += &format!("\n- {r}: {n} ảnh");
+            }
+            let top = by[0].0.as_str();
+            let tip = if top.starts_with("Trùng") {
+                Some("Muốn giữ nhiều hơn mỗi loạt, nói «mỗi loạt giữ 2 ảnh».")
+            } else if top.starts_with("Điểm thấp") {
+                Some("Nếu thấy loại oan, nói «chọn nhiều hơn» hoặc «ngưỡng 7».")
+            } else if top.starts_with("Nhắm") {
+                Some("Nếu đây là ảnh thể thao hay sân khấu, nói «giữ ảnh nhắm mắt».")
+            } else if top.starts_with("Thiếu") || top.starts_with("Cháy") {
+                Some("Nếu ánh sáng như vậy là cố ý, nói «tôi thích ảnh tông tối» hoặc bật «Sửa thay vì loại».")
+            } else {
+                None
+            };
+            if let Some(t) = tip {
+                out += "\n";
+                out += t;
+            }
+            out.trim().to_string()
+        }
+        Question::Learned => {
+            let p = app.profile_view(&prefs.profile);
+            if p.samples == 0 {
+                return "AI chưa học được gì từ bạn. Mỗi lần bạn đổi «Chọn / Xem lại / Loại» trên một ảnh, AI học ngay ảnh đó; khi xuất ảnh, cả thư mục được ghi lại.".into();
+            }
+            let mut out = format!("Hồ sơ «{}»: đã học {} ảnh, trong đó {} ảnh bạn sửa tay.", p.name, p.samples, p.manual);
+            if p.ready {
+                out += &format!(" Gu của bạn đang chiếm khoảng {:.0}% điểm.", p.trust * 100.0);
+                if let Some(a) = p.accuracy {
+                    out += &format!(" AI đoán đúng lựa chọn của bạn khoảng {:.0}%.", a * 100.0);
+                }
+            } else {
+                out += &format!(" Cần ít nhất {} ảnh (có cả ảnh giữ và ảnh bỏ) để bắt đầu áp dụng.", p.min_samples);
+            }
+            if !p.explain.is_empty() {
+                out += "\nĐiều AI thấy bạn hay để ý:";
+                for e in p.explain.iter().take(5) {
+                    out += &format!("\n- {e}");
+                }
+            }
+            if !prefs.settings.options.use_learned {
+                out += "\nLưu ý: đang tắt «Dùng điều AI đã học», nói «chọn theo phong cách của tôi» để bật lại.";
+            }
+            out
+        }
+        Question::Settings => {
+            let s = &prefs.settings;
+            let total: f32 = s.weights.iter().sum::<f32>().max(1.0);
+            let mut w: Vec<(usize, f32)> = s.weights.iter().copied().enumerate().filter(|x| x.1 > 0.0).collect();
+            w.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let mut out = format!(
+                "Đang chấm theo: {}.",
+                w.iter().map(|(i, v)| format!("{} {:.0}%", LABEL[*i], v / total * 100.0)).collect::<Vec<_>>().join(", ")
+            );
+            out += &format!("\nĐiểm để chọn: {:.1}, vùng xem lại {:.1} điểm dưới ngưỡng.", s.threshold, s.review_margin);
+            out += &format!(
+                "\nMỗi loạt giữ {} ảnh{}.",
+                s.keep_per_series,
+                s.max_selected.map(|n| format!(", tối đa {n} ảnh")).unwrap_or_default()
+            );
+            let o = &s.options;
+            let on = |b: bool| if b { "bật" } else { "tắt" };
+            out += &format!(
+                "\nLoại nhắm mắt: {}. Soi khẩu hình: {}. Sửa thay vì loại: {}. Đủ khoảnh khắc: {}. Theo gu của bạn: {} ({:.0}%).",
+                on(o.reject_closed_eyes),
+                on(o.review_open_mouth),
+                on(o.fix_instead_of_reject),
+                on(o.moments),
+                on(o.use_learned),
+                s.learned_weight * 100.0
+            );
+            out
+        }
+    }
+}
+
+fn op_copy_card(app: &Arc<App>, card: String, dest: String, backup: Option<String>) -> Result<CopyReport, String> {
+    let app = app.clone();
+    (move || {
+        if app.card_busy.swap(true, Ordering::SeqCst) {
+            return Err("Đang chép một thẻ khác".to_string());
+        }
+        app.card_cancel.store(false, Ordering::SeqCst);
+        let on_step = emitter(&app, None);
+        let r = ingest::safe_copy(Path::new(&card), Path::new(&dest), backup.as_deref().map(Path::new), &|n, t| on_step(n, t, "Đang chép thẻ"), &app.card_cancel)
+            .map_err(|e| format!("{e:#}"));
+        app.card_busy.store(false, Ordering::SeqCst);
+        r
+    })()
+}
+
+/// Copy the photos starred on the camera straight from a folder or the memory card, without
+/// waiting for the AI.
+fn op_copy_starred(app: &Arc<App>, source: String, dest: String, min_stars: u8) -> Result<ingest::StarCopy, String> {
+    let app = app.clone();
+    (move || {
+        let (src, dst) = (PathBuf::from(&source), PathBuf::from(&dest));
+        if !src.is_dir() {
+            return Err(format!("Không tìm thấy thư mục {source}"));
+        }
+        if !dst.is_dir() {
+            return Err(format!("Không tìm thấy thư mục {dest}"));
+        }
+        if app.card_busy.swap(true, Ordering::SeqCst) {
+            return Err("Đang chép một thẻ khác".to_string());
+        }
+        app.card_cancel.store(false, Ordering::SeqCst);
+        let on_step = emitter(&app, None);
+        on_step(0, 0, "Đang đọc số sao trên ảnh");
+        let r = ingest::copy_starred(&src, &dst, min_stars, &|n, t| on_step(n, t, "Đang chép ảnh gắn sao"), &app.card_cancel).map_err(|e| format!("{e:#}"));
+        app.card_busy.store(false, Ordering::SeqCst);
+        r
+    })()
+}
+
+#[derive(Serialize)]
+struct StarLesson {
+    kept: usize,
+    dropped: usize,
+    profile: ProfileView,
+}
+
+/// The stars Sơn gave on the camera are his picks: learn them (starred = keep, the rest of the
+/// show = drop) like hand-made choices.
+fn op_learn_stars(app: &Arc<App>, id: u32, min_stars: u8) -> Result<StarLesson, String> {
+    let (profile, samples) = {
+        let map = app.sessions.lock().unwrap();
+        let s = map.get(&id).ok_or("Phiên đã đóng")?;
+        if s.phase != Phase::Ready {
+            return Err("Phiên này chưa phân tích xong".into());
+        }
+        let ok: Vec<&Item> = s.items.iter().filter(|i| i.analysis.is_some()).collect();
+        let all_locked = ok.len() >= 5 && ok.iter().all(|i| i.analysis.as_ref().unwrap().protected);
+        let starred = |a: &rawpick_core::analyze::Analysis| a.stars >= min_stars.max(1) || (a.protected && !all_locked);
+        let samples: Vec<learn::Sample> = ok
+            .iter()
+            .map(|i| {
+                let a = i.analysis.as_ref().unwrap();
+                let k = starred(a);
+                learn::Sample::new(i.path.display().to_string(), a, k, k, true)
+            })
+            .collect();
+        (s.prefs.profile.clone(), samples)
+    };
+    let kept = samples.iter().filter(|x| x.keep).count();
+    if kept == 0 {
+        return Err("Thư mục này chưa có ảnh nào gắn sao".into());
+    }
+    let dropped = samples.len() - kept;
+    let store = app.store();
+    let mut p = store.load(&profile);
+    p.add(samples);
+    p.train();
+    store.save(&p).map_err(|e| e.to_string())?;
+    {
+        let mut map = app.sessions.lock().unwrap();
+        for s in map.values_mut().filter(|s| s.prefs.profile == profile && s.phase == Phase::Ready) {
+            app.recull(s);
+        }
+        app.save_sessions(&map);
+    }
+    sessions_changed(app);
+    Ok(StarLesson { kept, dropped, profile: app.profile_view(&profile) })
+}
+
+/// Stop a session's analysis/export, or the card copy when `id` is None.
+fn op_cancel(app: &Arc<App>, id: Option<u32>) {
+    match id {
+        Some(id) => {
+            if let Some(s) = app.sessions.lock().unwrap().get(&id) {
+                s.cancel.store(true, Ordering::SeqCst);
+            }
+        }
+        None => app.card_cancel.store(true, Ordering::SeqCst),
+    }
+}
+
+/// A larger preview for the detail view, cached next to the thumbnails.
+/// `full` = the preview at its native size (for checking focus at 100 %).
+fn rand_u32() -> u32 {
+    let mut b = [0u8; 4];
+    let _ = getrandom::fill(&mut b);
+    u32::from_le_bytes(b)
+}
+
+fn op_big_preview(app: &Arc<App>, id: u32, idx: usize, full: Option<bool>) -> Result<String, String> {
+    let app = app.clone();
+    let full = full.unwrap_or(false);
+    (move || {
+        let (path, work) = {
+            let map = app.sessions.lock().unwrap();
+            let s = map.get(&id).ok_or("Phiên đã đóng")?;
+            (s.items.get(idx).ok_or("Sai ảnh")?.path.clone(), pipeline::work_dir(&app.data_dir, s.source.as_ref().ok_or("Phiên chưa có thư mục")?))
+        };
+        let key = rawpick_core::analyze::file_key(&path);
+        // 2560 px fills a Retina screen at fit size; `full` is every pixel the file holds.
+        let out = work.join("big").join(if full { format!("{key}-full.jpg") } else { format!("{key}-2560.jpg") });
+        if !out.exists() {
+            let long = if full { u32::MAX } else { BIG_LONG };
+            let pv = preview::load(&path, long).map_err(|e| format!("{e:#}"))?;
+            // The decoder already shrinks by 1/2, 1/4…: up to 30% over the target is shown as is
+            // (the screen scales it anyway), which skips a resize.
+            let img = if full || pv.rgb.width().max(pv.rgb.height()) <= BIG_LONG * 13 / 10 { pv.rgb } else { metrics::resize_long(&pv.rgb, BIG_LONG) };
+            std::fs::create_dir_all(out.parent().unwrap()).map_err(|e| e.to_string())?;
+            let bytes = metrics::encode_jpeg(&img, if full { 95 } else { 90 }).map_err(|e| format!("{e:#}"))?;
+            // Unique temp name: the viewer may ask for the same photo twice at once.
+            let tmp = out.with_extension(format!("{}.tmp", rand_u32()));
+            std::fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
+            if std::fs::rename(&tmp, &out).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+        }
+        Ok(out.display().to_string())
+    })()
+}
+
+// ---------------------------------------------------------------- one entry point
+
+/// Arguments of every command, as the page sends them (camelCase).
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct Args {
+    id: Option<u32>,
+    idx: Option<usize>,
+    source: Option<String>,
+    prefs: Option<Prefs>,
+    name: Option<String>,
+    decision: Option<Decision>,
+    parent: Option<String>,
+    sub: Option<String>,
+    message: Option<String>,
+    use_claude: bool,
+    card: Option<String>,
+    dest: Option<String>,
+    backup: Option<String>,
+    full: Option<bool>,
+    path: Option<String>,
+    lan: Option<bool>,
+    remote: Option<bool>,
+    new_password: bool,
+    tunnel_host: Option<String>,
+    tunnel_token: Option<String>,
+    face: Option<usize>,
+    open: Option<bool>,
+    crop: Option<[f32; 4]>,
+    mark: Option<String>,
+    yes: Option<bool>,
+    min_stars: Option<u8>,
+    person: Option<u32>,
+    idxs: Option<Vec<usize>>,
+    other: Option<u32>,
+}
+
+fn need<T>(v: Option<T>, what: &str) -> Result<T, String> {
+    v.ok_or_else(|| format!("Thiếu {what}"))
+}
+
+fn json<T: Serialize>(v: T) -> Result<serde_json::Value, String> {
+    serde_json::to_value(v).map_err(|e| e.to_string())
+}
+
+/// Every command of the app, shared by the desktop window and the web version.
+fn dispatch(app: &Arc<App>, cmd: &str, args: serde_json::Value) -> Result<serde_json::Value, String> {
+    let a: Args = if args.is_null() { Args::default() } else { serde_json::from_value(args).map_err(|e| format!("Sai tham số: {e}"))? };
+    match cmd {
+        "app_info" => json(op_app_info(app)),
+        "new_session" => json(op_new_session(app)),
+        "close_session" => json(op_close_session(app, need(a.id, "id")?)),
+        "list_sessions" => json(op_list_sessions(app)),
+        "get_session" => json(op_get_session(app, need(a.id, "id")?)?),
+        "save_prefs" => json(op_save_prefs(app, a.id, need(a.prefs, "prefs")?)),
+        "profile_info" => json(op_profile_info(app, need(a.name, "name")?)),
+        "analyze" => json(op_analyze(app, need(a.id, "id")?, a.source)?),
+        "set_decision" => json(op_set_decision(app, need(a.id, "id")?, need(a.idx, "idx")?, a.decision)?),
+        "set_decisions" => json(op_set_decisions(app, need(a.id, "id")?, &need(a.idxs, "idxs")?, a.decision)?),
+        "train" => json(op_train(app, need(a.id, "id")?)?),
+        "export_target" => json(op_export_target(app, need(a.id, "id")?, need(a.parent, "parent")?)?),
+        "export_folder" => json(op_export_folder(app, need(a.id, "id")?, need(a.parent, "parent")?)?),
+        "export_show" => json(op_export_show(app, need(a.id, "id")?)?),
+        "set_drive_dir" => json(op_set_folder(app, "drive", a.path)?),
+        "set_sync_dir" => json(op_set_folder(app, "sync", a.path)?),
+        "learn_show" => json(op_learn_show(app, need(a.path, "path")?, need(a.name, "name")?)?),
+        "learn_pair" => json(op_learn_pair(app, need(a.id, "id")?, need(a.other, "other")?, need(a.name, "name")?)?),
+        "gather_selected" => json(op_gather_selected(app, need(a.id, "id")?, need(a.sub, "sub")?)?),
+        "claude_status" => json(op_claude_status()),
+        "chat" => json(op_chat(app, a.id, need(a.message, "message")?, a.use_claude)?),
+        "copy_card" => json(op_copy_card(app, need(a.card, "card")?, need(a.dest, "dest")?, a.backup)?),
+        "cancel" => json(op_cancel(app, a.id)),
+        "set_crop" => json(op_set_crop(app, need(a.id, "id")?, need(a.idx, "idx")?, a.crop)?),
+        "copy_starred" => json(op_copy_starred(app, need(a.source, "source")?, need(a.dest, "dest")?, a.min_stars.unwrap_or(1))?),
+        "learn_stars" => json(op_learn_stars(app, need(a.id, "id")?, a.min_stars.unwrap_or(1))?),
+        "key_people" => json(op_key_people(app)),
+        "add_key_person" => json(op_add_key_person(app, need(a.id, "id")?, need(a.idx, "idx")?, need(a.face, "face")?, a.name.as_deref().unwrap_or(""), a.person)?),
+        "rename_key_person" => json(op_edit_key_person(app, need(a.person, "person")?, a.name.as_deref())?),
+        "remove_key_person" => json(op_edit_key_person(app, need(a.person, "person")?, None)?),
+        "set_mark" => json(op_set_mark(app, need(a.id, "id")?, need(a.idx, "idx")?, need(a.face, "face")?, &need(a.mark, "mark")?, a.yes)?),
+        "set_eyes" => json(op_set_eyes(app, need(a.id, "id")?, need(a.idx, "idx")?, need(a.face, "face")?, a.open)?),
+        "big_preview" => json(op_big_preview(app, need(a.id, "id")?, need(a.idx, "idx")?, a.full)?),
+        "list_dir" => json(web::list_dir(a.path.as_deref())?),
+        "open_path" => {
+            let p = need(a.path, "path")?;
+            tauri_plugin_opener::open_path(&p, None::<&str>).map_err(|e| format!("Không mở được {p}: {e}"))?;
+            json(())
+        }
+        "web_info" => json(web::info(app)),
+        "web_set" => json(web::set(app, a.lan, a.remote, a.new_password, a.tunnel_host, a.tunnel_token)?),
+        "open_web" => json(web::open(app, &need(a.path, "path")?)?),
+        _ => Err(format!("Không có lệnh {cmd}")),
+    }
+}
+
+/// The desktop window's single command; long work runs off the UI thread.
+#[tauri::command]
+async fn call(state: State<'_, Arc<App>>, cmd: String, args: Option<serde_json::Value>) -> Result<serde_json::Value, String> {
+    let app = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || dispatch(&app, &cmd, args.unwrap_or_default())).await.map_err(|e| e.to_string())?
+}
+
+fn find_model(handle: &AppHandle, data_dir: &Path) -> Option<PathBuf> {
+    let mut c = vec![];
+    if let Ok(r) = handle.path().resource_dir() {
+        c.push(r.join("models").join(FACE_MODEL));
+    }
+    c.push(data_dir.join("models").join(FACE_MODEL));
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(d) = exe.parent() {
+            c.push(d.join("models").join(FACE_MODEL));
+        }
+    }
+    // Development: repo/models
+    c.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../models").join(FACE_MODEL));
+    c.into_iter().find(|p| p.exists())
+}
+
+fn main() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            let data_dir = app.path().app_local_data_dir()?;
+            std::fs::create_dir_all(&data_dir)?;
+            let mut global: Global = std::fs::read(data_dir.join("settings.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+            global.prefs = global.prefs.upgrade();
+            if global.machine_id.is_empty() {
+                let mut b = [0u8; 8];
+                let _ = getrandom::fill(&mut b);
+                global.machine_id = b.iter().map(|x| format!("{x:02x}")).collect();
+                let _ = std::fs::write(data_dir.join("settings.json"), serde_json::to_vec_pretty(&global).unwrap_or_default());
+            }
+            let saved: Vec<SavedSession> = std::fs::read(data_dir.join("sessions.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+            let mut sessions = BTreeMap::new();
+            for s in saved {
+                let mut x = Session::new(s.id, s.prefs.upgrade());
+                x.name = s.name;
+                x.source = s.source;
+                x.overrides = s.overrides;
+                x.crops = s.crops;
+                x.last_export = s.last_export;
+                sessions.insert(x.id, x);
+            }
+            let next = sessions.keys().max().map(|m| m + 1).unwrap_or(1);
+            let model = find_model(app.handle(), &data_dir);
+            let (analyzer, face_warning) = Analyzer::new(model.as_deref(), None);
+            let app_state = Arc::new(App {
+                data_dir,
+                analyzer: Mutex::new(analyzer),
+                face_warning,
+                sessions: Mutex::new(sessions),
+                next_id: AtomicU32::new(next),
+                global: Mutex::new(global),
+                card_cancel: AtomicBool::new(false),
+                card_busy: AtomicBool::new(false),
+                handle: std::sync::OnceLock::new(),
+                web: web::Web::default(),
+                eyes: Mutex::new(EyeBook::default()),
+                keys: Mutex::new(Default::default()),
+                share_due: Mutex::new(Default::default()),
+            });
+            app_state.load_eyes();
+            *app_state.keys.lock().unwrap() = rawpick_core::keypeople::KeyBook::load(&app_state.data_dir.join(KEYS_FILE));
+            {
+                let a = app_state.clone();
+                std::thread::spawn(move || loop {
+                    std::thread::sleep(std::time::Duration::from_secs(150));
+                    a.flush_shared();
+                });
+            }
+            let _ = app_state.handle.set(app.handle().clone());
+            web::start(&app_state);
+            app.manage(app_state);
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![call])
+        .build(tauri::generate_context!())
+        .expect("không khởi động được SonVu Raw Pick")
+        .run(|handle, event| {
+            if let tauri::RunEvent::Exit = event {
+                if let Some(app) = handle.try_state::<Arc<App>>() {
+                    app.web.stop_tunnel();
+                    app.flush_shared();
+                }
+            }
+        });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_app(dir: &Path) -> Arc<App> {
+        let (analyzer, face_warning) = Analyzer::new(None, None);
+        Arc::new(App {
+            data_dir: dir.to_path_buf(),
+            analyzer: Mutex::new(analyzer),
+            face_warning,
+            sessions: Mutex::new(BTreeMap::new()),
+            next_id: AtomicU32::new(1),
+            global: Mutex::new(Global::default()),
+            card_cancel: AtomicBool::new(false),
+            card_busy: AtomicBool::new(false),
+            handle: std::sync::OnceLock::new(),
+            web: web::Web::default(),
+            eyes: Mutex::new(EyeBook::default()),
+            keys: Mutex::new(Default::default()),
+            share_due: Mutex::new(Default::default()),
+        })
+    }
+
+    /// Runs `f` on its own thread and fails instead of hanging.
+    fn within<T: Send + 'static>(secs: u64, f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(secs)).expect("hung")
+    }
+
+    #[test]
+    fn learning_an_old_show_finishes() {
+        let d = std::env::temp_dir().join(format!("rawpick-app-test-{}", rand_u32()));
+        let show = d.join("show");
+        let picks = show.join("gui khach");
+        std::fs::create_dir_all(&picks).unwrap();
+        for i in 0..6u32 {
+            let img = image::RgbImage::from_fn(320, 240, |x, y| image::Rgb([((x * (i + 1)) % 256) as u8, ((y * 3 + i * 40) % 256) as u8, (i * 37 % 256) as u8]));
+            let b = metrics::encode_jpeg(&img, 90).unwrap();
+            std::fs::write(show.join(format!("IMG_{i}.JPG")), &b).unwrap();
+            if i % 2 == 0 {
+                std::fs::write(picks.join(format!("IMG_{i}.JPG")), &b).unwrap();
+            }
+        }
+        let app = test_app(&d.join("data"));
+        let a = app.clone();
+        let path = show.display().to_string();
+        let r = within(60, move || dispatch(&a, "learn_show", serde_json::json!({ "path": path, "name": "Sự kiện chung" })));
+        assert!(r.is_ok(), "{r:?}");
+        let a = app.clone();
+        within(10, move || dispatch(&a, "profile_info", serde_json::json!({ "name": "Sự kiện chung" }))).unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn analysing_a_folder_finishes() {
+        let d = std::env::temp_dir().join(format!("rawpick-app-test-{}", rand_u32()));
+        let show = d.join("show");
+        std::fs::create_dir_all(&show).unwrap();
+        let img = image::RgbImage::from_fn(320, 240, |x, y| image::Rgb([(x % 256) as u8, (y % 256) as u8, 90]));
+        std::fs::write(show.join("IMG_1.JPG"), metrics::encode_jpeg(&img, 90).unwrap()).unwrap();
+        std::fs::write(show.join("IMG_2.JPG"), metrics::encode_jpeg(&img, 80).unwrap()).unwrap();
+        let chosen = d.join("da chon");
+        std::fs::create_dir_all(&chosen).unwrap();
+        std::fs::write(chosen.join("hanu_1.jpg"), metrics::encode_jpeg(&img, 85).unwrap()).unwrap();
+        let app = test_app(&d.join("data"));
+        // Opening a folder in a session also reports what the AI has learned.
+        let a = app.clone();
+        let path = show.display().to_string();
+        let picks = chosen.display().to_string();
+        let v = within(60, move || {
+            let m = dispatch(&a, "new_session", serde_json::Value::Null).unwrap();
+            let r = dispatch(&a, "analyze", serde_json::json!({ "id": m["id"], "source": path }));
+            // Ticked photos chosen in one go.
+            let b = dispatch(&a, "set_decisions", serde_json::json!({ "id": m["id"], "idxs": [0, 1], "decision": { "kind": "selected" } })).unwrap();
+            let picked = b["verdicts"].as_array().unwrap().iter().filter(|v| v["decision"]["kind"] == "selected" && v["overridden"] == true).count();
+            assert_eq!(picked, 2, "{b}");
+            // A second session with the photo Sơn picked (renamed) teaches the first.
+            let m2 = dispatch(&a, "new_session", serde_json::Value::Null).unwrap();
+            dispatch(&a, "analyze", serde_json::json!({ "id": m2["id"], "source": picks })).unwrap();
+            // (Without the look model in tests the photos can't be matched; the pairing itself is
+            // tested in the core.)
+            match dispatch(&a, "learn_pair", serde_json::json!({ "id": m["id"], "other": m2["id"], "name": "Sự kiện chung" })) {
+                Ok(l) => assert_eq!((l["lesson"]["kept"].as_u64(), l["lesson"]["dropped"].as_u64()), (Some(1), Some(1)), "{l}"),
+                Err(e) => assert!(e.contains("Không thấy ảnh nào"), "{e}"),
+            }
+            assert!(dispatch(&a, "learn_pair", serde_json::json!({ "id": m["id"], "other": m["id"], "name": "Sự kiện chung" })).is_err());
+            r
+        });
+        assert!(v.is_ok(), "{v:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
