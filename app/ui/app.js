@@ -1127,9 +1127,18 @@ function askPair(ready) {
 }
 
 async function doLearnPair() {
-  const ready = st.metas.filter((m) => m.source && m.phase === "ready");
+  const opened = st.metas.filter((m) => m.source);
+  const ready = opened.filter((m) => m.phase === "ready");
   if (ready.length < 2) {
-    toast("Mở hai phiên trước: một phiên thư mục ảnh gốc của show và một phiên thư mục ảnh bạn đã chọn từ show đó, chờ cả hai phân tích xong rồi bấm lại.", 9000);
+    // Say what each open session is doing, so it's clear what to wait for.
+    const state = (m) => m.phase === "ready" ? "đã xong" : m.phase === "failed" ? `lỗi: ${m.error || "không mở được"}` : m.phase === "exporting" ? "đang xuất ảnh" : `đang phân tích ${sessionLabel(m)}`;
+    const now = opened.length ? " Hiện có: " + opened.map((m) => `«${esc(m.name)}» ${esc(state(m))}`).join("; ") + "." : "";
+    toast(
+      (opened.length < 2
+        ? "Cần mở hai phiên: một phiên thư mục ảnh gốc của show và một phiên thư mục ảnh bạn đã chọn từ show đó (bấm «+ Phiên mới» để mở thêm)."
+        : "Chờ cả hai phiên phân tích xong (tab hiện dạng số chọn/tổng) rồi bấm lại. Sau khi cài bản mới, app đọc lại từng phiên một nên cần chờ một lúc.") + now,
+      12000
+    );
     return;
   }
   const pair = await askPair(ready);
