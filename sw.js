@@ -1,8 +1,8 @@
 /* Service worker: cho app mở được khi mất mạng và lưu tạm ô bản đồ đã xem. */
-const VERSION = 'dch-v1';
+const VERSION = 'dch-v2';
 const SHELL = [
   './', 'index.html', 'css/style.css',
-  'js/icons.js', 'js/db.js', 'js/demo.js', 'js/app.js',
+  'js/icons.js', 'js/vn-shape.js', 'js/geo.js', 'js/db.js', 'js/demo.js', 'js/app.js',
   'vendor/leaflet/leaflet.js', 'vendor/leaflet/leaflet.css',
   'icons/icon.svg', 'icons/icon-192.png', 'icons/icon-512.png', 'manifest.webmanifest'
 ];
