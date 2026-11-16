@@ -167,7 +167,7 @@ pub fn training_samples(items: &[Item], verdicts: &[Verdict]) -> Vec<Sample> {
         .collect()
 }
 
-pub fn export_all(source: &Path, items: &[Item], verdicts: &[Verdict], out_dir: &Path, opts: &ExportOptions, p: &Progress) -> Result<ExportReport> {
+pub fn export_all(_source: &Path, items: &[Item], verdicts: &[Verdict], out_dir: &Path, opts: &ExportOptions, p: &Progress) -> Result<ExportReport> {
     let entries: Vec<Entry> = items
         .iter()
         .zip(verdicts)
@@ -175,7 +175,6 @@ pub fn export_all(source: &Path, items: &[Item], verdicts: &[Verdict], out_dir: 
             files: &it.files,
             analysis: it.analysis.as_ref(),
             verdict: v,
-            rel_dir: it.path.parent().and_then(|d| d.strip_prefix(source).ok()).map(Path::to_path_buf).unwrap_or_default(),
         })
         .collect();
     export::export(&entries, out_dir, opts, &|n, t| (p.on_step)(n, t, "Đang xuất ảnh"), p.cancel)
@@ -213,8 +212,8 @@ pub fn gather_selected(source: &Path, items: &[Item], verdicts: &[Verdict], sub:
             break;
         }
         (p.on_step)(n, total, "Đang chép ảnh đã chọn vào thư mục con");
-        let rel = it.path.parent().and_then(|d| d.strip_prefix(source).ok()).map(Path::to_path_buf).unwrap_or_default();
-        let target = dir.join(rel);
+        // Straight into the folder, whatever sub-folder of the show the photo was in.
+        let target = dir.clone();
         let mut copied_any = false;
         for f in &it.files {
             let name = f.file_name().unwrap_or_default();
@@ -276,7 +275,7 @@ mod tests {
         let p = Progress { on_step: &|_, _, _| {}, cancel: &cancel };
         let r = gather_selected(&src, &items, &v, "Anh-da-chon", &p).unwrap();
         assert_eq!((r.photos, r.files), (1, 2), "{:?}", r.errors);
-        assert_eq!(std::fs::read(src.join("Anh-da-chon/Cam2/DSC_1.NEF")).unwrap(), b"raw");
+        assert_eq!(std::fs::read(src.join("Anh-da-chon/DSC_1.NEF")).unwrap(), b"raw");
         assert!(raw.exists() && jpg.exists() && other.exists(), "originals stay");
         // Again: nothing new to copy, no duplicates.
         let r = gather_selected(&src, &items, &v, "Anh-da-chon", &p).unwrap();

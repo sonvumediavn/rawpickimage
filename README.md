@@ -42,7 +42,7 @@ toàn bằng CPU, không cần card đồ hoạ, không gửi ảnh đi đâu.
 
 ```
 Ten-su-kien_anh chon/
-  (ảnh đã chọn, giữ nguyên tên, định dạng và thư mục con của máy ảnh)
+  (ảnh đã chọn nằm ngay ở đây, giữ nguyên tên và định dạng; ảnh ở thư mục con của show cũng chép thẳng vào đây, trùng tên thì thêm _2)
   Can-xem-lai/          (chỉ khi bật «Gồm cả ảnh Cần xem lại»)
   Bi-loai/              (chỉ khi bật «Gồm cả ảnh bị loại»)
     Nham-mat/  Mo-net/  Chay-sang/  Thieu-sang/  Nghieng/ ...

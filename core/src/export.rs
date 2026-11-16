@@ -208,8 +208,6 @@ pub struct Entry<'a> {
     pub files: &'a [PathBuf],
     pub analysis: Option<&'a Analysis>,
     pub verdict: &'a Verdict,
-    /// Folder the photo was found in, relative to the source (kept to avoid name clashes).
-    pub rel_dir: PathBuf,
 }
 
 pub fn export(
@@ -242,7 +240,6 @@ pub fn export(
         if opts.by_scene && d == Decision::Selected {
             folder = folder.join(e.verdict.scene.folder());
         }
-        let folder = folder.join(&e.rel_dir);
         if let Some(r) = e.analysis.and_then(|a| a.crop).and_then(crate::crop::clean) {
             match export_cropped(e, r, &folder, opts, &mut used, &mut rep) {
                 Ok(()) => rep.cropped += 1,
@@ -566,8 +563,8 @@ mod tests {
         let va = verdict(Decision::Selected);
         let vb = verdict(Decision::Rejected(Reason::ClosedEyes));
         let entries = vec![
-            Entry { files: &fa, analysis: None, verdict: &va, rel_dir: PathBuf::new() },
-            Entry { files: &fb, analysis: None, verdict: &vb, rel_dir: PathBuf::new() },
+            Entry { files: &fa, analysis: None, verdict: &va },
+            Entry { files: &fb, analysis: None, verdict: &vb },
         ];
         let out = default_out_dir(&src);
         // Default: only the chosen shot, straight into «Su-kien/Su-kien_anh chon», no report files.
@@ -590,6 +587,24 @@ mod tests {
     }
 
     #[test]
+    fn chosen_photos_from_sub_folders_land_at_the_top() {
+        // Sơn keeps the camera files in «Show/anh goc»: the chosen ones must sit right inside
+        // «Show_anh chon», not in a copy of «anh goc» that looks like the originals.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("Show");
+        std::fs::create_dir_all(src.join("anh goc")).unwrap();
+        let a = src.join("anh goc").join("HANU1.JPG");
+        std::fs::write(&a, b"chosen").unwrap();
+        let fa = vec![a.clone()];
+        let va = verdict(Decision::Selected);
+        let entries = vec![Entry { files: &fa, analysis: None, verdict: &va }];
+        let out = default_out_dir(&src);
+        export(&entries, &out, &ExportOptions::default(), &|_, _| {}, &AtomicBool::new(false)).unwrap();
+        assert_eq!(std::fs::read(out.join("HANU1.JPG")).unwrap(), b"chosen");
+        assert!(!out.join("anh goc").exists());
+    }
+
+    #[test]
     fn move_keeps_bytes_and_removes_originals() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("Su-kien");
@@ -599,7 +614,7 @@ mod tests {
         std::fs::write(&a, &raw).unwrap();
         let fa = vec![a.clone()];
         let va = verdict(Decision::Selected);
-        let entries = vec![Entry { files: &fa, analysis: None, verdict: &va, rel_dir: PathBuf::new() }];
+        let entries = vec![Entry { files: &fa, analysis: None, verdict: &va }];
         let out = dir.path().join("Xuat");
         let opts = ExportOptions { move_files: true, ..Default::default() };
         let rep = export(&entries, &out, &opts, &|_, _| {}, &AtomicBool::new(false)).unwrap();
@@ -654,13 +669,11 @@ mod tests {
                 files: &f1,
                 analysis: Some(&a1),
                 verdict: &v,
-                rel_dir: PathBuf::new(),
             },
             Entry {
                 files: &f2,
                 analysis: Some(&a2),
                 verdict: &v,
-                rel_dir: PathBuf::new(),
             },
         ];
         let out = dir.path().join("out");
