@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
+  <title>Dấu Chân Hồng</title>
+  <meta name="description" content="Ghi lại hành trình, check-in và kỉ niệm trên bản đồ thật.">
+  <meta name="theme-color" content="#F7DCE4">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="Dấu Chân">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700;800&family=Dancing+Script:wght@500;700&display=swap">
+  <link rel="stylesheet" href="vendor/leaflet/leaflet.css">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div id="app">
+    <!-- ============ BẢN ĐỒ ============ -->
+    <section class="view view-map is-active" id="view-map" data-view="map">
+      <div id="map" aria-label="Bản đồ"></div>
+
+      <div class="map-top">
+        <form class="search" id="searchForm" role="search">
+          <span class="ico" data-icon="search"></span>
+          <input id="searchInput" type="search" placeholder="Tìm địa điểm, quán ăn…" autocomplete="off" enterkeyhint="search">
+          <button type="button" class="search-clear" id="searchClear" hidden aria-label="Xoá tìm kiếm"><span data-icon="x"></span></button>
+        </form>
+        <ul class="search-results" id="searchResults" hidden></ul>
+        <div class="focus-banner" id="focusBanner" hidden>
+          <span data-icon="route"></span>
+          <span class="focus-title" id="focusTitle"></span>
+          <button type="button" class="chip-btn" id="focusClose">Đóng</button>
+        </div>
+      </div>
+
+      <div class="map-tools">
+        <button type="button" class="round-btn" id="btnLayers" aria-label="Đổi kiểu bản đồ"><span data-icon="layers"></span></button>
+        <button type="button" class="round-btn" id="btnRoutes" aria-label="Hiện mọi lộ trình"><span data-icon="route"></span></button>
+        <button type="button" class="round-btn" id="btnLocate" aria-label="Về vị trí của tôi"><span data-icon="locate"></span></button>
+      </div>
+
+      <div class="pick-cross" id="pickCross" hidden><span></span></div>
+      <div class="pick-bar" id="pickBar" hidden>
+        <p>Kéo bản đồ để đặt ghim vào đúng chỗ</p>
+        <div class="row">
+          <button type="button" class="btn ghost" id="pickCancel">Huỷ</button>
+          <button type="button" class="btn primary" id="pickOk">Chọn vị trí này</button>
+        </div>
+      </div>
+
+      <div class="track-card" id="trackCard"></div>
+    </section>
+
+    <!-- ============ HÀNH TRÌNH ============ -->
+    <section class="view page" id="view-journeys" data-view="journeys">
+      <header class="page-head">
+        <p class="eyebrow">Những chặng đã đi</p>
+        <h1>Hành trình</h1>
+      </header>
+      <div class="page-body" id="journeyList"></div>
+    </section>
+
+    <!-- ============ KỈ NIỆM ============ -->
+    <section class="view page" id="view-memories" data-view="memories">
+      <header class="page-head">
+        <p class="eyebrow">Nơi đã đến, điều đã nhớ</p>
+        <h1>Kỉ niệm</h1>
+        <div class="mem-tools">
+          <label class="search small">
+            <span class="ico" data-icon="search"></span>
+            <input id="memSearch" type="search" placeholder="Tìm trong kỉ niệm…" autocomplete="off">
+          </label>
+          <div class="seg" role="tablist" aria-label="Kiểu xem">
+            <button type="button" class="is-on" data-memmode="timeline">Dòng thời gian</button>
+            <button type="button" data-memmode="gallery">Album ảnh</button>
+          </div>
+        </div>
+        <div class="chips scroll-x" id="memFilters"></div>
+      </header>
+      <div class="page-body" id="memoryList"></div>
+    </section>
+
+    <!-- ============ THỐNG KÊ ============ -->
+    <section class="view page" id="view-stats" data-view="stats">
+      <header class="page-head">
+        <p class="eyebrow">Sổ tay dấu chân</p>
+        <h1>Thống kê</h1>
+      </header>
+      <div class="page-body" id="statsBody"></div>
+    </section>
+
+    <!-- ============ THANH TAB ============ -->
+    <nav class="tabbar" aria-label="Điều hướng">
+      <button type="button" class="tab is-on" data-go="map"><span data-icon="map"></span><b>Bản đồ</b></button>
+      <button type="button" class="tab" data-go="journeys"><span data-icon="route"></span><b>Hành trình</b></button>
+      <button type="button" class="tab tab-main" id="btnCheckin" aria-label="Check-in"><span class="fab"><span data-icon="pin"></span></span><b>Check-in</b></button>
+      <button type="button" class="tab" data-go="memories"><span data-icon="heart"></span><b>Kỉ niệm</b></button>
+      <button type="button" class="tab" data-go="stats"><span data-icon="chart"></span><b>Thống kê</b></button>
+    </nav>
+
+    <!-- Bottom sheet dùng chung -->
+    <div class="scrim" id="scrim" hidden></div>
+    <div class="sheet" id="sheet" role="dialog" aria-modal="true" hidden>
+      <div class="sheet-grip"></div>
+      <div class="sheet-inner" id="sheetInner"></div>
+      <div class="sheet-foot" id="sheetFoot" hidden></div>
+    </div>
+
+    <!-- Hộp xác nhận -->
+    <div class="modal" id="modal" hidden>
+      <div class="modal-card">
+        <h3 id="modalTitle"></h3>
+        <p id="modalText"></p>
+        <div class="row">
+          <button type="button" class="btn ghost" id="modalNo">Huỷ</button>
+          <button type="button" class="btn danger" id="modalYes">Đồng ý</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Xem ảnh -->
+    <div class="lightbox" id="lightbox" hidden>
+      <button type="button" class="lb-close" id="lbClose" aria-label="Đóng"><span data-icon="x"></span></button>
+      <div class="lb-track" id="lbTrack"></div>
+      <p class="lb-cap" id="lbCap"></p>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <input type="file" id="fileImport" accept="application/json,.json" hidden>
+  </div>
+
+  <script src="vendor/leaflet/leaflet.js"></script>
+  <script src="js/icons.js"></script>
+  <script src="js/db.js"></script>
+  <script src="js/demo.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
