@@ -178,6 +178,12 @@ loạt: ngẩng hay cúi đầu (của từng người trong nhóm), nhìn máy 
 show mới, tấm đẹp nhất của mỗi loạt được chọn theo cách bạn chọn, kể cả khi số đo kỹ thuật của tấm khác cao
 hơn. Lựa chọn của chính bạn (tự bấm, hay từ show cũ) không bao giờ bị lựa chọn của AI ghi đè khi mở lại show đó.
 
+**Ảnh toàn cảnh, người phát biểu ở xa**: khi mọi khuôn mặt trong ảnh đều nhỏ (chụp từ cuối hội trường), app
+tìm thêm mặt ở xa trên 9 vùng của ảnh rồi xem lại từng mặt ở độ phân giải gốc, nên vẫn đo được mắt, đầu và nhận
+ra người đó. Đánh dấu người phát biểu là ♛ nhân vật quan trọng một lần: ở mọi ảnh toàn cảnh, người đó luôn được
+coi là nhân vật chính và được xét mắt/đầu, dù đứng xa và nhỏ hơn khán giả hàng đầu. Ảnh toàn cảnh có người
+phân tích lâu hơn khoảng 1 giây mỗi ảnh.
+
 **Học từ 2 phiên đang mở…**: mở một phiên thư mục ảnh gốc của show và một phiên thư mục ảnh bạn đã chọn
 từ show đó (để ở đâu cũng được), chờ phân tích xong rồi bấm nút này, chọn phiên nào là ảnh gốc, phiên nào
 là ảnh đã chọn. App so từng ảnh bằng giờ chụp và hình, học ảnh gốc nào bạn giữ, ảnh nào bạn bỏ, chấm lại

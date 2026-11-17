@@ -112,6 +112,16 @@ impl KeyBook {
         } else {
             a.people.faces.iter().enumerate().filter_map(|(i, f)| self.who(&f.id).map(|p| (i, p))).collect()
         };
+        // A key person counts as a main face however small (the speaker seen from the back of
+        // the hall), so their eyes and head are judged.
+        let legacy = !a.people.faces.iter().any(|f| f.main_size);
+        for (i, f) in a.people.faces.iter_mut().enumerate() {
+            if legacy {
+                f.main_size = f.main;
+            }
+            f.key = a.key_faces.iter().any(|&(k, _)| k == i);
+            f.main = f.main_size || f.key;
+        }
     }
 }
 
@@ -154,11 +164,17 @@ mod tests {
         assert_eq!(b.people[1].name, "Nhân vật 2");
 
         let mut a = Analysis::default();
-        a.people.faces = vec![crate::faces::FaceInfo { id: person(3, 0), ..Default::default() }, crate::faces::FaceInfo { id: person(2, 4), ..Default::default() }];
+        // Someone big in the front row, and the guest far away and small (not main by size).
+        a.people.faces = vec![
+            crate::faces::FaceInfo { id: person(3, 0), main: true, main_size: true, ..Default::default() },
+            crate::faces::FaceInfo { id: person(2, 4), ..Default::default() },
+        ];
         b.mark(&mut a);
         assert_eq!(a.key_faces, vec![(1, guest)]);
+        assert!(a.people.faces[1].main && a.people.faces[1].key, "a key person is judged however small");
         assert!(b.remove(guest));
         b.mark(&mut a);
         assert!(a.key_faces.is_empty());
+        assert!(!a.people.faces[1].main && a.people.faces[0].main);
     }
 }

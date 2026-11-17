@@ -220,22 +220,23 @@ pub fn export(
     std::fs::create_dir_all(out_dir).with_context(|| format!("tạo thư mục {}", out_dir.display()))?;
     let mut rep = ExportReport { out_dir: out_dir.to_path_buf(), ..Default::default() };
     let mut used: HashSet<PathBuf> = HashSet::new();
-    let total = entries.len();
-    for (n, e) in entries.iter().enumerate() {
+    // Only the photos that go out count, so the progress shows «12 / 394», not every photo.
+    let todo: Vec<&Entry> = entries
+        .iter()
+        .filter(|e| match e.verdict.decision {
+            Decision::Selected => true,
+            Decision::Review => opts.copy_review,
+            Decision::Rejected(_) => opts.copy_rejected,
+        })
+        .collect();
+    let total = todo.len();
+    for (n, e) in todo.into_iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             rep.errors.push("Đã dừng theo yêu cầu".into());
             break;
         }
         progress(n, total);
         let d = e.verdict.decision;
-        let wanted = match d {
-            Decision::Selected => true,
-            Decision::Review => opts.copy_review,
-            Decision::Rejected(_) => opts.copy_rejected,
-        };
-        if !wanted {
-            continue;
-        }
         let mut folder = out_dir.join(sub_folder(d));
         if opts.by_scene && d == Decision::Selected {
             folder = folder.join(e.verdict.scene.folder());

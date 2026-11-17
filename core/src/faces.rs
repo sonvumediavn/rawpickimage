@@ -192,6 +192,12 @@ pub struct FaceInfo {
     /// Who this is: face fingerprint ([`crate::faceid`]), only for the main faces.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub id: Vec<i8>,
+    /// Main by size alone, as measured (`main` also counts a key person, however small).
+    #[serde(default)]
+    pub main_size: bool,
+    /// A key person Sơn marked ([`crate::keypeople`]): always judged, even far away in a crowd.
+    #[serde(default)]
+    pub key: bool,
 }
 
 impl FaceInfo {
@@ -358,7 +364,9 @@ pub fn assess_with(img: &RgbImage, g: &Gray, raw: &[RawFace], net: Option<&EyeNe
     let max_area = raw.iter().map(|f| f.w * f.h).fold(0f32, f32::max);
     let dist = |a: (f32, f32), b: (f32, f32)| ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt();
     // Fingerprint the largest main faces only (cost grows with each face).
-    let mut big: Vec<usize> = (0..raw.len()).filter(|&i| raw[i].w >= crate::faceid::MIN_SIDE && raw[i].w * raw[i].h >= max_area * 0.25).collect();
+    // Every face big enough to recognise, not only the main ones: a speaker far behind the front
+    // row is smaller than the audience, yet he is the one Sơn marks as a key person.
+    let mut big: Vec<usize> = (0..raw.len()).filter(|&i| raw[i].w >= crate::faceid::MIN_SIDE).collect();
     big.sort_by(|&a, &b| (raw[b].w * raw[b].h).partial_cmp(&(raw[a].w * raw[a].h)).unwrap());
     big.truncate(crate::faceid::MAX_FACES);
     let mut faces: Vec<FaceInfo> = raw
@@ -419,6 +427,8 @@ pub fn assess_with(img: &RgbImage, g: &Gray, raw: &[RawFace], net: Option<&EyeNe
                 edge,
                 small,
                 main: f.w * f.h >= max_area * 0.25,
+                main_size: f.w * f.h >= max_area * 0.25,
+                key: false,
                 score: s.clamp(0.0, 10.0),
                 issues,
                 mouth_open,
@@ -533,6 +543,12 @@ pub fn judge(mut faces: Vec<FaceInfo>, book: &crate::eyes::EyeBook, photo: Optio
         let mut by_size = main.clone();
         by_size.sort_by(|a, b| (b.bbox[2] * b.bbox[3]).total_cmp(&(a.bbox[2] * a.bbox[3])));
         by_size.truncate(2);
+        // A key person is always judged, wherever they stand.
+        for f in &main {
+            if f.key && !by_size.iter().any(|g| std::ptr::eq(*g, *f)) {
+                by_size.push(f);
+            }
+        }
         by_size
     } else {
         main.clone()

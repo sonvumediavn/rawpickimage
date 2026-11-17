@@ -127,6 +127,7 @@ pub fn features(a: &Analysis) -> [f32; N_FEAT] {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Sample {
     pub name: String,
+    #[serde(with = "nan_vec")]
     pub f: Vec<f32>,
     pub keep: bool,
     /// What the app had decided before Sơn's choice (for the agreement rate).
@@ -143,7 +144,7 @@ pub struct Sample {
     pub origin: Option<String>,
     /// Picture-features worked out at the last full training (so a single click does not
     /// compare thousands of photos again).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "nan_vis")]
     pub v: Option<[f32; N_VIS]>,
     /// Frames of one shot share this tag (a burst, the same group shot again): which one Sơn
     /// kept among them teaches [`Profile::rank`].
@@ -176,12 +177,17 @@ struct BankEntry {
 pub struct Profile {
     pub name: String,
     pub samples: Vec<Sample>,
+    #[serde(with = "nan_vec")]
     pub w: Vec<f32>,
+    #[serde(with = "nan_one")]
     pub b: f32,
+    #[serde(with = "nan_vec")]
     pub mean: Vec<f32>,
+    #[serde(with = "nan_vec")]
     pub std: Vec<f32>,
     pub trained_on: usize,
     /// Share of training decisions the model reproduces.
+    #[serde(with = "nan_one")]
     pub accuracy: f32,
     /// Which samples the weights were trained on (to notice choices merged from another computer).
     #[serde(default)]
@@ -191,14 +197,14 @@ pub struct Profile {
     pub vis_at: usize,
     /// Which frame of a series Sơn keeps: weights over the measured features (divided by
     /// `rscale`), learned from kept/dropped frames of the same shot.
-    #[serde(default)]
+    #[serde(default, with = "nan_vec")]
     pub rw: Vec<f32>,
-    #[serde(default)]
+    #[serde(default, with = "nan_vec")]
     pub rscale: Vec<f32>,
     /// Kept/dropped pairs it learned from, and the share it orders right.
     #[serde(default)]
     pub rank_pairs: usize,
-    #[serde(default)]
+    #[serde(default, with = "nan_one")]
     pub rank_acc: f32,
     #[serde(skip)]
     bank: Vec<BankEntry>,
@@ -707,7 +713,16 @@ impl Store {
 
     /// This computer's profile with the other computers' choices merged in, trained.
     pub fn load(&self, name: &str) -> Profile {
-        let mut p: Profile = std::fs::read(self.file(name)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_else(|| Profile::new(name));
+        let path = self.file(name);
+        let mut p: Profile = match std::fs::read(&path) {
+            Ok(b) => serde_json::from_slice(&b).unwrap_or_else(|_| {
+                // Never let the next save overwrite what could not be read: keep a copy aside.
+                let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                let _ = std::fs::copy(&path, path.with_extension(format!("unreadable-{secs}.json")));
+                Profile::new(name)
+            }),
+            Err(_) => Profile::new(name),
+        };
         if let Some(sh) = &self.shared {
             for f in sh.others(name) {
                 p.samples.retain(|s| s.origin.as_deref() != Some(f.machine.as_str()));
@@ -792,6 +807,25 @@ pub fn default_dir(base: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_profile_with_unknown_values_reads_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        let mut p = Profile::new("Sự kiện chung");
+        let mut f = vec![5.0; N_FEAT];
+        f[3] = f32::NAN;
+        p.samples.push(Sample { name: "/a/1.jpg".into(), f, keep: true, ai_keep: true, manual: true, e: vec![], origin: None, v: Some([0.8, f32::NAN]), series: Some("/a/1.jpg".into()) });
+        p.b = f32::NAN;
+        store.save(&p).unwrap();
+        let q = store.load("Sự kiện chung");
+        assert_eq!(q.samples.len(), 1);
+        assert!(q.samples[0].f[3].is_nan() && q.samples[0].v.unwrap()[1].is_nan() && q.samples[0].v.unwrap()[0] == 0.8);
+        // A file that can't be read is kept aside, not overwritten.
+        std::fs::write(store.file("x"), b"{broken").unwrap();
+        assert!(store.load("x").samples.is_empty());
+        assert!(std::fs::read_dir(dir.path()).unwrap().flatten().any(|e| e.file_name().to_string_lossy().contains("unreadable")));
+    }
+
     use super::*;
 
     #[test]
@@ -938,5 +972,43 @@ mod tests {
         assert!(mac.list().contains(&"cưới".to_string()));
         let mac_file: SharedFile = serde_json::from_slice(&std::fs::read(mac.shared.as_ref().unwrap().own_file("cưới")).unwrap()).unwrap();
         assert_eq!(mac_file.samples.len(), 12);
+    }
+}
+
+// JSON has no NaN: serde_json writes it as `null` and then refuses to read `null` back as a
+// number, which once made a whole learned profile unreadable (Sơn saw «0 lựa chọn»). Unknown
+// values are NaN in memory and `null` on disk, both ways.
+mod nan_one {
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(v: &f32, s: S) -> Result<S::Ok, S::Error> {
+        if v.is_finite() { s.serialize_f32(*v) } else { s.serialize_none() }
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<f32, D::Error> {
+        Ok(Option::<f32>::deserialize(d)?.unwrap_or(f32::NAN))
+    }
+}
+
+mod nan_vec {
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(v: &[f32], s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(v.iter().map(|x| x.is_finite().then_some(*x)))
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<f32>, D::Error> {
+        Ok(Vec::<Option<f32>>::deserialize(d)?.into_iter().map(|x| x.unwrap_or(f32::NAN)).collect())
+    }
+}
+
+mod nan_vis {
+    use super::N_VIS;
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(v: &Option<[f32; N_VIS]>, s: S) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(v) => super::nan_vec::serialize(v, s),
+            None => s.serialize_none(),
+        }
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<[f32; N_VIS]>, D::Error> {
+        let v = Option::<Vec<Option<f32>>>::deserialize(d)?;
+        Ok(v.filter(|v| v.len() == N_VIS).map(|v| std::array::from_fn(|i| v[i].unwrap_or(f32::NAN))))
     }
 }

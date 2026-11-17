@@ -156,7 +156,12 @@ impl Analyzer {
         #[cfg(feature = "faces")]
         if let (Some(det), false) = (&self.faces, ruined) {
             if let Ok(raw) = det.detect(&hi, 0.6) {
-                people = faces::assess_with(&hi, &ghi, &raw, self.eyes.as_ref(), self.ids.as_ref());
+                // A wide shot (a hall with the speaker far away at the lectern): every face is
+                // tiny here, so look again at full resolution before judging eyes and faces.
+                people = match far_faces(path, &hi, &raw, det) {
+                    Some((big, raw2)) => faces::assess_with(&big, &Gray::from_rgb(&big), &raw2, self.eyes.as_ref(), self.ids.as_ref()),
+                    None => faces::assess_with(&hi, &ghi, &raw, self.eyes.as_ref(), self.ids.as_ref()),
+                };
                 faces_checked = true;
             }
         }
@@ -333,4 +338,78 @@ pub fn rejudge(a: &mut Analysis, book: &crate::eyes::EyeBook, photo: &str) {
     let faces = std::mem::take(&mut a.people.faces);
     a.people = faces::judge(faces, book, Some(photo));
     a.scores.people = a.people.score.map(|v| (v * 10.0).round() / 10.0);
+}
+
+/// Faces narrower than this (pixels of the analysis image) are too small to judge.
+#[cfg(feature = "faces")]
+const FAR_FACE: f32 = 40.0;
+/// Faces looked at again at most (the largest ones).
+#[cfg(feature = "faces")]
+const FAR_MAX: usize = 10;
+
+/// Second look for wide shots where every face is small: find more far faces by detecting on
+/// nine overlapping windows of the picture, then decode the photo at about three times the size and re-detect
+/// each face in a window around it, so eyes, head and identity are measured on real pixels.
+/// Returns the large image with the faces in its coordinates, or None when not worth it.
+#[cfg(feature = "faces")]
+fn far_faces(path: &Path, hi: &image::RgbImage, raw: &[faces::RawFace], det: &faces::FaceDetector) -> Option<(image::RgbImage, Vec<faces::RawFace>)> {
+    // Only wide shots with people in them: photos without any face don't pay for this.
+    if raw.is_empty() || raw.iter().any(|f| f.w >= FAR_FACE) {
+        return None;
+    }
+    let (w, h) = hi.dimensions();
+    let long = w.max(h);
+    // More far faces (the speaker when only people in the audience were found).
+    let mut found: Vec<faces::RawFace> = raw.to_vec();
+    // 3 × 3 overlapping windows, each 2/5 of the picture: the detector sees it ~2.5× closer.
+    let (tw, th) = (w * 2 / 5, h * 2 / 5);
+    let spots = [0.0f32, 0.3, 0.6];
+    for (x0, y0) in spots.iter().flat_map(|&a| spots.iter().map(move |&b| (((w as f32) * a) as u32, ((h as f32) * b) as u32))) {
+        let (x0, y0) = (x0.min(w - tw), y0.min(h - th));
+        let tile = image::imageops::crop_imm(hi, x0, y0, tw, th).to_image();
+        for mut f in det.detect(&tile, 0.6).unwrap_or_default() {
+            f.x += x0 as f32;
+            f.y += y0 as f32;
+            for p in &mut f.lm {
+                p.0 += x0 as f32;
+                p.1 += y0 as f32;
+            }
+            let (cx, cy) = (f.x + f.w / 2.0, f.y + f.h / 2.0);
+            if !found.iter().any(|g| cx > g.x && cx < g.x + g.w && cy > g.y && cy < g.y + g.h) {
+                found.push(f);
+            }
+        }
+    }
+    let big = preview::load(path, (long * 3).min(4000)).ok()?.rgb;
+    if big.width().max(big.height()) < long * 9 / 5 {
+        return None; // the source has no more detail than what was already looked at
+    }
+    found.sort_by(|a, b| (b.w * b.h).total_cmp(&(a.w * a.h)));
+    found.truncate(FAR_MAX);
+    let k = big.width() as f32 / w as f32;
+    let (bw, bh) = (big.width() as f32, big.height() as f32);
+    let out = found
+        .iter()
+        .map(|f| {
+            let scaled = faces::RawFace { x: f.x * k, y: f.y * k, w: f.w * k, h: f.h * k, score: f.score, lm: f.lm.map(|(a, b)| (a * k, b * k)) };
+            // Window around the face; the detector enlarges it, so the face fills it well.
+            let side = (scaled.w.max(scaled.h) * 4.0).max(160.0);
+            let (cx, cy) = (scaled.x + scaled.w / 2.0, scaled.y + scaled.h / 2.0);
+            let x0 = (cx - side / 2.0).clamp(0.0, (bw - side).max(0.0));
+            let y0 = (cy - side / 2.0).clamp(0.0, (bh - side).max(0.0));
+            let (cw, ch) = (side.min(bw - x0) as u32, side.min(bh - y0) as u32);
+            let crop = image::imageops::crop_imm(&big, x0 as u32, y0 as u32, cw.max(1), ch.max(1)).to_image();
+            det.detect(&crop, 0.5)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|g| faces::RawFace { x: g.x + x0, y: g.y + y0, w: g.w, h: g.h, score: g.score, lm: g.lm.map(|(a, b)| (a + x0, b + y0)) })
+                .min_by(|a, b| {
+                    let d = |g: &faces::RawFace| (g.x + g.w / 2.0 - cx).powi(2) + (g.y + g.h / 2.0 - cy).powi(2);
+                    d(a).total_cmp(&d(b))
+                })
+                .filter(|g| (g.x + g.w / 2.0 - cx).abs() < scaled.w.max(8.0) && (g.y + g.h / 2.0 - cy).abs() < scaled.h.max(8.0))
+                .unwrap_or(scaled)
+        })
+        .collect();
+    Some((big, out))
 }
