@@ -199,6 +199,18 @@ AI học từ: phơi sáng, độ nét, bố cục, vị trí và cỡ nhân v�
 bị trừ điểm sẵn: AI theo gu của bạn. Ảnh đông người chỉ xét mắt của 2 người chính; mặt người đủ sáng thì
 vùng cháy sáng ở nền (màn chiếu, đèn) chỉ bị trừ nhẹ. Mọi thứ nằm trên máy, không gửi đi đâu.
 
+**Nét mặt.** Với khuôn mặt đủ lớn, AI đọc nét mặt (cười, bình thường, ngạc nhiên, khó chịu, buồn…) bằng
+mô hình MobileFaceNet FER. Khung «Khuôn mặt» trong ảnh to hiện dòng «Nét mặt». AI học gu dùng thêm ba
+con số: mọi người cười nhiều hay ít, người có nét mặt khó chịu nhất, nhân vật chính có cười không. Bạn
+hay giữ ảnh mọi người cười thì AI tự nghiêng về những ảnh đó.
+
+**Số ảnh mỗi chủ thể.** Như cách bạn giao ảnh: mỗi lượt phát biểu giữ 3–5 tấm đẹp nhất, mỗi nhóm chụp
+tập thể khoảng 3 tấm, mỗi nhân vật quan trọng chụp riêng khoảng 3 tấm. Ảnh tốt vượt quá số đó vào mục
+«Bị loại: Đã đủ ảnh chủ thể này» (vẫn xem và chọn lại được). Khi chủ thể mới có 1–2 tấm được chọn, AI
+lấy thêm tấm đẹp kế tiếp (gần đủ điểm, không nhắm mắt, không cúi đầu, không nhăn mặt) cho đủ 3. AI nhận
+ra cùng một người, cùng một nhóm nhờ dấu vân khuôn mặt; cùng người nhưng cách nhau hơn 10 phút là lượt
+khác. Tắt được trong Tuỳ chọn.
+
 ## Các tuỳ chọn
 
 AI trong ứng dụng gợi ý nên bật gì cho từng thư mục, bạn quyết định. Nếu bật «Để AI tự bật», AI chỉ được

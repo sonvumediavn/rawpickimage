@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 /// Measured features stored with each sample.
-pub const N_FEAT: usize = 24;
+pub const N_FEAT: usize = 27;
 /// Features from the pictures themselves: how close a photo looks to the ones Sơn kept, and
 /// to the ones he dropped (computed from the stored image vectors, not stored).
 pub const N_VIS: usize = 2;
@@ -77,11 +77,12 @@ pub const FEATURE_NAMES: [&str; N_ALL] = [
     "Miệng mở (khẩu hình)", "Mặt nghiêng", "Cỡ nhân vật chính", "Chủ thể ở điểm mạnh", "Chủ thể sát mép", "Độ sáng tổng",
     "Cúi đầu", "Người phát biểu cúi đầu", "Tỉ lệ người mở mắt",
     "Mọi người cúi đầu (trung bình)", "Người cúi đầu nhiều nhất", "Mọi người quay mặt đi (trung bình)", "Người quay mặt đi nhiều nhất",
+    "Mọi người cười (trung bình)", "Người có nét mặt khó chịu nhất", "Nhân vật chính cười",
     "Nhìn giống ảnh bạn hay chọn", "Nhìn giống ảnh bạn hay bỏ",
 ];
 
 /// Values for features a sample saved by an older version doesn't have.
-const NEUTRAL: [f32; N_FEAT] = [5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.46, 0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 0.0];
+const NEUTRAL: [f32; N_FEAT] = [5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.46, 0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
 
 pub fn features(a: &Analysis) -> [f32; N_FEAT] {
     let s = &a.scores;
@@ -94,6 +95,10 @@ pub fn features(a: &Analysis) -> [f32; N_FEAT] {
     let worst = |v: &dyn Fn(&crate::faces::FaceInfo) -> f32| main.iter().map(|f| v(f)).fold(0.0f32, f32::max);
     let down = |f: &crate::faces::FaceInfo| f.pitch.max(0.0) * 10.0;
     let away = |f: &crate::faces::FaceInfo| f.yaw.abs().min(1.0) * 10.0;
+    // Expression is only known for faces big enough to read; the others say nothing.
+    let read: Vec<&crate::faces::FaceInfo> = main.iter().copied().filter(|f| f.happy().is_some()).collect();
+    let smiles = if read.is_empty() { 0.0 } else { read.iter().filter_map(|f| f.happy()).sum::<f32>() / read.len() as f32 * 10.0 };
+    let sour = read.iter().filter_map(|f| f.negative()).fold(0.0f32, f32::max) * 10.0;
     [
         s.exposure,
         s.sharp,
@@ -121,6 +126,9 @@ pub fn features(a: &Analysis) -> [f32; N_FEAT] {
         worst(&down),
         mean(&away),
         worst(&away),
+        smiles,
+        sour,
+        lead.and_then(|f| f.happy()).unwrap_or(0.0) * 10.0,
     ]
 }
 

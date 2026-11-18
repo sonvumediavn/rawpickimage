@@ -192,6 +192,10 @@ pub struct FaceInfo {
     /// Who this is: face fingerprint ([`crate::faceid`]), only for the main faces.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub id: Vec<i8>,
+    /// Expression: 7 probabilities (0–255) in [`crate::faceid::EXPRESSIONS`] order; empty when
+    /// the face was too small or the model is missing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expr: Vec<u8>,
     /// Main by size alone, as measured (`main` also counts a key person, however small).
     #[serde(default)]
     pub main_size: bool,
@@ -201,6 +205,26 @@ pub struct FaceInfo {
 }
 
 impl FaceInfo {
+    /// Probability (0–1) of expression `k` ([`crate::faceid::EXPRESSIONS`]), None when unknown.
+    pub fn expression(&self, k: usize) -> Option<f32> {
+        (self.expr.len() == crate::faceid::EXPRESSIONS.len()).then(|| self.expr[k] as f32 / 255.0)
+    }
+
+    /// Smiling (0–1).
+    pub fn happy(&self) -> Option<f32> {
+        self.expression(crate::faceid::HAPPY)
+    }
+
+    /// Angry, disgusted, afraid or sad (0–1): the faces nobody wants in an event photo.
+    pub fn negative(&self) -> Option<f32> {
+        (self.expr.len() == crate::faceid::EXPRESSIONS.len()).then(|| crate::faceid::NEGATIVE.iter().map(|&k| self.expr[k] as f32).sum::<f32>() / 255.0)
+    }
+
+    /// The most likely expression, in words.
+    pub fn expression_label(&self) -> Option<&'static str> {
+        (self.expr.len() == crate::faceid::EXPRESSIONS.len()).then(|| crate::faceid::EXPRESSIONS[(0..7).max_by_key(|&k| self.expr[k]).unwrap()])
+    }
+
     pub fn eye_features(&self) -> [f32; crate::eyes::N] {
         crate::eyes::features(self.eye_p, self.eye_open, self.eye_min)
     }
@@ -337,12 +361,12 @@ pub type IdNet = crate::faceid::FaceId;
 pub struct IdNet;
 
 #[cfg(feature = "faces")]
-fn face_id(net: Option<&IdNet>, img: &RgbImage, lm: &[(f32, f32); 5]) -> Vec<i8> {
-    net.and_then(|n| n.describe(img, lm)).unwrap_or_default()
+fn face_id(net: Option<&IdNet>, img: &RgbImage, lm: &[(f32, f32); 5]) -> (Vec<i8>, Vec<u8>) {
+    net.map(|n| n.read(img, lm)).map(|(id, e)| (id.unwrap_or_default(), e)).unwrap_or_default()
 }
 #[cfg(not(feature = "faces"))]
-fn face_id(_: Option<&IdNet>, _: &RgbImage, _: &[(f32, f32); 5]) -> Vec<i8> {
-    vec![]
+fn face_id(_: Option<&IdNet>, _: &RgbImage, _: &[(f32, f32); 5]) -> (Vec<i8>, Vec<u8>) {
+    (vec![], vec![])
 }
 
 #[cfg(not(feature = "faces"))]
@@ -372,7 +396,7 @@ pub fn assess_with(img: &RgbImage, g: &Gray, raw: &[RawFace], net: Option<&EyeNe
     let mut faces: Vec<FaceInfo> = raw
         .iter()
         .enumerate()
-        .map(|(i, f)| {
+        .map(|(_, f)| {
             let (re, le, nose) = (f.lm[0], f.lm[1], f.lm[2]);
             let iod = dist(re, le).max(1.0);
             let ew = iod * 0.47;
@@ -443,10 +467,17 @@ pub fn assess_with(img: &RgbImage, g: &Gray, raw: &[RawFace], net: Option<&EyeNe
                 turned: false,
                 down: false,
                 hand_marks: vec![],
-                id: if big.contains(&i) { face_id(ids, img, &f.lm) } else { vec![] },
+                id: vec![],
+                expr: vec![],
             }
         })
         .collect();
+    // Who it is and how they look, for the faces big enough to tell.
+    for &i in &big {
+        let (id, expr) = face_id(ids, img, &raw[i].lm);
+        faces[i].id = id;
+        faces[i].expr = expr;
+    }
     faces.sort_by(|a, b| a.bbox[0].partial_cmp(&b.bbox[0]).unwrap());
     judge(faces, &crate::eyes::EyeBook::default(), None)
 }

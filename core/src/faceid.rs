@@ -84,6 +84,14 @@ pub fn align(img: &image::RgbImage, lm: &[(f32, f32); 5]) -> image::RgbImage {
     })
 }
 
+/// Probabilities from raw scores, 0–255 each.
+pub fn softmax_u8(z: &[f32]) -> Vec<u8> {
+    let m = z.iter().copied().fold(f32::MIN, f32::max);
+    let e: Vec<f32> = z.iter().map(|x| (x - m).exp()).collect();
+    let s: f32 = e.iter().sum();
+    e.iter().map(|x| (x / s * 255.0).round() as u8).collect()
+}
+
 /// Unit length × 127, as stored in the analysis cache.
 pub fn quantise(v: &[f32]) -> Option<Vec<i8>> {
     let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -93,9 +101,21 @@ pub fn quantise(v: &[f32]) -> Option<Vec<i8>> {
     Some(v.iter().map(|x| (x / n * 127.0).round().clamp(-127.0, 127.0) as i8).collect())
 }
 
+/// File name of the facial-expression model inside `models/` (OpenCV Zoo, Apache-2.0,
+/// MobileFaceNet trained on RAF-DB, 88 % accurate there). Same 112×112 alignment as SFace.
+pub const EXPRESSION_MODEL: &str = "facial_expression_recognition_mobilefacenet_2022july.onnx";
+/// Expressions in the model's order.
+pub const EXPRESSIONS: [&str; 7] = ["giận", "khó chịu", "sợ", "cười", "bình thường", "buồn", "ngạc nhiên"];
+pub const HAPPY: usize = 3;
+pub const NEUTRAL: usize = 4;
+pub const SURPRISED: usize = 6;
+/// Unflattering in an event photo: angry, disgusted, afraid, sad.
+pub const NEGATIVE: [usize; 4] = [0, 1, 2, 5];
+
 #[cfg(feature = "faces")]
 pub struct FaceId {
     model: std::sync::Arc<tract_onnx::prelude::TypedRunnableModel>,
+    expr: Option<std::sync::Arc<tract_onnx::prelude::TypedRunnableModel>>,
 }
 
 #[cfg(feature = "faces")]
@@ -103,7 +123,33 @@ impl FaceId {
     pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
         use tract_onnx::prelude::*;
         let model = tract_onnx::onnx().model_for_path(path)?.with_input_fact(0, f32::fact([1, 3, 112, 112]).into())?.into_optimized()?.into_runnable()?;
-        Ok(Self { model })
+        // The expression model sits next to it; without it faces simply carry no expression.
+        let expr = path
+            .parent()
+            .map(|d| d.join(EXPRESSION_MODEL))
+            .filter(|p| p.exists())
+            .and_then(|p| tract_onnx::onnx().model_for_path(p).ok()?.with_input_fact(0, f32::fact([1, 3, 112, 112]).into()).ok()?.into_optimized().ok()?.into_runnable().ok());
+        Ok(Self { model, expr })
+    }
+
+    /// Fingerprint and expression of one face (the face is straightened once for both).
+    /// The expression is 7 probabilities in [`EXPRESSIONS`] order, scaled to 0–255.
+    pub fn read(&self, img: &image::RgbImage, lm: &[(f32, f32); 5]) -> (Option<Vec<i8>>, Vec<u8>) {
+        use tract_onnx::prelude::*;
+        let face = align(img, lm);
+        let input: Tensor = tract_ndarray::Array4::<f32>::from_shape_fn((1, 3, 112, 112), |(_, c, y, x)| face.get_pixel(x as u32, y as u32)[c] as f32).into();
+        let id = self.model.run(tvec!(input.into())).ok().and_then(|out| {
+            let v: Vec<f32> = out[0].to_plain_array_view::<f32>().ok()?.iter().copied().collect();
+            quantise(&v)
+        });
+        let expr = self.expr.as_ref().and_then(|m| {
+            // RGB scaled to −1…1, as OpenCV Zoo's demo feeds it.
+            let input: Tensor = tract_ndarray::Array4::<f32>::from_shape_fn((1, 3, 112, 112), |(_, c, y, x)| face.get_pixel(x as u32, y as u32)[c] as f32 / 127.5 - 1.0).into();
+            let out = m.run(tvec!(input.into())).ok()?;
+            let z: Vec<f32> = out[0].to_plain_array_view::<f32>().ok()?.iter().copied().collect();
+            (z.len() == EXPRESSIONS.len()).then(|| softmax_u8(&z))
+        });
+        (id, expr.unwrap_or_default())
     }
 
     /// Fingerprint of the face with these landmarks (pixels of `img`).

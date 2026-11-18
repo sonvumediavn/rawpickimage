@@ -39,6 +39,9 @@ pub struct Options {
     /// Tell the whole story: every kind of photo the event has (overview, speaker, details,
     /// group, interaction…) keeps its best usable one, not only the prettiest kind.
     pub story: bool,
+    /// Sơn's count per subject: about 3 of the best photos of each group or key person, 3 to 5
+    /// of each speaker, never more; filled up to 3 from the next best usable frames.
+    pub per_subject: bool,
     /// Blend in what the AI learned from Sơn's earlier choices.
     pub use_learned: bool,
     /// Let the AI pick. Off: every photo still gets its score and notes, but nothing is chosen
@@ -87,6 +90,7 @@ impl Default for Options {
             keep_each_shot: true,
             speaker_head_up: true,
             story: true,
+            per_subject: true,
             use_learned: true,
             ai_pick: true,
             stars: StarMode::Off,

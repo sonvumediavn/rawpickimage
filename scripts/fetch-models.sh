@@ -67,3 +67,18 @@ if [ "$sum" != "$want" ]; then
   echo "sha256 của SFace không khớp (mong đợi $want)" >&2
   exit 1
 fi
+
+# Mô hình đọc nét mặt MobileFaceNet FER (Apache-2.0, OpenCV Zoo), 5 MB: cười, bình thường, khó chịu…
+f=models/facial_expression_recognition_mobilefacenet_2022july.onnx
+url=https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/facial_expression_recognition/facial_expression_recognition_mobilefacenet_2022july.onnx
+want=4f61307602fc089ce20488a31d4e4614e3c9753a7d6c41578c854858b183e1a9
+if [ ! -s "$f" ]; then
+  curl -fL --retry 4 --retry-delay 3 -o "$f.tmp" "$url"
+  mv "$f.tmp" "$f"
+fi
+if command -v sha256sum >/dev/null; then sum=$(sha256sum "$f" | cut -d' ' -f1); else sum=$(shasum -a 256 "$f" | cut -d' ' -f1); fi
+echo "Nét mặt: $(wc -c < "$f") byte, sha256 $sum"
+if [ "$sum" != "$want" ]; then
+  echo "sha256 của mô hình nét mặt không khớp (mong đợi $want)" >&2
+  exit 1
+fi

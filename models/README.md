@@ -7,3 +7,8 @@ tiêu chí «Người» (khuôn mặt, mắt nhắm).
 `face_recognition_sface_2021dec.onnx` (SFace, Apache-2.0, opencv_zoo, 39 MB) cũng được tải tự động:
 nhận ra từng người để tách các nhóm, các người lên sân khấu lần lượt. Thiếu file này thì app vẫn gom
 ảnh theo hình và số người như trước.
+
+`facial_expression_recognition_mobilefacenet_2022july.onnx` (MobileFaceNet FER, Apache-2.0, opencv_zoo,
+5 MB) đọc nét mặt (cười, bình thường, ngạc nhiên, khó chịu, buồn…) của các khuôn mặt đủ lớn, dùng chung
+cách căn mặt với SFace. AI học gu dùng thêm ba con số: mọi người cười nhiều hay ít, người có nét mặt khó
+chịu nhất, nhân vật chính có cười không. Thiếu file thì app bỏ qua phần này.

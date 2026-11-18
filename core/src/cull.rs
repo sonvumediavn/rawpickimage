@@ -22,10 +22,12 @@ pub enum Reason {
     LowScore,
     /// Not starred on the camera while only starred photos count.
     NotStarred,
+    /// Good, but enough photos of this speaker / group / person are picked already.
+    Enough,
 }
 
 impl Reason {
-    pub const ALL: [Reason; 11] = [
+    pub const ALL: [Reason; 12] = [
         Reason::ClosedEyes,
         Reason::Blurry,
         Reason::Overexposed,
@@ -37,6 +39,7 @@ impl Reason {
         Reason::Broken,
         Reason::LowScore,
         Reason::NotStarred,
+        Reason::Enough,
     ];
 
     /// Sub-folder inside `3_Bi-loai` (ASCII so it survives any file system / zip tool).
@@ -53,6 +56,7 @@ impl Reason {
             Reason::Broken => "Mat-loi",
             Reason::LowScore => "Diem-thap",
             Reason::NotStarred => "Khong-gan-sao",
+            Reason::Enough => "Du-anh",
         }
     }
 
@@ -69,6 +73,7 @@ impl Reason {
             Reason::Broken => "File hỏng / không đọc được",
             Reason::LowScore => "Điểm thấp",
             Reason::NotStarred => "Không gắn sao trên máy",
+            Reason::Enough => "Đã đủ ảnh chủ thể này",
         }
     }
 }
@@ -332,10 +337,10 @@ pub fn cull(items: &[Option<&Analysis>], s: &Settings, profile: Option<&Profile>
         _ => x.cmp(&y),
     });
 
+    // Which frame of a series Sơn keeps, once learned.
+    let gain = profile.map(|p| 2.5 * (2.0 * p.rank_acc - 1.0).max(0.0)).unwrap_or(0.0);
+    let rank: Vec<Option<f32>> = items.iter().map(|a| a.filter(|_| gain > 0.1).and_then(|a| profile.and_then(|p| p.rank(&learn::features(a))))).collect();
     if o.dedupe {
-        // Which frame of a series Sơn keeps, once learned.
-        let gain = profile.map(|p| 2.5 * (2.0 * p.rank_acc - 1.0).max(0.0)).unwrap_or(0.0);
-        let rank: Vec<Option<f32>> = items.iter().map(|a| a.filter(|_| gain > 0.1).and_then(|a| profile.and_then(|p| p.rank(&learn::features(a))))).collect();
         dedupe(items, &mut out, &order, s, &rank, gain);
     }
     assign_moments(&mut out, &order, s.moment_gap_seconds);
@@ -347,6 +352,9 @@ pub fn cull(items: &[Option<&Analysis>], s: &Settings, profile: Option<&Profile>
     }
     if o.story {
         cover_story(items, &mut out, s);
+    }
+    if o.per_subject {
+        subject_quotas(items, &mut out, &order, s, &rank, gain);
     }
     if let Some(n) = s.max_selected {
         limit(&mut out, n);
@@ -775,6 +783,136 @@ fn cover_story(items: &[Option<&Analysis>], out: &mut [Verdict], s: &Settings) {
     }
 }
 
+/// Sơn's rule for one subject (a speaker's speech, one group, one key person): about 3 of the
+/// best, up to 5 for a speaker, never more.
+const SPEAKER_MAX: usize = 5;
+const SUBJECT_MAX: usize = 3;
+const SUBJECT_FILL: usize = 3;
+/// Photos of the same subject this far apart (seconds) are another time: the closing words, the
+/// second group photo of the day.
+const SUBJECT_GAP: f64 = 600.0;
+/// Frames of a speaker just before or after, too turned to be matched by face: same subject when
+/// this close (seconds) and the picture alike.
+const SUBJECT_NEXT: f64 = 30.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubjectKind {
+    Speaker,
+    Group,
+    /// A person alone in the frame: a key person, or a portrait.
+    Person,
+}
+
+impl SubjectKind {
+    fn max(self) -> usize {
+        if self == SubjectKind::Speaker { SPEAKER_MAX } else { SUBJECT_MAX }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            SubjectKind::Speaker => "người phát biểu",
+            SubjectKind::Group => "nhóm",
+            SubjectKind::Person => "nhân vật",
+        }
+    }
+}
+
+/// What a photo is of, when it is one of the subjects Sơn counts: someone alone at the lectern,
+/// a group posing, a person alone (a key person, or a portrait). Faces must be known by their
+/// fingerprints to tell one subject from the next.
+fn subject_kind(a: &Analysis, v: &Verdict) -> Option<SubjectKind> {
+    use crate::scene::Scene;
+    let solo = a.people.solo().filter(|f| !f.id.is_empty());
+    match v.scene {
+        Scene::Speaker if solo.is_some() => Some(SubjectKind::Speaker),
+        Scene::Group if known_faces(a).len() >= 2 => Some(SubjectKind::Group),
+        Scene::Portrait | Scene::Moment | Scene::Activity if solo.is_some() && (v.scene == Scene::Portrait || !v.key_people.is_empty()) => Some(SubjectKind::Person),
+        _ => None,
+    }
+}
+
+/// Whether two photos of one kind show the same subject.
+fn same_subject(kind: SubjectKind, a: &Analysis, va: &Verdict, b: &Analysis, vb: &Verdict) -> bool {
+    match kind {
+        SubjectKind::Group => same_group(a, b),
+        _ => {
+            if va.key_people.iter().any(|p| vb.key_people.contains(p)) {
+                return true;
+            }
+            let (Some(fa), Some(fb)) = (a.people.solo(), b.people.solo()) else { return false };
+            crate::faceid::similarity(&fa.id, &fb.id).unwrap_or(0.0) >= crate::faceid::SAME_PERSON
+        }
+    }
+}
+
+/// Per subject, as Sơn delivers: at most 3 photos (5 of a speaker), the best ones; and when he
+/// has only 1 or 2 of a speaker, a group or a key person, the next best usable frames up to 3.
+fn subject_quotas(items: &[Option<&Analysis>], out: &mut [Verdict], order: &[usize], s: &Settings, rank: &[Option<f32>], gain: f32) {
+    struct Subject {
+        kind: SubjectKind,
+        members: Vec<usize>,
+    }
+    let mut subjects: Vec<Subject> = vec![];
+    for &i in order {
+        let Some(a) = items[i] else { continue };
+        let Some(kind) = subject_kind(a, &out[i]) else { continue };
+        let t = out[i].time;
+        let near = |k: usize, gap: f64| match (t, out[k].time) {
+            (Some(x), Some(y)) => (x - y).abs() <= gap,
+            _ => true,
+        };
+        let found = subjects.iter_mut().rev().find(|g| {
+            g.kind == kind
+                && g.members.last().is_some_and(|&l| near(l, SUBJECT_GAP))
+                && g.members.iter().rev().take(12).any(|&k| {
+                    let Some(b) = items[k] else { return false };
+                    if same_subject(kind, a, &out[i], b, &out[k]) {
+                        return true;
+                    }
+                    // The speaker turned away from the camera a moment: same lectern, same picture.
+                    kind == SubjectKind::Speaker
+                        && near(k, SUBJECT_NEXT)
+                        && !other_people(a, b)
+                        && crate::visual::similarity_content(&a.embed, &b.embed) >= SAME_SHOT_BURST
+                })
+        });
+        match found {
+            Some(g) => g.members.push(i),
+            None => subjects.push(Subject { kind, members: vec![i] }),
+        }
+    }
+    let floor = s.threshold - s.review_margin.max(0.5);
+    for g in subjects {
+        let key: HashMap<usize, f32> = g.members.iter().map(|&i| (i, frame_rank(items[i], &out[i], s, rank[i], gain))).collect();
+        let mut ranked = g.members.clone();
+        ranked.sort_by(|&x, &y| key[&y].total_cmp(&key[&x]).then(x.cmp(&y)));
+        let picked: Vec<usize> = ranked.iter().copied().filter(|&i| out[i].decision == Decision::Selected).collect();
+        let (max, label) = (g.kind.max(), g.kind.label());
+        for &i in picked.iter().skip(max) {
+            out[i].decision = Decision::Rejected(Reason::Enough);
+            out[i].notes.push(format!("Đã giữ {max} tấm đẹp nhất của {label} này"));
+        }
+        // Filling up: a speech, a group, a key person (not every portrait of a guest).
+        let fill = g.kind != SubjectKind::Person || g.members.iter().any(|&i| !out[i].key_people.is_empty());
+        let mut n = picked.len().min(max);
+        if !fill || n >= SUBJECT_FILL {
+            continue;
+        }
+        for &i in &ranked {
+            if n >= SUBJECT_FILL {
+                break;
+            }
+            let a = items[i];
+            let sour = a.and_then(|a| a.people.solo()).and_then(|f| f.negative()).unwrap_or(0.0) >= 0.5;
+            if out[i].decision != Decision::Selected && !sour && fills_gap(&out[i], a, floor, s) {
+                out[i].decision = Decision::Selected;
+                out[i].notes.push(format!("Giữ đủ {SUBJECT_FILL} tấm đẹp nhất của {label} này"));
+                n += 1;
+            }
+        }
+    }
+}
+
 /// Long side (pixels) under which a photo is fine for the web but not for large prints.
 const LOW_RES: u32 = 2000;
 
@@ -1000,7 +1138,16 @@ mod tests {
     }
 
     fn person(k: u32) -> Vec<i8> {
-        let v: Vec<f32> = (0..crate::faceid::DIM).map(|i| ((i as u32).wrapping_mul(2654435761).wrapping_add(k.wrapping_mul(40503)) as f32 * 1e-3).sin()).collect();
+        // Independent pseudo-random vectors: different people are unrelated (|cosine| ~0.1).
+        let h = |i: u32| {
+            let mut x = i.wrapping_mul(0x9E37_79B9) ^ k.wrapping_mul(0x85EB_CA6B).rotate_left(13);
+            x ^= x >> 16;
+            x = x.wrapping_mul(0x7FEB_352D);
+            x ^= x >> 15;
+            x = x.wrapping_mul(0x846C_A68B);
+            x ^ (x >> 16)
+        };
+        let v: Vec<f32> = (0..crate::faceid::DIM as u32).map(|i| (h(i) % 2001) as f32 - 1000.0).collect();
         crate::faceid::quantise(&v).unwrap()
     }
 
@@ -1010,7 +1157,11 @@ mod tests {
         // spot, each shot twice, a few seconds apart: the pictures are practically identical,
         // only the student's face tells them apart.
         let ids: Vec<Vec<i8>> = (0..6).map(person).collect();
-        assert!(crate::faceid::similarity(&ids[0], &ids[1]).unwrap() < crate::faceid::OTHER_PERSON);
+        for a in 0..6 {
+            for b in a + 1..6 {
+                assert!(crate::faceid::similarity(&ids[a], &ids[b]).unwrap().abs() < crate::faceid::OTHER_PERSON);
+            }
+        }
         let mut g = vec![];
         for st in 1..6u32 {
             for k in 0..2 {
@@ -1132,6 +1283,66 @@ mod tests {
         let mut s = Settings::default();
         s.options.speaker_head_up = false;
         assert_eq!(cull(&refs, &s, None)[0].decision, Decision::Selected);
+    }
+
+    #[test]
+    fn each_speaker_group_and_key_person_gets_three_to_five() {
+        // A speech: 12 good photos of the same speaker at the microphone over four minutes, each
+        // its own pose (no bursts). Then a group photo shot 6 times, people shifting, then a key
+        // person alone, 2 good frames and 3 just under the pick score.
+        let ids: Vec<Vec<i8>> = (30..40).map(person).collect();
+        let mut g = vec![];
+        for k in 0..12u32 {
+            let mut a = shot(&format!("pb{k}"), 1000.0 + k as f64 * 20.0, 8.0 + (k % 5) as f32 * 0.2, 100 + k, 1.0, k, 1);
+            a.people.faces[0].id = ids[0].clone();
+            a.objects = vec![(650, 30)];
+            g.push(a);
+        }
+        for k in 0..6u32 {
+            let mut a = shot(&format!("tt{k}"), 2000.0 + k as f64 * 20.0, 8.2 + k as f32 * 0.1, 200 + k, 1.0, 50 + k, 4);
+            for (f, id) in a.people.faces.iter_mut().zip(&ids[1..5]) {
+                f.id = id.clone();
+            }
+            g.push(a);
+        }
+        for k in 0..5u32 {
+            let score = if k < 2 { 8.4 } else { 7.0 + k as f32 * 0.1 };
+            let mut a = shot(&format!("nv{k}"), 3000.0 + k as f64 * 40.0, score, 300 + k, 1.0, 80 + k, 1);
+            a.people.faces[0].bbox = [0.4, 0.2, 0.2, 0.3];
+            a.people.faces[0].id = ids[6].clone();
+            a.key_faces = vec![(0, 2)];
+            g.push(a);
+        }
+        let refs: Vec<_> = g.iter().map(Some).collect();
+        let mut s = Settings::default();
+        s.options.story = false;
+        let v = cull(&refs, &s, None);
+        let names = |pre: &str| v.iter().filter(|x| x.decision == Decision::Selected && g[x.idx].name.starts_with(pre)).map(|x| g[x.idx].name.clone()).collect::<Vec<_>>();
+        let dump = || v.iter().map(|x| (g[x.idx].name.clone(), x.scene, x.decision, x.score)).collect::<Vec<_>>();
+        assert_eq!(v[0].scene, crate::scene::Scene::Speaker);
+        let pb = names("pb");
+        assert_eq!(pb.len(), SPEAKER_MAX, "{:?}", dump());
+        // The best five: both at 8.8, both at 8.6, the first at 8.4.
+        assert_eq!(pb, vec!["pb2", "pb3", "pb4", "pb8", "pb9"]);
+        assert_eq!(v.iter().filter(|x| x.decision == Decision::Rejected(Reason::Enough)).count(), 12 - 5 + 6 - 3, "{:?}", dump());
+        assert_eq!(names("tt"), vec!["tt3", "tt4", "tt5"], "{:?}", dump());
+        assert_eq!(names("nv").len(), 3, "two good frames and the best one just under: {:?}", dump());
+        assert!(names("nv").contains(&"nv4".to_string()));
+
+        // Another speaker right after the first: their own quota.
+        for (k, a) in g.iter_mut().take(12).enumerate() {
+            if k >= 6 {
+                a.people.faces[0].id = ids[7].clone();
+            }
+        }
+        let refs: Vec<_> = g.iter().map(Some).collect();
+        let v = cull(&refs, &s, None);
+        assert_eq!(v.iter().take(12).filter(|x| x.decision == Decision::Selected).count(), 10);
+
+        // Switched off: every good photo stays picked.
+        s.options.per_subject = false;
+        let v = cull(&refs, &s, None);
+        assert_eq!(v.iter().take(18).filter(|x| x.decision == Decision::Selected).count(), 18);
     }
 
     #[test]

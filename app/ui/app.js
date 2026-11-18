@@ -17,7 +17,7 @@ const PRESETS = {
 const REASONS = {
   "closed-eyes": "Nhắm mắt", blurry: "Mờ, rung, trượt nét", overexposed: "Cháy sáng / thừa sáng", underexposed: "Thiếu sáng",
   tilted: "Nghiêng", composition: "Sai bố cục", noise: "Nhiễu hạt nặng", duplicate: "Trùng lặp", broken: "File hỏng", "low-score": "Điểm thấp",
-  "not-starred": "Không gắn sao trên máy",
+  "not-starred": "Không gắn sao trên máy", enough: "Đã đủ ảnh chủ thể này",
 };
 const CORE_OPTS = [
   ["reject_closed_eyes", "Loại ảnh có người nhắm mắt"],
@@ -26,6 +26,7 @@ const CORE_OPTS = [
   ["keep_each_shot", "Cảnh chụp nhiều tấm (nhóm nhận giải…) giữ ít nhất 1 tấm đẹp nhất"],
   ["speaker_head_up", "Người phát biểu một mình cúi đầu: đưa vào «Cần xem lại»"],
   ["story", "Đủ loại ảnh kể câu chuyện (toàn cảnh, phát biểu, chi tiết, tập thể…)"],
+  ["per_subject", "Mỗi chủ thể chọn vừa đủ: người phát biểu 3–5 tấm, mỗi nhóm và mỗi nhân vật quan trọng khoảng 3 tấm đẹp nhất"],
   ["use_learned", "Dùng điều AI đã học từ lựa chọn của bạn"],
 ];
 
@@ -1574,6 +1575,7 @@ function renderEyes(i, p, mains) {
             ${btn(!v, `data-mark="${m}" data-yes="0"`, no)}${btn(v, `data-mark="${m}" data-yes="1"`, yes)}${hand(m) ? again(`data-mark="${m}" data-yes=""`) : ""}</div>`);
         }
       }
+      if (f.expr) lines.push(`<div class="eyerow"><span>Nét mặt</span><span class="note">${esc(f.expr)}</span></div>`);
       if (f.known || f.person != null) {
         lines.push(`<div class="eyerow"><span>Quan trọng</span>${f.person != null
           ? `<button class="btn sm on" data-key="1" title="Bấm để đổi tên hoặc bỏ đánh dấu">♛ ${esc(personName(f.person))}</button>`

@@ -336,6 +336,8 @@ struct FaceBox {
     person: Option<u32>,
     /// A fingerprint exists, so it can be marked as a key person.
     known: bool,
+    /// The facial expression read by the AI ("cười", "bình thường"…), when the face is big enough.
+    expr: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -448,6 +450,7 @@ fn photo_view(idx: usize, it: &Item) -> PhotoView {
                         small: f.small,
                         person: a.key_faces.iter().find(|k| k.0 == i).map(|k| k.1),
                         known: !f.id.is_empty(),
+                        expr: f.expression_label(),
                     }).collect())
             .unwrap_or_default(),
         error: it.error.clone(),
