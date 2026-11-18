@@ -28,6 +28,7 @@ const CORE_OPTS = [
   ["story", "Đủ loại ảnh kể câu chuyện (toàn cảnh, phát biểu, chi tiết, tập thể…)"],
   ["per_subject", "Mỗi chủ thể chọn vừa đủ: người phát biểu 3–5 tấm, mỗi nhóm và mỗi nhân vật quan trọng khoảng 3 tấm đẹp nhất"],
   ["use_learned", "Dùng điều AI đã học từ lựa chọn của bạn"],
+  ["self_tune", "AI tự kiểm tra trên các show bạn đã dạy và tự chỉnh cài đặt cho khớp bạn nhất"],
 ];
 
 const st = {
@@ -958,6 +959,7 @@ function wireResults() {
   $("btnExport").onclick = doExportShow;
   $("btnLearnShow").onclick = doLearnShow;
   $("btnLearnPair").onclick = doLearnPair;
+  $("btnSelfTune").onclick = doSelfTune;
   $("btnExportOther").onclick = doExport;
   $("optStars").onchange = () => {
     const v = $("optStars").value;
@@ -1073,6 +1075,39 @@ function renderSync() {
   if (off) off.onclick = async () => { st.info = Object.assign(st.info, await invoke("set_sync_dir", { path: null })); renderSync(); };
 }
 
+/** What the AI found checking itself on the shows taught. */
+function tunedNote(t) {
+  if (!t) return " Dạy AI bằng «Học từ show cũ…» (thư mục có cả ảnh gốc và ảnh bạn chọn) để AI có bài tự kiểm tra và tự chỉnh.";
+  const pct = (x) => Math.round(x * 100) + "%";
+  const auto = st.prefs.settings.options.self_tune !== false;
+  return ` AI tự kiểm tra trên ${t.shows.length} show đã dạy: khớp lựa chọn của bạn ${pct(t.before.f1)} → ${pct(t.after.f1)}.` +
+    (t.changes.length ? (auto ? " Đã tự chỉnh: " : " Gợi ý chỉnh (đang tắt «AI tự chỉnh»): ") + esc(t.changes.join("; ")) + "." : " Cài đặt hiện tại đã khớp nhất.");
+}
+
+/** Reload the open session after the AI re-decided it (new settings, new knowledge). */
+async function reloadAfterLearning() {
+  for (const k of Object.keys(st.views)) delete st.views[k];
+  if (!st.sid) return;
+  const v = await invoke("get_session", { id: st.sid }).catch(() => null);
+  if (v) st.views[st.sid] = v;
+  st.session = null;
+  renderMain();
+}
+
+async function doSelfTune() {
+  busy(true, "AI đang tự kiểm tra trên các show bạn đã dạy…");
+  try {
+    const r = await invoke("self_tune", { name: st.prefs.profile });
+    busy(false);
+    renderProfile(r.profile);
+    toast(r.tuned ? tunedNote(r.tuned).trim() + (r.tuned.lessons.length ? " Đúc kết: " + esc(r.tuned.lessons.join("; ")) + "." : "") : "Chưa có show nào để AI tự kiểm tra." + tunedNote(null), 20000);
+    await reloadAfterLearning();
+  } catch (e) {
+    busy(false);
+    toast(esc(e));
+  }
+}
+
 /** What a lesson taught about choosing inside a burst. */
 const seriesNote = (l) => (l.series ? ` Có ${l.series} loạt ảnh cùng cảnh bạn giữ tấm này, bỏ tấm kia: AI học bạn chọn tấm nào trong loạt.` : "");
 
@@ -1088,10 +1123,10 @@ async function doLearnShow() {
     toast(
       l.only_picks
         ? `Không thấy ảnh gốc trong thư mục này, nên app coi cả ${l.kept} ảnh là ảnh bạn đã chọn và học theo. Học thêm show có cả ảnh gốc để AI biết bạn hay bỏ ảnh kiểu nào.`
-        : `Đã học ${l.kept + l.dropped} ảnh của show: bạn chọn ${l.kept}, bỏ ${l.dropped}` + (l.pick_folders.length ? ` (ảnh chọn nằm ở ${l.pick_folders.map((f) => "«" + esc(f.split(/[\\/]/).pop()) + "»").join(", ")})` : "") + `.` + seriesNote(l) + ` AI áp dụng ngay cho loại sự kiện «${esc(st.prefs.profile)}».`,
-      15000
+        : `Đã học ${l.kept + l.dropped} ảnh của show: bạn chọn ${l.kept}, bỏ ${l.dropped}` + (l.pick_folders.length ? ` (ảnh chọn nằm ở ${l.pick_folders.map((f) => "«" + esc(f.split(/[\\/]/).pop()) + "»").join(", ")})` : "") + `.` + seriesNote(l) + tunedNote(r.tuned) + ` AI áp dụng ngay cho loại sự kiện «${esc(st.prefs.profile)}».`,
+      20000
     );
-    if (st.sid) { const v = await invoke("get_session", { id: st.sid }).catch(() => null); if (v) { st.views[st.sid] = v; st.session = null; renderMain(); } }
+    await reloadAfterLearning();
   } catch (e) {
     busy(false);
     toast(esc(e));
@@ -1157,15 +1192,12 @@ async function doLearnPair() {
       `Đã học ${l.kept + l.dropped} ảnh: bạn giữ ${l.kept}, bỏ ${l.dropped}.` +
         (l.unmatched ? ` Có ${l.unmatched} ảnh đã chọn không tìm thấy trong phiên gốc (có thể của show khác hoặc đã cắt khác nhiều).` : "") +
         seriesNote(l) +
+        tunedNote(r.tuned) +
         ` Giờ AI chọn ${r.ai_selected} ảnh ở phiên gốc, trúng ${r.ai_agrees}/${l.kept} ảnh bạn đã chọn.`,
-      15000
+      20000
     );
     // Every open session of this event type was re-decided: drop cached views, reload this one.
-    for (const k of Object.keys(st.views)) delete st.views[k];
-    const v = await invoke("get_session", { id: st.sid }).catch(() => null);
-    if (v) st.views[st.sid] = v;
-    st.session = null;
-    renderMain();
+    await reloadAfterLearning();
   } catch (e) {
     busy(false);
     toast(esc(e));

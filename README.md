@@ -211,6 +211,21 @@ lấy thêm tấm đẹp kế tiếp (gần đủ điểm, không nhắm mắt, 
 ra cùng một người, cùng một nhóm nhờ dấu vân khuôn mặt; cùng người nhưng cách nhau hơn 10 phút là lượt
 khác. Tắt được trong Tuỳ chọn.
 
+**AI tự rèn.** Sau mỗi lần học («Học từ show cũ…», «Học từ 2 phiên đang mở…») hoặc khi bấm «AI tự
+rèn lại», AI tự làm bài kiểm tra trên mọi show bạn đã dạy:
+1. Che lựa chọn của bạn, học gu từ các show *khác* (như thể show này là show mới, không nhìn trước đáp án).
+2. Tự chọn lại cả show, so với ảnh bạn thật sự giữ (điểm khớp F1: vừa chọn trúng ảnh bạn giữ, vừa không
+   chọn thừa).
+3. Thử lần lượt từng cài đặt (điểm để chọn, mức dựa vào gu đã học, cách chọn trong một loạt ảnh, số ảnh
+   mỗi người phát biểu / nhóm / nhân vật, giữ cảnh chụp nhiều tấm, đủ loại ảnh), giữ bộ khớp bạn nhất.
+   Chỉ đổi khi khớp hơn rõ rệt.
+4. Đúc kết cách bạn chọn: giữ bao nhiêu % ảnh, mấy tấm mỗi người phát biểu, mỗi nhóm, mỗi loạt ảnh, hay giữ
+   loại ảnh nào, ảnh cười hay không.
+
+Kết quả hiện trong khung «AI học theo bạn» và áp dụng ngay cho các phiên cùng loại sự kiện (tắt được bằng
+tuỳ chọn «AI tự kiểm tra… và tự chỉnh»). Bài kiểm tra lấy từ phần phân tích app đã lưu của các show đó,
+không cần mở lại thư mục.
+
 ## Các tuỳ chọn
 
 AI trong ứng dụng gợi ý nên bật gì cho từng thư mục, bạn quyết định. Nếu bật «Để AI tự bật», AI chỉ được

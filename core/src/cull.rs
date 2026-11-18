@@ -148,6 +148,13 @@ pub struct Settings {
     pub camera_offsets: HashMap<String, f64>,
     /// Share of the final score taken from the learned profile once it is ready (0–1).
     pub learned_weight: f32,
+    /// Photos of one subject (Sơn's rule, see [`Options::per_subject`]): at most this many of a
+    /// speaker, of a group or a person, and filled up to `subject_fill` when usable.
+    pub speaker_max: usize,
+    pub subject_max: usize,
+    pub subject_fill: usize,
+    /// How strongly his learned way of choosing inside a series counts (1 = as measured).
+    pub rank_gain: f32,
     pub options: Options,
 }
 
@@ -163,6 +170,10 @@ impl Default for Settings {
             max_selected: None,
             camera_offsets: HashMap::new(),
             learned_weight: 0.35,
+            speaker_max: 5,
+            subject_max: 3,
+            subject_fill: 3,
+            rank_gain: 1.0,
             options: Options::default(),
         }
     }
@@ -241,9 +252,45 @@ pub fn rule_score(a: &Analysis, w: &[f32; 6], fix_tilt: bool) -> (f32, Vec<Strin
 }
 
 /// Decide every photo. `items[i]` is `None` when the file could not be read.
+/// What the learned profile says of each photo; it does not depend on the settings, so trying
+/// many settings (the AI checking itself on old shows) works it out once.
+pub struct Learned {
+    /// Probability Sơn keeps it.
+    pub keep: Vec<Option<f32>>,
+    /// How he would rank it within a series.
+    pub rank: Vec<Option<f32>>,
+}
+
+impl Learned {
+    pub fn new(items: &[Option<&Analysis>], profile: Option<&Profile>) -> Self {
+        use rayon::prelude::*;
+        let profile = profile.filter(|p| p.ready() || p.rank_pairs > 0);
+        // Comparing every photo with the learned ones is the slow part: all cores at once.
+        let pairs: Vec<(Option<f32>, Option<f32>)> = items
+            .par_iter()
+            .map(|a| match (a, profile) {
+                (Some(a), Some(p)) => {
+                    let f = learn::features(a);
+                    (p.predict(&f, &a.embed), p.rank(&f))
+                }
+                _ => (None, None),
+            })
+            .collect();
+        let (keep, rank) = pairs.into_iter().unzip();
+        Self { keep, rank }
+    }
+}
+
 pub fn cull(items: &[Option<&Analysis>], s: &Settings, profile: Option<&Profile>) -> Vec<Verdict> {
+    let on = profile.filter(|p| s.options.use_learned && (p.ready() || p.rank_pairs > 0));
+    cull_with(items, s, profile, &Learned::new(items, on))
+}
+
+/// [`cull`] with the profile's opinions worked out beforehand.
+pub fn cull_with(items: &[Option<&Analysis>], s: &Settings, profile: Option<&Profile>, learned: &Learned) -> Vec<Verdict> {
     let o = &s.options;
     let fix = o.fix_instead_of_reject;
+    let ranker = profile.filter(|_| o.use_learned);
     let profile = profile.filter(|p| o.use_learned && p.ready());
     // Camera stars. A folder where every file is read-only was copied that way (a disc, a
     // shared drive): the camera's protect lock says nothing there.
@@ -254,11 +301,7 @@ pub fn cull(items: &[Option<&Analysis>], s: &Settings, profile: Option<&Profile>
     let min_stars = o.min_stars.max(1);
     let starred = |a: &Analysis| a.stars >= min_stars || (a.protected && !all_locked);
     let stars_on = o.stars != StarMode::Off;
-    // Comparing every photo with the learned ones is the slow part: all cores at once.
-    let learned_all: Vec<Option<f32>> = {
-        use rayon::prelude::*;
-        items.par_iter().map(|a| a.and_then(|a| profile.and_then(|p| p.predict(&learn::features(a), &a.embed)))).collect()
-    };
+    let learned_all: Vec<Option<f32>> = learned.keep.iter().map(|&p| p.filter(|_| profile.is_some())).collect();
     let mut out: Vec<Verdict> = items
         .iter()
         .enumerate()
@@ -330,16 +373,11 @@ pub fn cull(items: &[Option<&Analysis>], s: &Settings, profile: Option<&Profile>
         })
         .collect();
 
-    // Timeline order: by time when known, then by name order (input order).
-    let mut order: Vec<usize> = (0..out.len()).collect();
-    order.sort_by(|&x, &y| match (out[x].time, out[y].time) {
-        (Some(a), Some(b)) => a.total_cmp(&b).then(x.cmp(&y)),
-        _ => x.cmp(&y),
-    });
+    let order = timeline(&out);
 
     // Which frame of a series Sơn keeps, once learned.
-    let gain = profile.map(|p| 2.5 * (2.0 * p.rank_acc - 1.0).max(0.0)).unwrap_or(0.0);
-    let rank: Vec<Option<f32>> = items.iter().map(|a| a.filter(|_| gain > 0.1).and_then(|a| profile.and_then(|p| p.rank(&learn::features(a))))).collect();
+    let gain = ranker.map(|p| s.rank_gain.max(0.0) * 2.5 * (2.0 * p.rank_acc - 1.0).max(0.0)).unwrap_or(0.0);
+    let rank: Vec<Option<f32>> = learned.rank.iter().map(|&r| r.filter(|_| gain > 0.1)).collect();
     if o.dedupe {
         dedupe(items, &mut out, &order, s, &rank, gain);
     }
@@ -783,11 +821,6 @@ fn cover_story(items: &[Option<&Analysis>], out: &mut [Verdict], s: &Settings) {
     }
 }
 
-/// Sơn's rule for one subject (a speaker's speech, one group, one key person): about 3 of the
-/// best, up to 5 for a speaker, never more.
-const SPEAKER_MAX: usize = 5;
-const SUBJECT_MAX: usize = 3;
-const SUBJECT_FILL: usize = 3;
 /// Photos of the same subject this far apart (seconds) are another time: the closing words, the
 /// second group photo of the day.
 const SUBJECT_GAP: f64 = 600.0;
@@ -795,8 +828,9 @@ const SUBJECT_GAP: f64 = 600.0;
 /// this close (seconds) and the picture alike.
 const SUBJECT_NEXT: f64 = 30.0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SubjectKind {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SubjectKind {
     Speaker,
     Group,
     /// A person alone in the frame: a key person, or a portrait.
@@ -804,11 +838,11 @@ enum SubjectKind {
 }
 
 impl SubjectKind {
-    fn max(self) -> usize {
-        if self == SubjectKind::Speaker { SPEAKER_MAX } else { SUBJECT_MAX }
+    fn max(self, s: &Settings) -> usize {
+        if self == SubjectKind::Speaker { s.speaker_max } else { s.subject_max }
     }
 
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             SubjectKind::Speaker => "người phát biểu",
             SubjectKind::Group => "nhóm",
@@ -845,13 +879,14 @@ fn same_subject(kind: SubjectKind, a: &Analysis, va: &Verdict, b: &Analysis, vb:
     }
 }
 
-/// Per subject, as Sơn delivers: at most 3 photos (5 of a speaker), the best ones; and when he
-/// has only 1 or 2 of a speaker, a group or a key person, the next best usable frames up to 3.
-fn subject_quotas(items: &[Option<&Analysis>], out: &mut [Verdict], order: &[usize], s: &Settings, rank: &[Option<f32>], gain: f32) {
-    struct Subject {
-        kind: SubjectKind,
-        members: Vec<usize>,
-    }
+/// One subject: a speaker's speech, one group, one person alone, in timeline order.
+pub struct Subject {
+    pub kind: SubjectKind,
+    pub members: Vec<usize>,
+}
+
+/// The subjects Sơn counts photos of (see [`subject_kind`]), photos in timeline `order`.
+pub fn subjects(items: &[Option<&Analysis>], out: &[Verdict], order: &[usize]) -> Vec<Subject> {
     let mut subjects: Vec<Subject> = vec![];
     for &i in order {
         let Some(a) = items[i] else { continue };
@@ -881,32 +916,50 @@ fn subject_quotas(items: &[Option<&Analysis>], out: &mut [Verdict], order: &[usi
             None => subjects.push(Subject { kind, members: vec![i] }),
         }
     }
+    subjects
+}
+
+/// Timeline order: by time when known, then by name order (input order).
+pub fn timeline(out: &[Verdict]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..out.len()).collect();
+    order.sort_by(|&x, &y| match (out[x].time, out[y].time) {
+        (Some(a), Some(b)) => a.total_cmp(&b).then(x.cmp(&y)),
+        _ => x.cmp(&y),
+    });
+    order
+}
+
+/// Per subject, as Sơn delivers: at most 3 photos (5 of a speaker), the best ones; and when he
+/// has only 1 or 2 of a speaker, a group or a key person, the next best usable frames up to 3.
+fn subject_quotas(items: &[Option<&Analysis>], out: &mut [Verdict], order: &[usize], s: &Settings, rank: &[Option<f32>], gain: f32) {
+    let subjects = subjects(items, out, order);
     let floor = s.threshold - s.review_margin.max(0.5);
     for g in subjects {
         let key: HashMap<usize, f32> = g.members.iter().map(|&i| (i, frame_rank(items[i], &out[i], s, rank[i], gain))).collect();
         let mut ranked = g.members.clone();
         ranked.sort_by(|&x, &y| key[&y].total_cmp(&key[&x]).then(x.cmp(&y)));
         let picked: Vec<usize> = ranked.iter().copied().filter(|&i| out[i].decision == Decision::Selected).collect();
-        let (max, label) = (g.kind.max(), g.kind.label());
+        let (max, label) = (g.kind.max(s).max(1), g.kind.label());
         for &i in picked.iter().skip(max) {
             out[i].decision = Decision::Rejected(Reason::Enough);
             out[i].notes.push(format!("Đã giữ {max} tấm đẹp nhất của {label} này"));
         }
         // Filling up: a speech, a group, a key person (not every portrait of a guest).
         let fill = g.kind != SubjectKind::Person || g.members.iter().any(|&i| !out[i].key_people.is_empty());
+        let want = s.subject_fill.min(max);
         let mut n = picked.len().min(max);
-        if !fill || n >= SUBJECT_FILL {
+        if !fill || n >= want {
             continue;
         }
         for &i in &ranked {
-            if n >= SUBJECT_FILL {
+            if n >= want {
                 break;
             }
             let a = items[i];
             let sour = a.and_then(|a| a.people.solo()).and_then(|f| f.negative()).unwrap_or(0.0) >= 0.5;
             if out[i].decision != Decision::Selected && !sour && fills_gap(&out[i], a, floor, s) {
                 out[i].decision = Decision::Selected;
-                out[i].notes.push(format!("Giữ đủ {SUBJECT_FILL} tấm đẹp nhất của {label} này"));
+                out[i].notes.push(format!("Giữ đủ {want} tấm đẹp nhất của {label} này"));
                 n += 1;
             }
         }
@@ -1321,7 +1374,7 @@ mod tests {
         let dump = || v.iter().map(|x| (g[x.idx].name.clone(), x.scene, x.decision, x.score)).collect::<Vec<_>>();
         assert_eq!(v[0].scene, crate::scene::Scene::Speaker);
         let pb = names("pb");
-        assert_eq!(pb.len(), SPEAKER_MAX, "{:?}", dump());
+        assert_eq!(pb.len(), 5, "{:?}", dump());
         // The best five: both at 8.8, both at 8.6, the first at 8.4.
         assert_eq!(pb, vec!["pb2", "pb3", "pb4", "pb8", "pb9"]);
         assert_eq!(v.iter().filter(|x| x.decision == Decision::Rejected(Reason::Enough)).count(), 12 - 5 + 6 - 3, "{:?}", dump());

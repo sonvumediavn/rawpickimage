@@ -17,4 +17,5 @@ pub mod export;
 pub mod ingest;
 pub mod pipeline;
 pub mod lesson;
+pub mod selftune;
 pub mod chat;

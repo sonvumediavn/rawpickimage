@@ -214,6 +214,9 @@ pub struct Profile {
     pub rank_pairs: usize,
     #[serde(default, with = "nan_one")]
     pub rank_acc: f32,
+    /// Settings the AI found by checking itself on the shows Sơn taught ([`crate::selftune`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tuned: Option<crate::selftune::Tuned>,
     #[serde(skip)]
     bank: Vec<BankEntry>,
 }
@@ -601,6 +604,9 @@ impl Profile {
                 self.rank_acc * 100.0,
                 top.join(", ")
             ));
+        }
+        if let Some(t) = &self.tuned {
+            out.extend(t.summary());
         }
         out
     }

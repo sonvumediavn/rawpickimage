@@ -42,6 +42,9 @@ pub struct Options {
     /// Sơn's count per subject: about 3 of the best photos of each group or key person, 3 to 5
     /// of each speaker, never more; filled up to 3 from the next best usable frames.
     pub per_subject: bool,
+    /// After each lesson the AI checks itself on the shows taught and puts the settings matching
+    /// Sơn best into use (pick score, photos per subject…).
+    pub self_tune: bool,
     /// Blend in what the AI learned from Sơn's earlier choices.
     pub use_learned: bool,
     /// Let the AI pick. Off: every photo still gets its score and notes, but nothing is chosen
@@ -91,6 +94,7 @@ impl Default for Options {
             speaker_head_up: true,
             story: true,
             per_subject: true,
+            self_tune: true,
             use_learned: true,
             ai_pick: true,
             stars: StarMode::Off,

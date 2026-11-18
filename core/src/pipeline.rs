@@ -37,6 +37,33 @@ fn cache_key(p: &Path) -> Option<String> {
     Some(format!("v{ANALYSIS_VERSION}|{}|{}|{}", p.display(), m.len(), t))
 }
 
+/// Analyses kept in a work folder's cache, by photo path, whatever version measured them (an
+/// older one lacks the newest measurements, nothing more). Entries that no longer read are skipped.
+pub fn cached_analyses(work: &Path) -> HashMap<String, Analysis> {
+    #[derive(Deserialize)]
+    struct Raw {
+        entries: HashMap<String, serde_json::Value>,
+    }
+    let Some(raw) = std::fs::read(work.join("cache.json")).ok().and_then(|b| serde_json::from_slice::<Raw>(&b).ok()) else {
+        return HashMap::new();
+    };
+    let mut best: HashMap<String, (u32, Analysis)> = HashMap::new();
+    for (k, v) in raw.entries {
+        // "v<version>|<path>|<size>|<mtime>"; the path itself may hold '|'.
+        let Some((ver, rest)) = k.split_once('|') else { continue };
+        let ver: u32 = ver.trim_start_matches('v').parse().unwrap_or(0);
+        let mut parts = rest.rsplitn(3, '|');
+        let (Some(_mtime), Some(_size), Some(path)) = (parts.next(), parts.next(), parts.next()) else { continue };
+        if best.get(path).is_some_and(|(v0, _)| *v0 >= ver) {
+            continue;
+        }
+        if let Ok(a) = serde_json::from_value::<Analysis>(v) {
+            best.insert(path.to_string(), (ver, a));
+        }
+    }
+    best.into_iter().map(|(k, (_, a))| (k, a)).collect()
+}
+
 /// Working folder for one source folder inside the app's data folder.
 pub fn work_dir(data_dir: &Path, source: &Path) -> PathBuf {
     let h = crc32fast::hash(source.to_string_lossy().as_bytes());

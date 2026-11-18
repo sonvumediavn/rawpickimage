@@ -9,6 +9,7 @@ use rawpick_core::learn::{self, Store};
 use rawpick_core::options::{self, FeatureInfo, Suggestion};
 use rawpick_core::pipeline::{self, Item, Progress, Timing};
 use rawpick_core::eyes::EyeBook;
+use rawpick_core::selftune::Tuned;
 use rawpick_core::{metrics, preview};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -1187,6 +1188,69 @@ fn op_set_folder(app: &Arc<App>, which: &str, path: Option<String>) -> Result<Ap
 struct LessonResult {
     lesson: rawpick_core::lesson::Lesson,
     profile: ProfileView,
+    /// What the AI found checking itself on the shows taught (None: nothing to check on yet).
+    tuned: Option<Tuned>,
+}
+
+/// The AI checks itself on every show taught for this event type and keeps the settings
+/// matching Sơn best; with «AI tự chỉnh» on, they go into the open sessions of this event type
+/// and the defaults. Re-deciding the sessions is left to the caller.
+fn self_tune(app: &App, profile: &str) -> Option<Tuned> {
+    let on_step = emitter(app, None);
+    let store = app.store();
+    let mut p = store.load(profile);
+    let exams = rawpick_core::selftune::find_exams(&p, &app.data_dir);
+    if exams.is_empty() {
+        return None;
+    }
+    // Start from the settings this event type is used with.
+    let base = {
+        let g = app.global.lock().unwrap();
+        let global = (g.prefs.profile == profile).then(|| g.prefs.settings.clone());
+        drop(g);
+        global.or_else(|| app.sessions.lock().unwrap().values().find(|s| s.prefs.profile == profile).map(|s| s.prefs.settings.clone())).unwrap_or_default()
+    };
+    let what = format!("AI tự kiểm tra trên {} show đã dạy", exams.len());
+    let t = rawpick_core::selftune::tune(&p, &exams, &base, &|d, n| on_step(d, n, &what))?;
+    p.tuned = Some(t.clone());
+    let _ = store.save(&p);
+    let auto = {
+        let mut g = app.global.lock().unwrap();
+        let on = g.prefs.settings.options.self_tune;
+        if on && g.prefs.profile == profile {
+            t.apply(&mut g.prefs.settings);
+        }
+        on
+    };
+    if auto {
+        app.save_global();
+        let mut map = app.sessions.lock().unwrap();
+        for s in map.values_mut().filter(|s| s.prefs.profile == profile && s.prefs.settings.options.self_tune) {
+            t.apply(&mut s.prefs.settings);
+        }
+        app.save_sessions(&map);
+    }
+    Some(t)
+}
+
+#[derive(Serialize)]
+struct TuneResult {
+    tuned: Option<Tuned>,
+    profile: ProfileView,
+}
+
+/// «AI tự rèn lại»: check on the shows taught again and re-decide.
+fn op_self_tune(app: &Arc<App>, profile: String) -> Result<TuneResult, String> {
+    let tuned = self_tune(app, &profile);
+    {
+        let mut map = app.sessions.lock().unwrap();
+        for s in map.values_mut().filter(|s| s.prefs.profile == profile && s.phase == Phase::Ready) {
+            app.recull(s);
+        }
+        app.save_sessions(&map);
+    }
+    sessions_changed(app);
+    Ok(TuneResult { tuned, profile: app.profile_view(&profile) })
 }
 
 /// «Học từ show cũ»: look at an old, already culled show and learn Sơn's picks from it.
@@ -1219,6 +1283,7 @@ fn op_learn_show(app: &Arc<App>, path: String, profile: String) -> Result<Lesson
         p.add(samples);
         p.train();
         store.save(&p).map_err(|e| e.to_string())?;
+        let tuned = self_tune(&app, &profile);
         // Already-open sessions of this event type use the new knowledge right away.
         {
             let mut map = app.sessions.lock().unwrap();
@@ -1228,7 +1293,7 @@ fn op_learn_show(app: &Arc<App>, path: String, profile: String) -> Result<Lesson
             app.save_sessions(&map);
         }
         sessions_changed(&app);
-        Ok(LessonResult { lesson, profile: app.profile_view(&profile) })
+        Ok(LessonResult { lesson, profile: app.profile_view(&profile), tuned })
     })()
 }
 
@@ -1240,6 +1305,7 @@ struct PairResult {
     ai_agrees: usize,
     /// How many photos the AI now picks in the originals session.
     ai_selected: usize,
+    tuned: Option<Tuned>,
 }
 
 /// «Học từ 2 phiên»: one open session holds the whole show, another the photos Sơn picked from
@@ -1268,6 +1334,7 @@ fn op_learn_pair(app: &Arc<App>, id: u32, other: u32, profile: String) -> Result
     p.add(samples);
     p.train();
     store.save(&p).map_err(|e| e.to_string())?;
+    let tuned = self_tune(app, &profile);
     let (mut ai_agrees, mut ai_selected) = (0, 0);
     {
         let mut map = app.sessions.lock().unwrap();
@@ -1287,7 +1354,7 @@ fn op_learn_pair(app: &Arc<App>, id: u32, other: u32, profile: String) -> Result
         app.save_sessions(&map);
     }
     sessions_changed(app);
-    Ok(PairResult { lesson, profile: app.profile_view(&profile), ai_agrees, ai_selected })
+    Ok(PairResult { lesson, profile: app.profile_view(&profile), ai_agrees, ai_selected, tuned })
 }
 
 /// Copy the selected photos into a sub-folder of the source folder (originals untouched).
@@ -1949,6 +2016,7 @@ fn dispatch(app: &Arc<App>, cmd: &str, args: serde_json::Value) -> Result<serde_
         "set_drive_dir" => json(op_set_folder(app, "drive", a.path)?),
         "set_sync_dir" => json(op_set_folder(app, "sync", a.path)?),
         "learn_show" => json(op_learn_show(app, need(a.path, "path")?, need(a.name, "name")?)?),
+        "self_tune" => json(op_self_tune(app, need(a.name, "name")?)?),
         "learn_pair" => json(op_learn_pair(app, need(a.id, "id")?, need(a.other, "other")?, need(a.name, "name")?)?),
         "gather_selected" => json(op_gather_selected(app, need(a.id, "id")?, need(a.sub, "sub")?)?),
         "claude_status" => json(op_claude_status()),
@@ -2125,6 +2193,10 @@ mod tests {
         assert!(r.is_ok(), "{r:?}");
         let a = app.clone();
         within(10, move || dispatch(&a, "profile_info", serde_json::json!({ "name": "Sự kiện chung" }))).unwrap();
+        // Nothing taught yet: checking itself finds no show, changes nothing, does not hang.
+        let a = app.clone();
+        let r = within(10, move || dispatch(&a, "self_tune", serde_json::json!({ "name": "Sự kiện chung" }))).unwrap();
+        assert!(r["tuned"].is_null(), "{r}");
         let _ = std::fs::remove_dir_all(&d);
     }
 
