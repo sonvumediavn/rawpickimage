@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 /// Measured features stored with each sample.
-pub const N_FEAT: usize = 27;
+pub const N_FEAT: usize = 35;
 /// Features from the pictures themselves: how close a photo looks to the ones Sơn kept, and
 /// to the ones he dropped (computed from the stored image vectors, not stored).
 pub const N_VIS: usize = 2;
@@ -78,11 +78,17 @@ pub const FEATURE_NAMES: [&str; N_ALL] = [
     "Cúi đầu", "Người phát biểu cúi đầu", "Tỉ lệ người mở mắt",
     "Mọi người cúi đầu (trung bình)", "Người cúi đầu nhiều nhất", "Mọi người quay mặt đi (trung bình)", "Người quay mặt đi nhiều nhất",
     "Mọi người cười (trung bình)", "Người có nét mặt khó chịu nhất", "Nhân vật chính cười",
+    "Đẹp tổng thể (mô hình thẩm mỹ)", "Khung cắt ngang khớp tay chân", "Tay che mặt", "Tay đang diễn tả, cử chỉ sống động",
+    "Khoanh tay", "Người chính xoay người khỏi máy", "Tay hai người chạm nhau (bắt tay, trao quà)", "Nhân vật chính ngạc nhiên, đang nói",
     "Nhìn giống ảnh bạn hay chọn", "Nhìn giống ảnh bạn hay bỏ",
 ];
 
 /// Values for features a sample saved by an older version doesn't have.
-const NEUTRAL: [f32; N_FEAT] = [5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.46, 0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+/// Features added after 27 are unknown (NaN) for older samples: training counts them as average.
+const NEUTRAL: [f32; N_FEAT] = [
+    5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.46, 0.0, 0.0, 9.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    f32::NAN, f32::NAN, f32::NAN, f32::NAN, f32::NAN, f32::NAN, f32::NAN, f32::NAN,
+];
 
 pub fn features(a: &Analysis) -> [f32; N_FEAT] {
     let s = &a.scores;
@@ -99,6 +105,13 @@ pub fn features(a: &Analysis) -> [f32; N_FEAT] {
     let read: Vec<&crate::faces::FaceInfo> = main.iter().copied().filter(|f| f.happy().is_some()).collect();
     let smiles = if read.is_empty() { 0.0 } else { read.iter().filter_map(|f| f.happy()).sum::<f32>() / read.len() as f32 * 10.0 };
     let sour = read.iter().filter_map(|f| f.negative()).fold(0.0f32, f32::max) * 10.0;
+    // Body language of the main people ([`crate::pose`]); without the pose model all zero.
+    let bodies: Vec<&crate::pose::Body> = main.iter().filter_map(|f| f.body.as_ref()).collect();
+    let cuts = bodies.iter().map(|b| b.cut.len()).sum::<usize>().min(4) as f32;
+    let hand_face = bodies.iter().any(|b| b.hand_face) as u8 as f32;
+    let gesture = bodies.iter().map(|b| b.gesture).fold(0.0f32, f32::max) * 10.0;
+    let crossed = bodies.iter().any(|b| b.arms_crossed) as u8 as f32;
+    let turned = lead.and_then(|f| f.body.as_ref()).map(|b| b.turned * 10.0).unwrap_or(f32::NAN);
     [
         s.exposure,
         s.sharp,
@@ -129,6 +142,14 @@ pub fn features(a: &Analysis) -> [f32; N_FEAT] {
         smiles,
         sour,
         lead.and_then(|f| f.happy()).unwrap_or(0.0) * 10.0,
+        a.aesthetic.unwrap_or(f32::NAN),
+        cuts,
+        hand_face,
+        gesture,
+        crossed,
+        turned,
+        a.people.hands_meet as u8 as f32,
+        lead.and_then(|f| f.expression(crate::faceid::SURPRISED)).unwrap_or(0.0) * 10.0,
     ]
 }
 
@@ -499,6 +520,9 @@ impl Profile {
                     let mut x = [0f32; N_FEAT];
                     for i in 0..N_FEAT {
                         x[i] = k.f.get(i).copied().unwrap_or(NEUTRAL[i]) - d.f.get(i).copied().unwrap_or(NEUTRAL[i]);
+                        if !x[i].is_finite() {
+                            x[i] = 0.0;
+                        }
                     }
                     diffs.push(x);
                     n += 1;
@@ -543,7 +567,7 @@ impl Profile {
         if self.rw.len() != N_FEAT || self.rscale.len() != N_FEAT {
             return None;
         }
-        Some((0..N_FEAT).map(|k| f[k] / self.rscale[k] * self.rw[k]).sum())
+        Some((0..N_FEAT).filter(|&k| f[k].is_finite()).map(|k| f[k] / self.rscale[k] * self.rw[k]).sum())
     }
 
     /// Choices Sơn made by hand.

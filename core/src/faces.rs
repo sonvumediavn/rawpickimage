@@ -202,6 +202,9 @@ pub struct FaceInfo {
     /// A key person Sơn marked ([`crate::keypeople`]): always judged, even far away in a crowd.
     #[serde(default)]
     pub key: bool,
+    /// How this person stands and moves ([`crate::pose`]); only for the largest main faces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<crate::pose::Body>,
 }
 
 impl FaceInfo {
@@ -240,6 +243,9 @@ pub struct People {
     pub notes: Vec<String>,
     /// Centre of the main faces' eyes (0–1), used as the composition subject.
     pub eye_center: Option<(f32, f32)>,
+    /// Two people's hands meet (handshake, award or gift handed over), from [`crate::pose`].
+    #[serde(default)]
+    pub hands_meet: bool,
 }
 
 /// Fraction of a short vertical band through the eye that is iris/pupil-dark. Landmark models
@@ -469,6 +475,7 @@ pub fn assess_with(img: &RgbImage, g: &Gray, raw: &[RawFace], net: Option<&EyeNe
                 hand_marks: vec![],
                 id: vec![],
                 expr: vec![],
+                body: None,
             }
         })
         .collect();
@@ -492,7 +499,7 @@ pub fn judge(mut faces: Vec<FaceInfo>, book: &crate::eyes::EyeBook, photo: Optio
         return People { notes: vec!["Không thấy khuôn mặt nào, tiêu chí này không tính vào điểm".into()], ..Default::default() };
     }
     for (i, f) in faces.iter_mut().enumerate() {
-        f.issues.retain(|x| !matches!(x.as_str(), "nhắm mắt" | "mắt lim dim" | "khẩu hình chưa đẹp" | "đang há miệng" | "mặt nghiêng" | "cúi đầu"));
+        f.issues.retain(|x| !matches!(x.as_str(), "nhắm mắt" | "mắt lim dim" | "khẩu hình chưa đẹp" | "đang há miệng" | "mặt nghiêng" | "cúi đầu" | "nét mặt khó chịu" | "nét mặt hơi căng" | "nét mặt đờ" | "tay che mặt"));
         let mut s = f.base;
         f.hand_marks.clear();
         let mut marks = [false; 3];
@@ -522,6 +529,25 @@ pub fn judge(mut faces: Vec<FaceInfo>, book: &crate::eyes::EyeBook, photo: Optio
             // speaker) and Sơn's own choices.
             f.issues.push("cúi đầu".into());
         }
+        // Expression: a real smile is what people want to see; a blank face costs a little, a
+        // sour one (angry, disgusted, afraid, sad) clearly. Only faces big enough to read.
+        if !f.small {
+            if let (Some(neg), Some(happy)) = (f.negative(), f.happy()) {
+                if neg >= 0.5 {
+                    s -= 1.5;
+                    f.issues.push("nét mặt khó chịu".into());
+                } else if neg >= 0.3 {
+                    s -= 0.7;
+                    f.issues.push("nét mặt hơi căng".into());
+                }
+                let lively = happy + f.expression(crate::faceid::SURPRISED).unwrap_or(0.0) * 0.5;
+                s -= 0.5 * (1.0 - lively).clamp(0.0, 1.0);
+            }
+        }
+        if f.body.as_ref().is_some_and(|b| b.hand_face) {
+            s -= 1.5;
+            f.issues.push("tay che mặt".into());
+        }
         let hand = forced(i);
         f.by_hand = hand.is_some();
         f.p_closed = match hand {
@@ -549,7 +575,21 @@ pub fn judge(mut faces: Vec<FaceInfo>, book: &crate::eyes::EyeBook, photo: Optio
     )];
     for (i, f) in main.iter().enumerate() {
         let lbl = if main.len() > 1 { format!("Người {}: ", i + 1) } else { String::new() };
-        let body = if f.issues.is_empty() { "mắt mở, mặt nét, đủ sáng".to_string() } else { f.issues.join(", ") };
+        let mut body = if f.issues.is_empty() { "mắt mở, mặt nét, đủ sáng".to_string() } else { f.issues.join(", ") };
+        if !f.small && f.happy().is_some_and(|h| h >= 0.6) {
+            body.push_str(", cười tươi");
+        }
+        if let Some(b) = &f.body {
+            if b.gesture >= 0.6 {
+                body.push_str(", tay đang diễn tả");
+            }
+            if b.arms_crossed {
+                body.push_str(", khoanh tay");
+            }
+            if !b.cut.is_empty() {
+                body.push_str(&format!(", khung cắt ngang {}", b.cut.join(", ")));
+            }
+        }
         let tail = if f.small {
             " (mặt nhỏ, chưa kiểm tra mắt)"
         } else if f.by_hand {
@@ -591,7 +631,13 @@ pub fn judge(mut faces: Vec<FaceInfo>, book: &crate::eyes::EyeBook, photo: Optio
         }
     }
     let score = if crowd { 0.3 * mn + 0.7 * avg } else { 0.6 * mn + 0.4 * avg };
+    let bodies: Vec<(&crate::pose::Body, f32)> = faces.iter().filter_map(|f| f.body.as_ref().map(|b| (b, f.bbox[2]))).collect();
+    let hands_meet = crate::pose::hands_meet(&bodies);
+    if hands_meet {
+        notes.push("Tay hai người chạm nhau: bắt tay, trao quà hoặc trao bằng".into());
+    }
     People {
+        hands_meet,
         score: Some(score.clamp(0.0, 10.0)),
         closed_eyes: lead.iter().any(|f| f.closed),
         blurred_face: lead.iter().any(|f| f.sharp < 4.0),

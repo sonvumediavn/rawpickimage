@@ -69,6 +69,10 @@ pub struct Analysis {
     /// Locked ("protect") on the camera.
     #[serde(default)]
     pub protected: bool,
+    /// How beautiful the whole picture looks to people in general, 0–10 ([`crate::aesthetic`]);
+    /// None without the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aesthetic: Option<f32>,
     /// Sơn's crop for export (set by the app from the session, never cached).
     #[serde(skip)]
     pub crop: Option<crate::crop::Rect>,
@@ -90,6 +94,10 @@ pub struct Analyzer {
     pub eyes: Option<crate::eyes::EyeModel>,
     #[cfg(feature = "faces")]
     pub ids: Option<crate::faceid::FaceId>,
+    #[cfg(feature = "faces")]
+    pub pose: Option<crate::pose::PoseModel>,
+    #[cfg(feature = "faces")]
+    pub beauty: Option<crate::aesthetic::AestheticModel>,
     pub thumbs_dir: Option<PathBuf>,
 }
 
@@ -121,7 +129,17 @@ impl Analyzer {
                 .map(|d| d.join(crate::faceid::MODEL))
                 .filter(|p| p.exists())
                 .and_then(|p| crate::faceid::FaceId::load(&p).ok());
-            (Self { faces: det, visual, eyes, ids, thumbs_dir }, warn)
+            let pose = face_model
+                .and_then(|p| p.parent())
+                .map(|d| d.join(crate::pose::MODEL))
+                .filter(|p| p.exists())
+                .and_then(|p| crate::pose::PoseModel::load(&p).ok());
+            let beauty = face_model
+                .and_then(|p| p.parent())
+                .map(|d| d.join(crate::aesthetic::MODEL))
+                .filter(|p| p.exists())
+                .and_then(|p| crate::aesthetic::AestheticModel::load(&p).ok());
+            (Self { faces: det, visual, eyes, ids, pose, beauty, thumbs_dir }, warn)
         }
         #[cfg(not(feature = "faces"))]
         {
@@ -158,10 +176,30 @@ impl Analyzer {
             if let Ok(raw) = det.detect(&hi, 0.6) {
                 // A wide shot (a hall with the speaker far away at the lectern): every face is
                 // tiny here, so look again at full resolution before judging eyes and faces.
+                // Faces of a medium size (a speaker half way down the hall, a group of ten) are
+                // also measured again on the full picture: eyes, sharpness and expression read on
+                // 40 pixels are guesses, on 120 they are facts.
                 people = match far_faces(path, &hi, &raw, det) {
                     Some((big, raw2)) => faces::assess_with(&big, &Gray::from_rgb(&big), &raw2, self.eyes.as_ref(), self.ids.as_ref()),
                     None => faces::assess_with(&hi, &ghi, &raw, self.eyes.as_ref(), self.ids.as_ref()),
                 };
+                if let Some(pm) = &self.pose {
+                    read_bodies(pm, &hi, &mut people);
+                    // Body cut at a joint by the frame edge: the crop to avoid.
+                    let cuts: Vec<String> = {
+                        let mut v: Vec<String> = people.faces.iter().filter(|f| f.main).filter_map(|f| f.body.as_ref()).flat_map(|b| b.cut.iter().cloned()).collect();
+                        v.sort();
+                        v.dedup();
+                        v
+                    };
+                    if !cuts.is_empty() {
+                        // Legs cut at the knee or ankle hurt most; an elbow at the bottom edge of
+                        // a half-length shot is common and only costs a little.
+                        let legs = cuts.iter().any(|c| matches!(c.as_str(), "đầu gối" | "cổ chân" | "bàn chân"));
+                        comp.score = (comp.score - if legs { 0.8 } else { 0.4 }).max(0.0);
+                        comp.notes.push(format!("Khung cắt ngang khớp ({}), nên crop ở giữa đùi, giữa cẳng chân hoặc chừa trọn tay chân", cuts.join(", ")));
+                    }
+                }
                 faces_checked = true;
             }
         }
@@ -201,6 +239,10 @@ impl Analyzer {
         let (embed, objects) = self.visual.as_ref().and_then(|v| v.look(&hi).ok()).unwrap_or_default();
         #[cfg(not(feature = "faces"))]
         let (embed, objects) = (vec![], vec![]);
+        #[cfg(feature = "faces")]
+        let aesthetic = self.beauty.as_ref().and_then(|m| m.mean(&a640)).map(|m| (crate::aesthetic::to_score(m) * 10.0).round() / 10.0);
+        #[cfg(not(feature = "faces"))]
+        let aesthetic = None;
         let thumb = self.thumbs_dir.as_ref().and_then(|d| {
             let t = metrics::resize_long(&hi, 480);
             // Named after the file, not its position, so cached thumbnails stay right
@@ -243,6 +285,7 @@ impl Analyzer {
             objects,
             stars: 0,
             protected: false,
+            aesthetic,
             crop: None,
             key_faces: vec![],
         })
@@ -343,6 +386,31 @@ pub fn rejudge(a: &mut Analysis, book: &crate::eyes::EyeBook, photo: &str) {
 /// Faces narrower than this (pixels of the analysis image) are too small to judge.
 #[cfg(feature = "faces")]
 const FAR_FACE: f32 = 40.0;
+/// When the largest face is narrower than this, faces are measured again on the full picture.
+#[cfg(feature = "faces")]
+const CLOSE_FACE: f32 = 110.0;
+
+/// Body pose of the largest main faces ([`crate::pose`]), on the analysis image `img` (the
+/// faces' boxes are fractions, so any size of the same picture works).
+#[cfg(feature = "faces")]
+fn read_bodies(pm: &crate::pose::PoseModel, img: &image::RgbImage, people: &mut People) {
+    let (w, h) = (img.width() as f32, img.height() as f32);
+    let mut order: Vec<usize> = (0..people.faces.len()).filter(|&i| people.faces[i].main && people.faces[i].bbox[2] * w >= crate::pose::MIN_FACE).collect();
+    order.sort_by(|&a, &b| {
+        let ar = |i: usize| people.faces[i].bbox[2] * people.faces[i].bbox[3];
+        ar(b).total_cmp(&ar(a))
+    });
+    order.truncate(crate::pose::MAX_PEOPLE);
+    for i in order {
+        let f = &people.faces[i];
+        let bx = [f.bbox[0] * w, f.bbox[1] * h, f.bbox[2] * w, f.bbox[3] * h];
+        let body = pm.skeleton(img, bx).and_then(|s| crate::pose::judge(&s, bx, w, h));
+        people.faces[i].body = body;
+    }
+    // Hand over the face, hands meeting: judged again with the bodies.
+    let faces = std::mem::take(&mut people.faces);
+    *people = faces::judge(faces, &crate::eyes::EyeBook::default(), None);
+}
 /// Faces looked at again at most (the largest ones).
 #[cfg(feature = "faces")]
 const FAR_MAX: usize = 10;
@@ -353,12 +421,23 @@ const FAR_MAX: usize = 10;
 /// Returns the large image with the faces in its coordinates, or None when not worth it.
 #[cfg(feature = "faces")]
 fn far_faces(path: &Path, hi: &image::RgbImage, raw: &[faces::RawFace], det: &faces::FaceDetector) -> Option<(image::RgbImage, Vec<faces::RawFace>)> {
-    // Only wide shots with people in them: photos without any face don't pay for this.
-    if raw.is_empty() || raw.iter().any(|f| f.w >= FAR_FACE) {
+    // Only photos with people in them: photos without any face don't pay for this.
+    let widest = raw.iter().map(|f| f.w).fold(0f32, f32::max);
+    if raw.is_empty() || widest >= CLOSE_FACE {
         return None;
     }
     let (w, h) = hi.dimensions();
     let long = w.max(h);
+    if widest >= FAR_FACE {
+        // Medium faces: the detector already saw them well; only measure them on more pixels.
+        let big = preview::load(path, (long * 3).min(4000)).ok()?.rgb;
+        if big.width().max(big.height()) < long * 3 / 2 {
+            return None;
+        }
+        let k = big.width() as f32 / w as f32;
+        let out = raw.iter().map(|f| faces::RawFace { x: f.x * k, y: f.y * k, w: f.w * k, h: f.h * k, score: f.score, lm: f.lm.map(|(a, b)| (a * k, b * k)) }).collect();
+        return Some((big, out));
+    }
     // More far faces (the speaker when only people in the audience were found).
     let mut found: Vec<faces::RawFace> = raw.to_vec();
     // 3 × 3 overlapping windows, each 2/5 of the picture: the detector sees it ~2.5× closer.

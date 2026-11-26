@@ -1330,7 +1330,10 @@ async function renderDetail() {
             .map((n) => `<li>${esc(n)}</li>`)
             .join("")}</ul></div>`;
         })
-        .join("")
+        .join("") +
+      (p.aesthetic != null
+        ? `<div class="crit"><div class="h"><span>Đẹp tổng thể</span><b class="${cls(p.aesthetic)}">${p.aesthetic.toFixed(1)}</b></div><div class="bar"><i style="width:${p.aesthetic * 10}%"></i></div><ul><li>${esc("Mô hình thẩm mỹ nhìn cả bức ảnh (ánh sáng, bố cục, chủ thể nổi bật), cộng/trừ nhẹ vào điểm; AI học gu sẽ tự cân thêm")}</li></ul></div>`
+        : "")
     : "";
 }
 
@@ -1608,6 +1611,7 @@ function renderEyes(i, p, mains) {
         }
       }
       if (f.expr) lines.push(`<div class="eyerow"><span>Nét mặt</span><span class="note">${esc(f.expr)}</span></div>`);
+      if (f.body) lines.push(`<div class="eyerow"><span>Dáng người</span><span class="note">${esc(f.body)}</span></div>`);
       if (f.known || f.person != null) {
         lines.push(`<div class="eyerow"><span>Quan trọng</span>${f.person != null
           ? `<button class="btn sm on" data-key="1" title="Bấm để đổi tên hoặc bỏ đánh dấu">♛ ${esc(personName(f.person))}</button>`

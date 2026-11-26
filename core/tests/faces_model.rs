@@ -54,6 +54,29 @@ fn finds_the_face_and_tells_open_from_closed_eyes() {
         assert!(!open.objects.is_empty());
         assert_eq!(rawpick_core::scene::classify(&open), rawpick_core::scene::Scene::Portrait);
     }
+    // Body pose: a half-length portrait, square to the camera, arms down, nothing cut at a joint
+    // (the legs the pose model invents below the frame must not count).
+    if an.pose.is_some() {
+        let b = f.body.as_ref().expect("dáng người");
+        eprintln!("dáng người {b:?}");
+        assert!(b.cut.is_empty() && !b.hand_face && !b.arms_crossed && b.turned < 0.4, "{b:?}");
+    } else if std::env::var("RAWPICK_REQUIRE_MODEL").as_deref() == Ok("1") {
+        panic!("thiếu mô hình dáng người {}", rawpick_core::pose::MODEL);
+    }
+    // Overall beauty: an ordinary well-made portrait sits in the middle of the scale, and a
+    // blurred copy of it scores lower.
+    if an.beauty.is_some() {
+        let b = open.aesthetic.expect("điểm thẩm mỹ");
+        eprintln!("đẹp tổng thể {b}");
+        assert!((2.0..9.0).contains(&b), "{b}");
+        let dir = tempfile::tempdir().unwrap();
+        let blurred = dir.path().join("mo.jpg");
+        image::imageops::blur(&face_img(&data), 6.0).save(&blurred).unwrap();
+        let mo = an.analyze(&blurred, vec![], 2).unwrap();
+        assert!(mo.aesthetic.unwrap() < b, "{:?} vs {b}", mo.aesthetic);
+    } else if std::env::var("RAWPICK_REQUIRE_MODEL").as_deref() == Ok("1") {
+        panic!("thiếu mô hình thẩm mỹ {}", rawpick_core::aesthetic::MODEL);
+    }
     let closed = an.analyze(&data.join("chan-dung-nham-mat.jpg"), vec![], 1).unwrap();
     let g = &closed.people.faces[0];
     eprintln!("nhắm: mạng mắt {:?}, điểm ảnh {:.2}, khả năng nhắm {:.2}", g.eye_p, g.eye_open, g.p_closed);
@@ -112,4 +135,8 @@ fn finds_a_far_speaker_in_a_wide_shot_and_knows_who_it_is() {
         eprintln!("cùng người (xa/gần): {same:.3}");
         assert!(same >= rawpick_core::faceid::SAME_PERSON, "{same}");
     }
+}
+
+fn face_img(data: &Path) -> image::RgbImage {
+    image::open(data.join("chan-dung.jpg")).unwrap().to_rgb8()
 }
