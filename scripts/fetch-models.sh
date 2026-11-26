@@ -82,3 +82,23 @@ if [ "$sum" != "$want" ]; then
   echo "sha256 của mô hình nét mặt không khớp (mong đợi $want)" >&2
   exit 1
 fi
+
+# Mô hình đọc dáng người MediaPipe Pose (Apache-2.0, OpenCV Zoo), 5,5 MB: cắt ngang khớp, tay che mặt,
+# cử chỉ, khoanh tay, xoay người, hai người trao tay nhau.
+f=models/pose_estimation_mediapipe_2023mar.onnx
+url=https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/pose_estimation_mediapipe/pose_estimation_mediapipe_2023mar.onnx
+want=9d89c599319a18fb7d2e28451a883476164543182bafca5f09eb2cf767ed2f3f
+if [ ! -s "$f" ]; then
+  curl -fL --retry 4 --retry-delay 3 -o "$f.tmp" "$url"
+  mv "$f.tmp" "$f"
+fi
+if command -v sha256sum >/dev/null; then sum=$(sha256sum "$f" | cut -d' ' -f1); else sum=$(shasum -a 256 "$f" | cut -d' ' -f1); fi
+echo "Dáng người: $(wc -c < "$f") byte, sha256 $sum"
+if [ "$sum" != "$want" ]; then
+  echo "sha256 của mô hình dáng người không khớp (mong đợi $want)" >&2
+  exit 1
+fi
+
+# Mô hình thẩm mỹ NIMA MobileNet (Apache-2.0, idealo/image-quality-assessment, chuyển sang ONNX),
+# 13 MB, nằm sẵn trong git: chấm "đẹp tổng thể" của cả bức ảnh.
+test -s models/nima_mobilenet_aesthetic.onnx || { echo "thiếu models/nima_mobilenet_aesthetic.onnx" >&2; exit 1; }

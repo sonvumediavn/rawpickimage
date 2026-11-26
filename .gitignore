@@ -3,3 +3,4 @@ target/
 .DS_Store
 node_modules/
 app/src-tauri/gen/
+!/models/nima_mobilenet_aesthetic.onnx

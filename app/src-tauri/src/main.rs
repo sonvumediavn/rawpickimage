@@ -339,6 +339,8 @@ struct FaceBox {
     known: bool,
     /// The facial expression read by the AI ("cười", "bình thường"…), when the face is big enough.
     expr: Option<&'static str>,
+    /// Body language read by the pose model, in words ("tay đang diễn tả, khung cắt ngang đầu gối").
+    body: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -362,6 +364,8 @@ struct PhotoView {
     protected: bool,
     /// Sơn's crop for export, `[x, y, w, h]` of the upright photo.
     crop: Option<[f32; 4]>,
+    /// How beautiful the whole picture looks (0–10), from the aesthetic model.
+    aesthetic: Option<f32>,
 }
 
 #[derive(Serialize)]
@@ -452,12 +456,42 @@ fn photo_view(idx: usize, it: &Item) -> PhotoView {
                         person: a.key_faces.iter().find(|k| k.0 == i).map(|k| k.1),
                         known: !f.id.is_empty(),
                         expr: f.expression_label(),
+                        body: f.body.as_ref().map(body_words),
                     }).collect())
             .unwrap_or_default(),
         error: it.error.clone(),
         stars: a.map(|a| a.stars).unwrap_or(0),
         protected: a.is_some_and(|a| a.protected),
         crop: a.and_then(|a| a.crop),
+        aesthetic: a.and_then(|a| a.aesthetic),
+    }
+}
+
+/// A person's body language in a few words for the face panel.
+fn body_words(b: &rawpick_core::pose::Body) -> String {
+    let mut w: Vec<String> = vec![];
+    if b.hand_face {
+        w.push("tay che mặt".into());
+    }
+    if b.gesture >= 0.6 {
+        w.push("tay đang diễn tả".into());
+    }
+    if b.arms_crossed {
+        w.push("khoanh tay".into());
+    }
+    if b.turned >= 0.6 {
+        w.push("xoay người khỏi máy".into());
+    }
+    if b.shoulder_tilt.abs() >= 8.0 {
+        w.push("vai lệch".into());
+    }
+    if !b.cut.is_empty() {
+        w.push(format!("khung cắt ngang {}", b.cut.join(", ")));
+    }
+    if w.is_empty() {
+        "tự nhiên, không lỗi".into()
+    } else {
+        w.join(", ")
     }
 }
 

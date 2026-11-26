@@ -229,6 +229,12 @@ pub fn rule_score(a: &Analysis, w: &[f32; 6], fix_tilt: bool) -> (f32, Vec<Strin
         }
     }
     let mut s = if wsum > 0.0 { sum / wsum } else { 0.0 };
+    // The picture as a whole (light, balance, the subject standing out), as people in general
+    // see it: a light touch, Sơn's own taste weighs it properly once learned.
+    if let Some(b) = a.aesthetic {
+        // Centred on an ordinary photo (5), so the threshold keeps its meaning.
+        s = (s + (0.12 * (b - 5.0)).clamp(-0.3, 0.4)).clamp(0.0, 10.0);
+    }
     let mut notes = vec![];
     let mut cap = |limit: f32, why: &str, s: &mut f32| {
         if *s > limit {

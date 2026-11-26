@@ -12,3 +12,11 @@ nhận ra từng người để tách các nhóm, các người lên sân khấu
 5 MB) đọc nét mặt (cười, bình thường, ngạc nhiên, khó chịu, buồn…) của các khuôn mặt đủ lớn, dùng chung
 cách căn mặt với SFace. AI học gu dùng thêm ba con số: mọi người cười nhiều hay ít, người có nét mặt khó
 chịu nhất, nhân vật chính có cười không. Thiếu file thì app bỏ qua phần này.
+
+`pose_estimation_mediapipe_2023mar.onnx` (MediaPipe Pose, Apache-2.0, opencv_zoo, 5,5 MB) đọc dáng người
+của tối đa 3 người chính trong ảnh: khung cắt ngang khớp (đầu gối, cổ chân, cổ tay, khuỷu tay), tay che
+mặt, tay đang diễn tả, khoanh tay, xoay người khỏi máy, hai người trao tay nhau. Tải tự động.
+
+`nima_mobilenet_aesthetic.onnx` (NIMA MobileNet của idealo/image-quality-assessment, Apache-2.0, 13 MB) chấm
+"đẹp tổng thể" của cả bức ảnh như số đông người xem (huấn luyện trên 250 000 ảnh AVA). File này được
+chuyển từ Keras sang ONNX một lần và lưu thẳng trong git (không có bản ONNX công khai để tải).
