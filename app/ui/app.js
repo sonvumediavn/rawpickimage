@@ -143,8 +143,26 @@ T.event.listen("progress", (e) => {
   }
   st.progress[session] = { done, total, stage };
   renderTabs();
-  if (session === st.sid) renderProgress();
+  if (session === st.sid) { renderProgress(); renderLive(); }
 });
+// Live mode analysed new photos (or sent them): show them without losing the place in the grid.
+T.event.listen("session-updated", async (e) => {
+  const id = e.payload;
+  const v = await invoke("get_session", { id }).catch(() => null);
+  if (!v) return;
+  // Not under the open viewer: its photo numbers would move. Shown when the viewer closes.
+  if (id === st.sid && !$("detail").hidden) { st.pendingLive = v; return; }
+  applyLiveView(v);
+});
+function applyLiveView(v) {
+  const id = v.meta.id;
+  const main = document.querySelector("main");
+  const top = main.scrollTop;
+  st.views[id] = v;
+  Object.assign(meta(id) || {}, v.meta);
+  if (st.sid === id) { renderMain(); main.scrollTop = top; }
+  renderTabs();
+}
 T.event.listen("sessions-changed", async () => {
   st.metas = await invoke("list_sessions");
   renderTabs();
@@ -424,10 +442,14 @@ function renderMain() {
   const m = meta();
   if (!m) return;
   const view = st.views[m.id];
-  const ready = (m.phase === "ready" || m.phase === "exporting") && view;
-  $("empty").hidden = !(m.phase === "empty" || (m.phase === "failed" && !view));
-  $("emptyErr").hidden = m.phase !== "failed";
+  // Live mode keeps the photos on screen while it analyses the new ones.
+  const liveRun = m.live && view && view.photos.length && ["waiting", "analyzing"].includes(m.phase);
+  const ready = ((m.phase === "ready" || m.phase === "exporting") && view) || liveRun;
+  $("empty").hidden = !!ready || !(m.phase === "empty" || (m.phase === "failed" && !view));
+  $("emptyErr").hidden = m.phase !== "failed" || m.live;
   $("emptyErr").textContent = m.error || "";
+  $("emptyLive").hidden = !m.live;
+  $("emptyLive").innerHTML = m.live ? `● Đang theo dõi <b>${esc(m.source || "")}</b>. Ảnh chép vào đây sẽ được lọc ngay, không cần bấm gì.` : "";
   $("results").hidden = !ready;
   renderProgress();
   if (ready) {
@@ -446,6 +468,100 @@ function renderMain() {
   $("btnExportOther").disabled = m.phase !== "ready";
   $("btnTrain").disabled = m.phase !== "ready";
   renderAiSwitch();
+  renderLive();
+}
+
+function clock(s) {
+  return new Date(s * 1000).toLocaleTimeString("vi-VN", { hour: "2-digit", minute: "2-digit" });
+}
+
+function renderLive() {
+  const m = meta();
+  if (!m || !st.info) return;
+  const on = !!m.live;
+  $("optLive").checked = on;
+  $("liveBar").classList.toggle("on", on);
+  const pr = st.progress[m.id];
+  const count = pr && pr.total ? ` ${pr.done}/${pr.total}` : "";
+  let note;
+  if (m.posting) note = "Đang gửi ảnh đăng nhanh…" + (pr && /gửi/.test(pr.stage) ? count : "");
+  else if (on && ["waiting", "analyzing"].includes(m.phase)) note = "Đang lọc ảnh mới…" + count;
+  else if (on) note = (m.live_note || "Đang theo dõi thư mục") + (m.live_at ? ` · ${clock(m.live_at)}` : "");
+  else note = "Bật khi sự kiện đang diễn ra: ảnh mới chép vào thư mục được tự lọc ngay";
+  if (m.sent) note += ` · đã gửi ${m.sent} ảnh`;
+  $("liveNote").textContent = note;
+  $("optAutoPost").checked = !!(st.info.post && st.info.post.auto);
+  $("optAutoPost").parentElement.hidden = !on;
+  $("btnPost").textContent = m.unsent ? `Đăng nhanh (${m.unsent} ảnh mới)` : "Đăng nhanh";
+  $("btnPost").disabled = !m.unsent || m.posting;
+}
+
+function postDir() {
+  return (st.info.post && st.info.post.dir) || st.info.drive_dir || null;
+}
+
+async function pickPostDir() {
+  const def = postDir() || (st.info.drive_roots || [])[0];
+  const d = await T.dialog.open({ directory: true, multiple: false, title: "Chọn thư mục trên Google Drive để gửi ảnh đăng nhanh (mở được trên điện thoại)", defaultPath: def || undefined });
+  if (!d) return false;
+  st.info = Object.assign(st.info, await invoke("set_post", { path: d }));
+  renderPostBox();
+  return true;
+}
+
+function renderPostBox() {
+  const p = st.info.post || {};
+  const d = postDir();
+  const size = p.opts ? p.opts.long_side : 2048;
+  $("postBox").innerHTML = `<span><b>Đăng nhanh</b> gửi ảnh chọn (JPG gọn) vào:</span>
+    <span class="path">${d ? esc(d) : "chưa chọn, app hỏi khi bấm lần đầu"}${d && !p.dir ? " (thư mục Drive ở trên)" : ""}</span>
+    <span class="row"><button class="btn sm" id="postChange">${d ? "Đổi thư mục" : "Chọn thư mục…"}</button>
+    <select id="postSize" aria-label="Cỡ ảnh đăng nhanh">
+      <option value="2048">2048px (Facebook nét nhất)</option>
+      <option value="1080">1080px (Instagram, gửi Zalo nhanh)</option>
+      <option value="0">Giữ cỡ gốc</option>
+    </select></span>`;
+  $("postSize").value = String(size);
+  $("postChange").onclick = pickPostDir;
+  $("postSize").onchange = async (e) => { st.info = Object.assign(st.info, await invoke("set_post", { longSide: +e.target.value })); };
+}
+
+async function doPost() {
+  const m = meta();
+  if (!m) return;
+  if (!postDir() && !(await pickPostDir())) return;
+  try {
+    const r = await invoke("post_new", { id: m.id });
+    const n = r.report.done.length;
+    const mb = (r.report.bytes / 1e6).toFixed(1);
+    toast(
+      (n ? `Đã gửi ${n} ảnh (${mb} MB) vào <span class="path">${esc(r.report.dir)}</span>. Mở Google Drive trên điện thoại để đăng.` : "Không có ảnh chọn mới để gửi.") +
+        (r.report.errors.length ? `<br>${r.report.errors.length} ảnh lỗi: ${esc(r.report.errors[0])}` : "") +
+        (r.link ? ` · <a id="postLink">Mở trên Drive</a>` : ` · <a id="postOpen">Mở thư mục</a>`),
+      12000,
+    );
+    const a = document.getElementById("postLink");
+    if (a) a.onclick = () => T.opener.openUrl(r.link);
+    const o = document.getElementById("postOpen");
+    if (o) o.onclick = () => T.opener.openPath(r.report.dir);
+  } catch (e) {
+    toast(esc(e));
+  }
+}
+
+async function setLive(on, path) {
+  const m = meta();
+  if (!m) return;
+  try {
+    const mm = await invoke("set_live", { id: m.id, yesLive: on, path: path || null });
+    Object.assign(m, mm);
+    renderTabs();
+    renderMain();
+    if (on) toast(`Đang theo dõi thư mục. Chép ảnh vào đó (thẻ nhớ, Wi-Fi máy ảnh): vài giây sau app tự lọc${st.info.post && st.info.post.auto ? " và tự gửi ảnh chọn vào thư mục đăng nhanh" : ""}.`, 9000);
+  } catch (e) {
+    $("optLive").checked = !on;
+    toast(esc(e));
+  }
 }
 
 function renderAiSwitch() {
@@ -464,7 +580,8 @@ function renderAiSwitch() {
 
 function renderProgress() {
   const m = meta();
-  const run = m && ["waiting", "analyzing", "exporting"].includes(m.phase);
+  const liveRun = m && m.live && st.views[m.id] && st.views[m.id].photos.length;
+  const run = m && ["waiting", "analyzing", "exporting"].includes(m.phase) && !(liveRun && m.phase !== "exporting");
   $("sprog").hidden = !run;
   if (!run) return;
   const pr = st.progress[m.id] || { done: 0, total: 0, stage: "" };
@@ -528,6 +645,19 @@ function wireIn() {
   drop.onclick = async () => openFolder(await pickFolder("Chọn thư mục ảnh"));
   $("btnPickMain").onclick = async () => openFolder(await pickFolder("Chọn thư mục ảnh cho phiên này"), st.sid);
   $("sprogStop").onclick = () => invoke("cancel", { id: st.sid });
+  $("btnLiveMain").onclick = async () => {
+    const p = await pickFolder("Chọn thư mục bạn chép ảnh sự kiện vào (trống cũng được)");
+    if (!p) return;
+    if (!postDir()) await pickPostDir();
+    setLive(true, p);
+  };
+  $("optLive").onchange = (e) => setLive(e.target.checked);
+  $("optAutoPost").onchange = async (e) => {
+    st.info = Object.assign(st.info, await invoke("set_post", { auto: e.target.checked }));
+    if (e.target.checked && !postDir()) await pickPostDir();
+    renderLive();
+  };
+  $("btnPost").onclick = doPost;
   drop.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") drop.click(); };
   T.webview.getCurrentWebview().onDragDropEvent((e) => {
     const t = e.payload.type;
@@ -1043,7 +1173,7 @@ async function pickDriveDir() {
   if (!d) return false;
   try {
     st.info = Object.assign(st.info, await invoke("set_drive_dir", { path: d }));
-    renderDrive();
+    renderDrive(); renderPostBox();
     return true;
   } catch (e) {
     toast(esc(e));
@@ -1060,7 +1190,7 @@ function renderDrive() {
        <span class="row"><button class="btn sm" id="driveChange">Chọn thư mục Drive…</button></span>`;
   $("driveChange").onclick = pickDriveDir;
   const off = document.getElementById("driveOff");
-  if (off) off.onclick = async () => { st.info = Object.assign(st.info, await invoke("set_drive_dir", { path: null })); renderDrive(); };
+  if (off) off.onclick = async () => { st.info = Object.assign(st.info, await invoke("set_drive_dir", { path: null })); renderDrive(); renderPostBox(); };
 }
 
 function renderSync() {
@@ -1788,7 +1918,10 @@ function step(d) {
 }
 
 function wireDetail() {
-  $("dclose").onclick = () => { cropEd.on = false; hideCropResult(); $("detail").hidden = true; st.cur = -1; zoom.idx = -1; };
+  $("dclose").onclick = () => {
+    cropEd.on = false; hideCropResult(); $("detail").hidden = true; st.cur = -1; zoom.idx = -1;
+    if (st.pendingLive) { const v = st.pendingLive; st.pendingLive = null; applyLiveView(v); }
+  };
   wireCrop();
   for (const b of document.querySelectorAll(".dact button")) b.onclick = () => decide(b.dataset.d === "ai" ? null : b.dataset.d);
   document.addEventListener("keydown", (e) => {
@@ -2334,7 +2467,7 @@ function wireWeb() {
   wireZoom();
   wireChat();
   wireWeb();
-  renderDrive();
+  renderDrive(); renderPostBox();
   renderSync();
   if (!st.metas.length) await newSession();
   await selectSession(st.metas[0].id);

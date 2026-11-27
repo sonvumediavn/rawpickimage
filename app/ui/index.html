@@ -83,6 +83,7 @@
     <section class="sec">
       <h2>Khi xuất</h2>
       <div class="drivebox" id="driveBox"></div>
+      <div class="drivebox" id="postBox"></div>
       <div class="seg" id="expMode" role="radiogroup" aria-label="Cách xuất">
         <button data-m="copy" role="radio">Chép (giữ ảnh gốc)</button>
         <button data-m="move" role="radio">Chuyển sang thư mục mới</button>
@@ -124,7 +125,9 @@
       <div>
         <p class="big">Thả thư mục ảnh sự kiện vào đây.</p>
         <p class="note err" id="emptyErr" hidden></p>
-        <p><button class="btn primary" id="btnPickMain">Chọn thư mục cho phiên này…</button></p>
+        <p class="note live" id="emptyLive" hidden></p>
+        <p><button class="btn primary" id="btnPickMain">Chọn thư mục cho phiên này…</button>
+          <button class="btn" id="btnLiveMain" title="Cho sự kiện đang diễn ra: chọn thư mục bạn chép ảnh vào (thẻ nhớ, ảnh Wi-Fi từ máy ảnh). Thư mục trống cũng được. Ảnh mới vào là app tự lọc, và có thể tự gửi ảnh chọn lên Google Drive để đăng fanpage.">● Theo dõi thư mục trực tiếp…</button></p>
         <p>Mỗi phiên lọc một thư mục. Bấm <b>+ Phiên mới</b> để mở thêm thư mục khác, hoặc kéo nhiều thư mục vào cùng lúc. Các phiên được phân tích lần lượt để máy không bị chậm, và tự mở lại khi bật ứng dụng.</p>
         <p>SonVu Raw Pick đọc ảnh xem trước nhúng trong file RAW nên chạy nhanh cả trên máy không có card đồ hoạ. Ảnh được chấm điểm theo phơi sáng, độ nét, bố cục, màu, nhiễu và người (mắt nhắm, mặt mờ), rồi chia vào <b>Đã chọn</b>, <b>Cần xem lại</b> và <b>Bị loại</b>.</p>
         <p class="note" id="faceWarn" hidden></p>
@@ -141,6 +144,13 @@
     <div id="results" hidden>
      <div class="rwrap">
      <div class="rmain">
+      <div class="livebar" id="liveBar">
+        <label class="chk livesw" title="Cho sự kiện đang diễn ra: ảnh mới chép vào thư mục (thẻ nhớ, Wi-Fi máy ảnh) được app tự lọc ngay, không cần bấm lại"><input type="checkbox" id="optLive"> <b>Trực tiếp</b></label>
+        <span class="livenote" id="liveNote"></span>
+        <span class="grow"></span>
+        <label class="chk" title="Mỗi lần lọc xong ảnh mới, app tự gửi ảnh vừa chọn vào thư mục đăng nhanh"><input type="checkbox" id="optAutoPost"> Tự gửi</label>
+        <button class="btn post" id="btnPost" title="Gửi ảnh đã chọn chưa gửi lần nào: JPG gọn cỡ Facebook (2048px), đúng chiều, theo khung crop, tên theo giờ chụp, vào thư mục «… - dang ngay» trên Google Drive. Mở Drive trên điện thoại để đăng.">Đăng nhanh</button>
+      </div>
       <div class="summary" id="summary"></div>
       <div class="suggest" id="suggest" hidden></div>
       <div class="toolbar">

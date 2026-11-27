@@ -76,6 +76,24 @@ struct Global {
     sync_dir: Option<PathBuf>,
     /// Random id of this computer, for the shared learning files.
     machine_id: String,
+    /// «Đăng nhanh»: where the photos to post go, and whether new picks go there by themselves.
+    post: PostPrefs,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct PostPrefs {
+    /// Folder (on Google Drive) for the photos to post; the Drive export folder when unset.
+    dir: Option<PathBuf>,
+    /// In live mode, send each new pick as soon as it is picked.
+    auto: bool,
+    opts: rawpick_core::post::PostOptions,
+}
+
+impl Default for PostPrefs {
+    fn default() -> Self {
+        Self { dir: None, auto: true, opts: Default::default() }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +124,17 @@ struct Session {
     applied: Vec<String>,
     last_export: Option<PathBuf>,
     cancel: Arc<AtomicBool>,
+    /// «Chế độ sự kiện trực tiếp»: new photos in the folder are analysed as they arrive.
+    live: bool,
+    /// The folder as last analysed, and as seen on the previous look.
+    live_sig: Option<rawpick_core::post::Signature>,
+    live_seen: Option<rawpick_core::post::Signature>,
+    /// What live mode last did, and when (seconds since 1970).
+    live_note: Option<String>,
+    live_at: Option<u64>,
+    /// Photos already sent by «Đăng nhanh», by path: never sent twice.
+    sent: std::collections::HashSet<String>,
+    posting: bool,
 }
 
 /// What survives a restart: the folder, its settings and Sơn's manual choices.
@@ -119,6 +148,10 @@ struct SavedSession {
     #[serde(default)]
     crops: HashMap<String, [f32; 4]>,
     last_export: Option<PathBuf>,
+    #[serde(default)]
+    live: bool,
+    #[serde(default)]
+    sent: std::collections::HashSet<String>,
 }
 
 impl Session {
@@ -139,6 +172,13 @@ impl Session {
             applied: vec![],
             last_export: None,
             cancel: Arc::new(AtomicBool::new(false)),
+            live: false,
+            live_sig: None,
+            live_seen: None,
+            live_note: None,
+            live_at: None,
+            sent: Default::default(),
+            posting: false,
         }
     }
 }
@@ -228,6 +268,8 @@ impl App {
                 overrides: s.overrides.clone(),
                 crops: s.crops.clone(),
                 last_export: s.last_export.clone(),
+                live: s.live,
+                sent: s.sent.clone(),
             })
             .collect();
         let _ = std::fs::write(self.data_dir.join("sessions.json"), serde_json::to_vec_pretty(&saved).unwrap_or_default());
@@ -388,6 +430,13 @@ struct SessionMeta {
     summary: Option<Summary>,
     prefs: Prefs,
     last_export: Option<String>,
+    live: bool,
+    live_note: Option<String>,
+    live_at: Option<u64>,
+    /// Photos sent by «Đăng nhanh», and picks not sent yet.
+    sent: usize,
+    unsent: usize,
+    posting: bool,
 }
 
 #[derive(Serialize)]
@@ -409,10 +458,27 @@ fn meta(s: &Session) -> SessionMeta {
         source: s.source.as_ref().map(|p| p.display().to_string()),
         phase: s.phase,
         error: s.error.clone(),
-        summary: (s.phase == Phase::Ready || s.phase == Phase::Exporting).then(|| cull::summarize(&s.verdicts)),
+        summary: (s.phase == Phase::Ready || s.phase == Phase::Exporting || (s.live && !s.verdicts.is_empty())).then(|| cull::summarize(&s.verdicts)),
         prefs: s.prefs.clone(),
         last_export: s.last_export.as_ref().map(|p| p.display().to_string()),
+        live: s.live,
+        live_note: s.live_note.clone(),
+        live_at: s.live_at,
+        sent: s.sent.len(),
+        unsent: unsent(s).len(),
+        posting: s.posting,
     }
+}
+
+/// Picks «Đăng nhanh» has not sent yet (places in `items`).
+fn unsent(s: &Session) -> Vec<usize> {
+    s.verdicts
+        .iter()
+        .filter(|v| v.decision == Decision::Selected)
+        .filter_map(|v| s.items.get(v.idx).map(|it| (v.idx, it)))
+        .filter(|(_, it)| it.analysis.is_some() && !s.sent.contains(&it.path.display().to_string()))
+        .map(|(i, _)| i)
+        .collect()
 }
 
 fn photo_view(idx: usize, it: &Item) -> PhotoView {
@@ -604,6 +670,7 @@ struct AppInfo {
     drive_roots: Vec<String>,
     machine: String,
     sessions: Vec<SessionMeta>,
+    post: PostPrefs,
 }
 
 fn op_app_info(app: &Arc<App>) -> AppInfo {
@@ -634,6 +701,7 @@ fn op_app_info(app: &Arc<App>) -> AppInfo {
         drive_roots: drive_roots().into_iter().map(|p| p.display().to_string()).collect(),
         machine: machine_label(),
         sessions,
+        post: g.post,
     }
 }
 
@@ -1354,6 +1422,188 @@ fn op_learn_published(app: &Arc<App>, path: String, profile: String) -> Result<P
 }
 
 /// «Chuyển định dạng thư mục»: every picture of a folder into «<folder>_JPG» (or PNG…).
+/// How often live mode looks at the folders, and how long a folder must stay unchanged (a
+/// card copy or Wi-Fi transfer finished) before its new photos are analysed.
+const LIVE_LOOK_SECS: u64 = 4;
+const LIVE_QUIET_SECS: u64 = 3;
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Turn live mode on or off; `path` also sets the folder to watch (it may still be empty).
+fn op_set_live(app: &Arc<App>, id: u32, on: bool, path: Option<String>) -> Result<SessionMeta, String> {
+    let mut map = app.sessions.lock().unwrap();
+    let s = map.get_mut(&id).ok_or("Phiên đã đóng")?;
+    if let Some(p) = path {
+        let p = PathBuf::from(p);
+        if !p.is_dir() {
+            return Err(format!("Không tìm thấy thư mục {}", p.display()));
+        }
+        if s.source.as_ref() != Some(&p) {
+            if matches!(s.phase, Phase::Waiting | Phase::Analyzing | Phase::Exporting) {
+                return Err("Phiên này đang chạy, đợi xong hoặc bấm Dừng".into());
+            }
+            s.overrides.clear();
+            s.crops.clear();
+            s.sent.clear();
+            s.items.clear();
+            s.verdicts.clear();
+            s.phase = Phase::Empty;
+            s.error = None;
+            s.live_sig = None;
+            s.name = folder_name(&p);
+            s.source = Some(p);
+        }
+    }
+    if on && s.source.is_none() {
+        return Err("Chọn thư mục ảnh của sự kiện trước".into());
+    }
+    s.live = on;
+    s.live_seen = None;
+    s.live_note = on.then(|| "Đang chờ ảnh mới vào thư mục".to_string());
+    s.live_at = on.then(now_secs);
+    let m = meta(s);
+    app.save_sessions(&map);
+    drop(map);
+    sessions_changed(app);
+    Ok(m)
+}
+
+fn op_set_post(app: &Arc<App>, path: Option<String>, auto: Option<bool>, long_side: Option<u32>) -> AppInfo {
+    {
+        let mut g = app.global.lock().unwrap();
+        if let Some(p) = path {
+            g.post.dir = (!p.is_empty()).then(|| PathBuf::from(p));
+        }
+        if let Some(a) = auto {
+            g.post.auto = a;
+        }
+        if let Some(l) = long_side {
+            g.post.opts.long_side = l;
+        }
+    }
+    app.save_global();
+    op_app_info(app)
+}
+
+#[derive(Serialize)]
+struct PostResult {
+    report: rawpick_core::post::PostReport,
+    /// Shareable link when the Drive app tells us the folder's id.
+    link: Option<String>,
+}
+
+/// «Đăng nhanh»: every pick not sent yet, as a light JPEG ready to post, into
+/// `<posting folder>/<show> - dang ngay`.
+fn op_post_new(app: &Arc<App>, id: u32) -> Result<PostResult, String> {
+    let (dir, opts) = {
+        let g = app.global.lock().unwrap();
+        (g.post.dir.clone().or(g.drive_dir.clone()), g.post.opts)
+    };
+    let dir = dir.ok_or("Chọn thư mục để gửi ảnh đăng (thư mục Google Drive) trước")?;
+    if !dir.is_dir() {
+        return Err(format!("Không thấy thư mục {}. App Google Drive đã mở và đăng nhập chưa?", dir.display()));
+    }
+    let (out, idxs, shots, cancel) = {
+        let mut map = app.sessions.lock().unwrap();
+        let s = map.get_mut(&id).ok_or("Phiên đã đóng")?;
+        if s.posting {
+            return Err("Đang gửi ảnh, đợi chút".into());
+        }
+        let src = s.source.clone().ok_or("Phiên chưa có thư mục")?;
+        let idxs = unsent(s);
+        let shots: Vec<rawpick_core::post::Shot> = idxs
+            .iter()
+            .map(|&i| {
+                let it = &s.items[i];
+                let a = it.analysis.as_ref();
+                rawpick_core::post::Shot { files: it.files.clone(), time: a.and_then(|a| a.time), crop: a.and_then(|a| a.crop).and_then(rawpick_core::crop::clean) }
+            })
+            .collect();
+        s.posting = !shots.is_empty();
+        let out = dir.join(format!("{}{}", folder_name(&src), rawpick_core::post::POST_SUFFIX));
+        (out, idxs, shots, Arc::new(AtomicBool::new(false)))
+    };
+    if shots.is_empty() {
+        return Ok(PostResult { report: rawpick_core::post::PostReport { dir: out.clone(), ..Default::default() }, link: drive_link(&out) });
+    }
+    sessions_changed(app);
+    let on_step = emitter(app, Some(id));
+    let step = |n: usize, t: usize| on_step(n, t, "Đang gửi ảnh đăng nhanh");
+    let res = rawpick_core::post::post(&shots, &out, &opts, &step, &cancel).map_err(|e| format!("{e:#}"));
+    {
+        let mut map = app.sessions.lock().unwrap();
+        if let Some(s) = map.get_mut(&id) {
+            s.posting = false;
+            if let Ok(r) = &res {
+                for &k in &r.done {
+                    if let Some(it) = s.items.get(idxs[k]) {
+                        s.sent.insert(it.path.display().to_string());
+                    }
+                }
+            }
+        }
+        app.save_sessions(&map);
+    }
+    sessions_changed(app);
+    let report = res?;
+    Ok(PostResult { link: drive_link(&out), report })
+}
+
+/// One look of live mode: analyse sessions whose folder got new photos (and has settled), then
+/// send the new picks when «Tự gửi» is on.
+fn live_tick(app: &Arc<App>) {
+    let todo: Vec<(u32, PathBuf, bool, Option<rawpick_core::post::Signature>, Option<rawpick_core::post::Signature>)> = {
+        let map = app.sessions.lock().unwrap();
+        map.values()
+            .filter(|s| s.live && !s.posting && matches!(s.phase, Phase::Ready | Phase::Empty | Phase::Failed))
+            .filter_map(|s| s.source.clone().map(|p| (s.id, p, s.prefs.recursive, s.live_sig, s.live_seen)))
+            .collect()
+    };
+    for (id, src, recursive, analysed, seen) in todo {
+        let Some(now) = rawpick_core::post::signature(&src, recursive) else { continue };
+        let go = rawpick_core::post::ready_to_analyse(now, analysed, seen, LIVE_QUIET_SECS);
+        let before = {
+            let mut map = app.sessions.lock().unwrap();
+            let Some(s) = map.get_mut(&id) else { continue };
+            s.live_seen = Some(now);
+            s.items.len()
+        };
+        if !go {
+            continue;
+        }
+        let res = op_analyze(app, id, None);
+        let picked_new = {
+            let mut map = app.sessions.lock().unwrap();
+            let Some(s) = map.get_mut(&id) else { continue };
+            s.live_sig = Some(now);
+            s.live_at = Some(now_secs());
+            let fresh = unsent(s).len();
+            s.live_note = Some(match &res {
+                Ok(_) => format!("{} ảnh mới đã lọc · {} ảnh chọn chưa gửi", s.items.len().saturating_sub(before), fresh),
+                Err(e) => e.clone(),
+            });
+            fresh
+        };
+        let auto = app.global.lock().unwrap().post.auto;
+        if res.is_ok() && auto && picked_new > 0 {
+            let r = op_post_new(app, id);
+            let mut map = app.sessions.lock().unwrap();
+            if let Some(s) = map.get_mut(&id) {
+                s.live_at = Some(now_secs());
+                s.live_note = Some(match r {
+                    Ok(r) if r.report.errors.is_empty() => format!("Đã tự gửi {} ảnh mới lên thư mục đăng", r.report.done.len()),
+                    Ok(r) => format!("Đã gửi {} ảnh, {} ảnh lỗi: {}", r.report.done.len(), r.report.errors.len(), r.report.errors[0]),
+                    Err(e) => format!("Chưa gửi được: {e}"),
+                });
+            }
+        }
+        app.emit("session-updated", id);
+        sessions_changed(app);
+    }
+}
+
 fn op_convert_folder(app: &Arc<App>, path: String, format: rawpick_core::convert::Format, quality: u8) -> Result<rawpick_core::convert::ConvertReport, String> {
     let src = PathBuf::from(&path);
     if !src.is_dir() {
@@ -2122,6 +2372,9 @@ struct Args {
     years: Option<u32>,
     format: Option<rawpick_core::convert::Format>,
     quality: Option<u8>,
+    yes_live: Option<bool>,
+    auto: Option<bool>,
+    long_side: Option<u32>,
 }
 
 fn need<T>(v: Option<T>, what: &str) -> Result<T, String> {
@@ -2155,6 +2408,9 @@ fn dispatch(app: &Arc<App>, cmd: &str, args: serde_json::Value) -> Result<serde_
         "learn_show" => json(op_learn_show(app, need(a.path, "path")?, need(a.name, "name")?)?),
         "learn_web" => json(op_learn_web(app, need(a.url, "url")?, a.years.unwrap_or(2), need(a.name, "name")?)?),
         "learn_published" => json(op_learn_published(app, need(a.path, "path")?, need(a.name, "name")?)?),
+        "set_live" => json(op_set_live(app, need(a.id, "id")?, need(a.yes_live, "yes_live")?, a.path)?),
+        "post_new" => json(op_post_new(app, need(a.id, "id")?)?),
+        "set_post" => json(op_set_post(app, a.path, a.auto, a.long_side)),
         "convert_folder" => json(op_convert_folder(app, need(a.path, "path")?, need(a.format, "format")?, a.quality.unwrap_or(rawpick_core::convert::DEFAULT_QUALITY))?),
         "self_tune" => json(op_self_tune(app, need(a.name, "name")?)?),
         "learn_pair" => json(op_learn_pair(app, need(a.id, "id")?, need(a.other, "other")?, need(a.name, "name")?)?),
@@ -2233,6 +2489,8 @@ fn main() {
                 x.overrides = s.overrides;
                 x.crops = s.crops;
                 x.last_export = s.last_export;
+                x.live = s.live;
+                x.sent = s.sent;
                 sessions.insert(x.id, x);
             }
             let next = sessions.keys().max().map(|m| m + 1).unwrap_or(1);
@@ -2260,6 +2518,13 @@ fn main() {
                 std::thread::spawn(move || loop {
                     std::thread::sleep(std::time::Duration::from_secs(150));
                     a.flush_shared();
+                });
+            }
+            {
+                let a = app_state.clone();
+                std::thread::spawn(move || loop {
+                    std::thread::sleep(std::time::Duration::from_secs(LIVE_LOOK_SECS));
+                    live_tick(&a);
                 });
             }
             let _ = app_state.handle.set(app.handle().clone());
@@ -2348,6 +2613,65 @@ mod tests {
         let r = within(60, move || dispatch(&a, "convert_folder", serde_json::json!({ "path": path, "format": "png" }))).unwrap();
         assert!(r["converted"].as_u64().unwrap() >= 6, "{r}");
         assert!(d.join("show_PNG").join("IMG_0.png").exists() && show.join("IMG_0.JPG").exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn live_mode_analyses_new_photos_and_sends_each_pick_once() {
+        let d = std::env::temp_dir().join(format!("rawpick-app-test-{}", rand_u32()));
+        let show = d.join("Le tot nghiep");
+        let drive = d.join("drive");
+        std::fs::create_dir_all(&show).unwrap();
+        std::fs::create_dir_all(&drive).unwrap();
+        let app = test_app(&d.join("data"));
+        let id = dispatch(&app, "new_session", serde_json::json!({})).unwrap()["id"].as_u64().unwrap();
+        dispatch(&app, "set_post", serde_json::json!({ "path": drive.display().to_string(), "auto": false })).unwrap();
+        let m = dispatch(&app, "set_live", serde_json::json!({ "id": id, "yesLive": true, "path": show.display().to_string() })).unwrap();
+        assert!(m["live"].as_bool().unwrap(), "{m}");
+        // Photos copied in a while ago (a finished card copy).
+        let put = |i: u32| {
+            let img = image::RgbImage::from_fn(640, 480, |x, y| image::Rgb([((x * (i + 2)) % 256) as u8, ((y * 3 + i * 50) % 256) as u8, 120]));
+            let p = show.join(format!("IMG_{i}.JPG"));
+            std::fs::write(&p, metrics::encode_jpeg(&img, 90).unwrap()).unwrap();
+            let f = std::fs::File::options().write(true).open(&p).unwrap();
+            f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(30)).unwrap();
+        };
+        let photos = |app: &Arc<App>| dispatch(app, "get_session", serde_json::json!({ "id": id })).map(|v| v["photos"].as_array().unwrap().len()).unwrap_or(0);
+        live_tick(&app);
+        assert_eq!(photos(&app), 0, "empty folder: nothing to do");
+        for i in 0..3 {
+            put(i);
+        }
+        live_tick(&app);
+        assert_eq!(photos(&app), 0, "first look: wait until the folder settles");
+        let a = app.clone();
+        within(60, move || {
+            live_tick(&a);
+            Ok::<_, String>(())
+        })
+        .unwrap();
+        assert_eq!(photos(&app), 3);
+        dispatch(&app, "set_decisions", serde_json::json!({ "id": id, "idxs": [0, 1, 2], "decision": { "kind": "rejected", "reason": "low-score" } })).unwrap();
+        dispatch(&app, "set_decisions", serde_json::json!({ "id": id, "idxs": [0, 2], "decision": { "kind": "selected" } })).unwrap();
+        let r = dispatch(&app, "post_new", serde_json::json!({ "id": id })).unwrap();
+        assert_eq!(r["report"]["done"].as_array().unwrap().len(), 2, "{r}");
+        let out = drive.join("Le tot nghiep - dang ngay");
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 2);
+        let r = dispatch(&app, "post_new", serde_json::json!({ "id": id })).unwrap();
+        assert_eq!(r["report"]["done"].as_array().unwrap().len(), 0, "never sent twice");
+        // One more photo arrives: analysed on the next looks, the earlier choices stay.
+        put(3);
+        live_tick(&app);
+        let a = app.clone();
+        within(60, move || {
+            live_tick(&a);
+            Ok::<_, String>(())
+        })
+        .unwrap();
+        assert_eq!(photos(&app), 4);
+        let m = dispatch(&app, "list_sessions", serde_json::json!({})).unwrap();
+        assert_eq!(m[0]["sent"].as_u64(), Some(2), "{m}");
+        assert!(show.join("IMG_0.JPG").exists());
         let _ = std::fs::remove_dir_all(&d);
     }
 

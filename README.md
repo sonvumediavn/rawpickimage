@@ -242,6 +242,17 @@ khi xuất»: giữ nguyên như máy chụp, JPG (kèm chất lượng), PNG, T
 mục…» chuyển cả một thư mục bất kỳ (ví dụ ảnh điện thoại sinh viên gửi) sang JPG, lưu vào «<thư mục>_JPG»
 bên cạnh. Ảnh gốc luôn giữ nguyên; ảnh đã đúng định dạng thì chép nguyên, không nén lại.
 
+## Đăng ảnh ngay tại sự kiện
+
+Cho sự kiện cần đăng fanpage liên tục:
+
+1. Bấm **● Theo dõi thư mục trực tiếp…** và chọn thư mục sẽ chép ảnh vào (thẻ nhớ, ảnh máy ảnh truyền Wi-Fi). Thư mục trống cũng được.
+2. Ảnh mới vào là app tự lọc sau vài giây, lưới ảnh vẫn hiện để chọn tay thêm.
+3. **Đăng nhanh** gửi ảnh đã chọn chưa gửi lần nào thành JPG gọn (2048px, đúng chiều, theo khung crop, tên theo giờ chụp) vào thư mục `<tên show> - dang ngay` trên Google Drive. Bật **Tự gửi** để app tự gửi mỗi lần lọc xong.
+4. Mở Google Drive trên điện thoại, chọn ảnh và đăng.
+
+Ảnh gốc không bị đổi. Mỗi ảnh chỉ gửi một lần.
+
 ## Các tuỳ chọn
 
 AI trong ứng dụng gợi ý nên bật gì cho từng thư mục, bạn quyết định. Nếu bật «Để AI tự bật», AI chỉ được
