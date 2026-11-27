@@ -218,9 +218,6 @@ function renderRules() {
   $("keepSeries").value = s.keep_per_series;
   $("optRecursive").checked = st.prefs.recursive;
   $("optAuto").checked = s.options.auto_apply;
-  $("expReview").checked = st.prefs.export.copy_review;
-  $("expRejected").checked = st.prefs.export.copy_rejected;
-  $("expReport").checked = st.prefs.export.report;
   $("expRawCrop").value = st.prefs.export.raw_crop || "both";
   $("expByScene").checked = !!st.prefs.export.by_scene;
   renderExpMode();
@@ -342,9 +339,6 @@ function wireRail() {
   $("keepSeries").onchange = () => { st.prefs.settings.keep_per_series = Math.max(1, parseInt($("keepSeries").value, 10) || 1); savePrefs(); };
   $("optRecursive").onchange = () => { st.prefs.recursive = $("optRecursive").checked; savePrefs(); };
   $("optAuto").onchange = () => { st.prefs.settings.options.auto_apply = $("optAuto").checked; savePrefs(); };
-  $("expReview").onchange = () => { st.prefs.export.copy_review = $("expReview").checked; savePrefs(); };
-  $("expRejected").onchange = () => { st.prefs.export.copy_rejected = $("expRejected").checked; savePrefs(); };
-  $("expReport").onchange = () => { st.prefs.export.report = $("expReport").checked; savePrefs(); };
   $("expRawCrop").onchange = () => { st.prefs.export.raw_crop = $("expRawCrop").value; savePrefs(); };
   $("expByScene").onchange = () => { st.prefs.export.by_scene = $("expByScene").checked; savePrefs(); };
   $("expFormat").onchange = () => { st.prefs.export.format = $("expFormat").value; renderExpMode(); savePrefs(); };

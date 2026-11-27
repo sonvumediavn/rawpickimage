@@ -43,12 +43,16 @@ const PREFS_REV: u32 = 1;
 
 impl Prefs {
     fn upgrade(mut self) -> Self {
-        if self.rev < 1 {
-            self.export.copy_rejected = false;
-            self.export.copy_review = false;
-            self.export.report = false;
-        }
         self.rev = PREFS_REV;
+        self.only_picks()
+    }
+
+    /// Sơn's rule (2026-11-03, again 2026-11-27): an export holds the chosen photos only, no
+    /// «Can-xem-lai» / «Bi-loai» folders and no report files.
+    fn only_picks(mut self) -> Self {
+        self.export.copy_rejected = false;
+        self.export.copy_review = false;
+        self.export.report = false;
         self
     }
 }
@@ -741,6 +745,7 @@ fn op_get_session(app: &Arc<App>, id: u32) -> Result<SessionView, String> {
 /// Save a session's settings (they also become the defaults for new sessions)
 /// and re-decide instantly; no re-analysis needed.
 fn op_save_prefs(app: &Arc<App>, id: Option<u32>, prefs: Prefs) -> Option<VerdictsView> {
+    let prefs = prefs.only_picks();
     app.global.lock().unwrap().prefs = prefs.clone();
     app.save_global();
     let mut map = app.sessions.lock().unwrap();
