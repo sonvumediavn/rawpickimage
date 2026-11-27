@@ -20,4 +20,7 @@ pub mod ingest;
 pub mod pipeline;
 pub mod lesson;
 pub mod selftune;
+pub mod webref;
+pub mod convert;
+pub mod post;
 pub mod chat;

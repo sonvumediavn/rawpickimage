@@ -504,6 +504,12 @@ fn first_decision(a: &Analysis, score: f32, s: &Settings, notes: &mut Vec<String
         notes.push("Người phát biểu đang cúi đầu: để bạn xem lại (ảnh có người khác cùng khung thì cúi đầu vẫn giữ)".into());
         return Decision::Review;
     }
+    if score >= s.threshold && s.options.centre_facing {
+        if let Some(why) = centre_fault(a) {
+            notes.push(format!("Người đứng giữa hàng (nhân vật chính) {why}: để bạn xem lại"));
+            return Decision::Review;
+        }
+    }
     if score >= s.threshold {
         if !fixes.is_empty() {
             notes.push("Đạt điểm chọn nhưng cần sửa nhẹ trước khi giao".into());
@@ -613,6 +619,14 @@ fn same_group(a: &Analysis, b: &Analysis) -> bool {
     found as f32 >= 0.75 * lo as f32
 }
 
+/// The same people in the same places, the picture all but unchanged.
+fn same_still(a: &Analysis, b: &Analysis) -> bool {
+    (a.signature.aspect - b.signature.aspect).abs() <= 0.05
+        && same_people_layout(a, b)
+        && same_group(a, b)
+        && crate::visual::similarity_content(&a.embed, &b.embed) >= SAME_SHOT
+}
+
 fn known_faces(x: &Analysis) -> Vec<&crate::faces::FaceInfo> {
     x.people.faces.iter().filter(|f| f.main && !f.small && !f.id.is_empty()).collect()
 }
@@ -627,6 +641,9 @@ const SAME_SHOT_BURST: f32 = 0.78;
 /// Within one press of the shutter, a frame where the detector found other faces still counts
 /// when the picture is practically the same.
 const SAME_PICTURE: f32 = 0.9;
+/// Frames of the same people sitting or standing still this far apart (seconds) are still one
+/// shot when the picture has not changed.
+const STILL_GAP: f64 = 30.0;
 /// A series longer than this (seconds) is a long speech or performance, not one shot: it starts
 /// a new series so it keeps a few photos.
 const SERIES_SPAN: f64 = 45.0;
@@ -638,11 +655,78 @@ const MEANT_GROUP: usize = 2;
 /// The rules want this photo looked at by Sơn rather than picked (mouth wide open, a speaker
 /// looking down).
 fn flagged(a: &Analysis, s: &Settings) -> bool {
-    (s.options.review_open_mouth && lead_mouth_open(a)) || (s.options.speaker_head_up && speaker_head_down(a))
+    (s.options.review_open_mouth && lead_mouth_open(a)) || (s.options.speaker_head_up && speaker_head_down(a)) || (s.options.centre_facing && centre_fault(a).is_some())
 }
 
 fn speaker_head_down(a: &Analysis) -> bool {
     a.people.solo().is_some_and(|f| f.down)
+}
+
+fn centre_of(f: &crate::faces::FaceInfo) -> (f32, f32) {
+    (f.bbox[0] + f.bbox[2] / 2.0, f.bbox[1] + f.bbox[3] / 2.0)
+}
+
+/// People standing side by side for the camera (a group called up on stage, a delegation, a
+/// family): three faces or more of about one size, level, close together, someone in it looking
+/// at the camera. It is what the photo is of when its faces are the main ones, or when it stands
+/// in the middle of the picture and the larger faces are the audience in front (lower down or at
+/// the sides).
+pub fn posed_row(a: &Analysis) -> Option<Vec<&crate::faces::FaceInfo>> {
+    let faces: Vec<&crate::faces::FaceInfo> = a.people.faces.iter().filter(|f| !f.small).collect();
+    if faces.len() < 3 {
+        return None;
+    }
+    let mut best: Vec<&crate::faces::FaceInfo> = vec![];
+    for seed in &faces {
+        let (sy, h) = (centre_of(seed).1, seed.bbox[3].max(1e-4));
+        let mut level: Vec<&crate::faces::FaceInfo> = faces.iter().copied().filter(|f| (0.67..=1.5).contains(&(f.bbox[3] / h)) && (centre_of(f).1 - sy).abs() < 0.7 * h).collect();
+        level.sort_by(|x, y| centre_of(x).0.total_cmp(&centre_of(y).0));
+        let w = level.iter().map(|f| f.bbox[2]).sum::<f32>() / level.len() as f32;
+        // Side by side: the run of neighbours, each within a few face widths, holding the seed.
+        let mut run: Vec<&crate::faces::FaceInfo> = vec![];
+        for f in level {
+            if run.last().is_some_and(|l| centre_of(f).0 - centre_of(l).0 > 4.0 * w) {
+                if run.iter().any(|g| std::ptr::eq(*g, *seed)) {
+                    break;
+                }
+                run.clear();
+            }
+            run.push(f);
+        }
+        if run.len() > best.len() && run.iter().any(|g| std::ptr::eq(*g, *seed)) {
+            best = run;
+        }
+    }
+    if best.len() < 3 || best.iter().all(|f| f.turned) {
+        return None;
+    }
+    if best.iter().filter(|f| f.main).count() * 2 >= best.len() {
+        return Some(best);
+    }
+    let n = best.len() as f32;
+    let rx = best.iter().map(|f| centre_of(f).0).sum::<f32>() / n;
+    let ry = best.iter().map(|f| centre_of(f).1).sum::<f32>() / n;
+    let rh = best.iter().map(|f| f.bbox[3]).sum::<f32>() / n;
+    let front = a.people.faces.iter().filter(|f| f.main && !best.iter().any(|g| std::ptr::eq(*g, *f))).all(|f| {
+        let (x, y) = centre_of(f);
+        y > ry + rh || (x - 0.5).abs() > 0.25
+    });
+    ((rx - 0.5).abs() < 0.2 && front).then_some(best)
+}
+
+/// What is wrong with the person in the middle of a posed row, the one the photo is about:
+/// face turned away, eyes closed.
+fn centre_fault(a: &Analysis) -> Option<&'static str> {
+    let row = posed_row(a)?;
+    let rx = row.iter().map(|f| centre_of(f).0).sum::<f32>() / row.len() as f32;
+    let mid = row.iter().min_by(|x, y| (centre_of(x).0 - rx).abs().total_cmp(&(centre_of(y).0 - rx).abs()))?;
+    if mid.closed {
+        Some("đang nhắm mắt")
+    } else if mid.turned {
+        Some("đang quay mặt đi")
+    } else {
+        None
+    }
 }
 
 /// Best frame first: a frame the rules would pick, then the score, then (with several people)
@@ -679,7 +763,7 @@ pub fn series(items: &[Option<&Analysis>], times: &[Option<f64>], order: &[usize
         let joined = series.last_mut().filter(|g| {
             let (&first, &last) = (g.first().unwrap(), g.last().unwrap());
             if let (Some(t), Some(l)) = (ti, times[last]) {
-                if (t - l).abs() > dedupe_seconds {
+                if (t - l).abs() > dedupe_seconds.max(STILL_GAP) {
                     return false;
                 }
             }
@@ -696,7 +780,12 @@ pub fn series(items: &[Option<&Analysis>], times: &[Option<f64>], order: &[usize
                     (Some(t), Some(u)) => Some((t - u).abs()),
                     _ => None,
                 };
-                gap.is_none_or(|g| g <= dedupe_seconds) && items[k].is_some_and(|b| same_shot(a, b, gap))
+                items[k].is_some_and(|b| match gap {
+                    // Longer apart: only the same people sitting or standing still, same picture
+                    // (a couple on a sofa shot every few seconds through an interview).
+                    Some(d) if d > dedupe_seconds => d <= STILL_GAP && same_still(a, b),
+                    _ => same_shot(a, b, gap),
+                })
             })
         });
         match joined {
@@ -716,7 +805,7 @@ fn dedupe(items: &[Option<&Analysis>], out: &mut [Verdict], order: &[usize], s: 
         ranked.sort_by(|&x, &y| key[&y].total_cmp(&key[&x]).then(x.cmp(&y)));
         let best = ranked[0];
         // The rules picked another frame of this shot, but Sơn's way of choosing prefers this one.
-        if rank[best].is_some() && out[best].decision == Decision::Review && g.iter().any(|&i| out[i].decision == Decision::Selected) {
+        if rank[best].is_some() && out[best].decision == Decision::Review && !items[best].is_some_and(|a| flagged(a, s)) && g.iter().any(|&i| out[i].decision == Decision::Selected) {
             out[best].decision = Decision::Selected;
             out[best].notes.push("AI đã học: trong một loạt ảnh, bạn hay chọn tấm như tấm này".into());
         }
@@ -772,7 +861,7 @@ fn cover_moments(items: &[Option<&Analysis>], out: &mut [Verdict], s: &Settings)
             .iter()
             .filter(|v| v.moment == m && v.score >= floor)
             .filter(|v| matches!(v.decision, Decision::Review | Decision::Rejected(Reason::LowScore) | Decision::Rejected(Reason::Composition)))
-            .filter(|v| items[v.idx].is_some_and(|a| !a.people.closed_eyes))
+            .filter(|v| items[v.idx].is_some_and(|a| !a.people.closed_eyes && !flagged(a, s)))
             .max_by(|a, b| a.score.total_cmp(&b.score))
             .map(|v| v.idx);
         if let Some(i) = best {
@@ -833,6 +922,11 @@ const SUBJECT_GAP: f64 = 600.0;
 /// Frames of a speaker just before or after, too turned to be matched by face: same subject when
 /// this close (seconds) and the picture alike.
 const SUBJECT_NEXT: f64 = 30.0;
+/// The same people caught unposed (a couple talking in their seats, guests at a table): frames
+/// this close (seconds) to the last one are the same scene.
+const CANDID_GAP: f64 = 180.0;
+/// Photos kept of one such scene: it is not a subject Sơn delivers many of.
+const CANDID_MAX: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -841,11 +935,17 @@ pub enum SubjectKind {
     Group,
     /// A person alone in the frame: a key person, or a portrait.
     Person,
+    /// The same two people or more, unposed (talking, listening, at a table).
+    Candid,
 }
 
 impl SubjectKind {
     fn max(self, s: &Settings) -> usize {
-        if self == SubjectKind::Speaker { s.speaker_max } else { s.subject_max }
+        match self {
+            SubjectKind::Speaker => s.speaker_max,
+            SubjectKind::Candid => s.subject_max.min(CANDID_MAX),
+            _ => s.subject_max,
+        }
     }
 
     pub fn label(self) -> &'static str {
@@ -853,6 +953,7 @@ impl SubjectKind {
             SubjectKind::Speaker => "người phát biểu",
             SubjectKind::Group => "nhóm",
             SubjectKind::Person => "nhân vật",
+            SubjectKind::Candid => "cảnh",
         }
     }
 }
@@ -867,6 +968,7 @@ fn subject_kind(a: &Analysis, v: &Verdict) -> Option<SubjectKind> {
         Scene::Speaker if solo.is_some() => Some(SubjectKind::Speaker),
         Scene::Group if known_faces(a).len() >= 2 => Some(SubjectKind::Group),
         Scene::Portrait | Scene::Moment | Scene::Activity if solo.is_some() && (v.scene == Scene::Portrait || !v.key_people.is_empty()) => Some(SubjectKind::Person),
+        Scene::Interaction | Scene::Moment | Scene::Activity | Scene::Portrait | Scene::Other if known_faces(a).len() >= 2 => Some(SubjectKind::Candid),
         _ => None,
     }
 }
@@ -874,7 +976,7 @@ fn subject_kind(a: &Analysis, v: &Verdict) -> Option<SubjectKind> {
 /// Whether two photos of one kind show the same subject.
 fn same_subject(kind: SubjectKind, a: &Analysis, va: &Verdict, b: &Analysis, vb: &Verdict) -> bool {
     match kind {
-        SubjectKind::Group => same_group(a, b),
+        SubjectKind::Group | SubjectKind::Candid => same_group(a, b),
         _ => {
             if va.key_people.iter().any(|p| vb.key_people.contains(p)) {
                 return true;
@@ -902,19 +1004,22 @@ pub fn subjects(items: &[Option<&Analysis>], out: &[Verdict], order: &[usize]) -
             (Some(x), Some(y)) => (x - y).abs() <= gap,
             _ => true,
         };
+        let gap = if kind == SubjectKind::Candid { CANDID_GAP } else { SUBJECT_GAP };
+        let together = |k: SubjectKind| matches!(k, SubjectKind::Group | SubjectKind::Candid);
         let found = subjects.iter_mut().rev().find(|g| {
-            g.kind == kind
-                && g.members.last().is_some_and(|&l| near(l, SUBJECT_GAP))
+            (g.kind == kind || (together(g.kind) && together(kind)))
+                && g.members.last().is_some_and(|&l| near(l, gap))
                 && g.members.iter().rev().take(12).any(|&k| {
                     let Some(b) = items[k] else { return false };
                     if same_subject(kind, a, &out[i], b, &out[k]) {
                         return true;
                     }
-                    // The speaker turned away from the camera a moment: same lectern, same picture.
-                    kind == SubjectKind::Speaker
-                        && near(k, SUBJECT_NEXT)
+                    // The speaker turned away from the camera a moment, someone of the couple
+                    // turned to the other: same place, same picture.
+                    matches!(kind, SubjectKind::Speaker | SubjectKind::Candid)
+                        && near(k, if kind == SubjectKind::Candid { CANDID_GAP } else { SUBJECT_NEXT })
                         && !other_people(a, b)
-                        && crate::visual::similarity_content(&a.embed, &b.embed) >= SAME_SHOT_BURST
+                        && crate::visual::similarity_content(&a.embed, &b.embed) >= if kind == SubjectKind::Candid { SAME_SHOT } else { SAME_SHOT_BURST }
                 })
         });
         match found {
@@ -951,7 +1056,11 @@ fn subject_quotas(items: &[Option<&Analysis>], out: &mut [Verdict], order: &[usi
             out[i].notes.push(format!("Đã giữ {max} tấm đẹp nhất của {label} này"));
         }
         // Filling up: a speech, a group, a key person (not every portrait of a guest).
-        let fill = g.kind != SubjectKind::Person || g.members.iter().any(|&i| !out[i].key_people.is_empty());
+        let fill = match g.kind {
+            SubjectKind::Candid => false,
+            SubjectKind::Person => g.members.iter().any(|&i| !out[i].key_people.is_empty()),
+            _ => true,
+        };
         let want = s.subject_fill.min(max);
         let mut n = picked.len().min(max);
         if !fill || n >= want {
@@ -1402,6 +1511,66 @@ mod tests {
         s.options.per_subject = false;
         let v = cull(&refs, &s, None);
         assert_eq!(v.iter().take(18).filter(|x| x.decision == Decision::Selected).count(), 18);
+    }
+
+    #[test]
+    fn a_couple_sitting_still_is_one_shot_however_long_apart() {
+        // Two people on a sofa, shot every 11 s for a minute and a half: the same picture.
+        let (her, him) = (person(40), person(41));
+        let mut g: Vec<Analysis> = (0..9)
+            .map(|k| {
+                let mut a = shot(&format!("sofa-{k}"), 100.0 + k as f64 * 11.0, 8.0 + (k % 4) as f32 * 0.1, 9, 0.97, k as u32, 2);
+                a.signature.bits = (k as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                a.people.faces[0].id = her.clone();
+                a.people.faces[1].id = him.clone();
+                a
+            })
+            .collect();
+        // Then another couple on the same sofa.
+        for k in 0..2 {
+            let mut a = shot(&format!("other-{k}"), 220.0 + k as f64 * 11.0, 8.0, 9, 0.97, 50 + k, 2);
+            a.signature.bits = (k as u64 + 50).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            a.people.faces[0].id = person(42);
+            a.people.faces[1].id = person(43);
+            g.push(a);
+        }
+        let refs: Vec<_> = g.iter().map(Some).collect();
+        let v = cull(&refs, &Settings::default(), None);
+        let picked: Vec<&str> = v.iter().filter(|x| x.decision == Decision::Selected).map(|x| g[x.idx].name.as_str()).collect();
+        let sofa = picked.iter().filter(|n| n.starts_with("sofa")).count();
+        assert!((1..=2).contains(&sofa), "{picked:?}");
+        assert_eq!(picked.iter().filter(|n| n.starts_with("other")).count(), 1, "{picked:?}");
+    }
+
+    #[test]
+    fn a_row_on_stage_with_the_middle_person_turned_away_is_for_review() {
+        let mut a = photo("row", 0.0, [9.0, 9.0, 8.0, 8.0, 9.0], 1);
+        let at = |x: f32, y: f32, w: f32, h: f32, main: bool| crate::faces::FaceInfo { bbox: [x - w / 2.0, y - h / 2.0, w, h], main, main_size: main, eye_seen: true, ..Default::default() };
+        // Five people standing on stage, the audience's heads large in front.
+        for x in [0.34, 0.41, 0.48, 0.55, 0.62] {
+            a.people.faces.push(at(x, 0.38, 0.03, 0.05, false));
+        }
+        for (x, y) in [(0.15, 0.8), (0.86, 0.7), (0.9, 0.78)] {
+            a.people.faces.push(at(x, y, 0.08, 0.13, true));
+        }
+        assert_eq!(posed_row(&a).map(|r| r.len()), Some(5));
+        let s = Settings::default();
+        assert_eq!(cull(&[Some(&a)], &s, None)[0].decision, Decision::Selected);
+        a.people.faces[1].turned = true;
+        assert_eq!(cull(&[Some(&a)], &s, None)[0].decision, Decision::Selected, "someone at the side may turn");
+        a.people.faces[2].turned = true;
+        let v = cull(&[Some(&a)], &s, None);
+        assert_eq!(v[0].decision, Decision::Review);
+        assert!(v[0].notes.iter().any(|n| n.contains("quay mặt đi")), "{:?}", v[0].notes);
+        let mut off = s.clone();
+        off.options.centre_facing = false;
+        assert_eq!(cull(&[Some(&a)], &off, None)[0].decision, Decision::Selected);
+        // An audience row all looking at the stage is not a posed row.
+        for f in a.people.faces.iter_mut().take(5) {
+            f.turned = true;
+        }
+        assert!(posed_row(&a).is_none());
+        assert_eq!(cull(&[Some(&a)], &s, None)[0].decision, Decision::Selected);
     }
 
     #[test]

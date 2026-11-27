@@ -222,6 +222,9 @@ fn knobs() -> Vec<Knob> {
     ]
 }
 
+/// A published photo this close to a photo of the show checked is a copy of it.
+const LEAK: f32 = 0.9;
+
 /// Rounds over all the knobs, one knob at a time.
 const ROUNDS: usize = 2;
 /// A change must win at least this much (F1) to be taken: on ties the current setting stays.
@@ -246,6 +249,23 @@ pub fn tune(profile: &Profile, exams: &[Exam], base: &Settings, step: &(dyn Fn(u
         .map(|e| {
             let mut p = profile.clone();
             p.samples.retain(|s| !e.paths.contains(&s.name));
+            // Published copies of this very show's photos would give the answers away.
+            {
+                use rayon::prelude::*;
+                let leaks: HashSet<usize> = p
+                    .samples
+                    .par_iter()
+                    .enumerate()
+                    .filter(|(_, s)| s.reference && crate::visual::usable(&s.e))
+                    .filter(|(_, s)| e.items.iter().any(|a| crate::visual::similarity(&s.e, &a.embed) >= LEAK))
+                    .map(|(i, _)| i)
+                    .collect();
+                let mut i = 0;
+                p.samples.retain(|_| {
+                    i += 1;
+                    !leaks.contains(&(i - 1))
+                });
+            }
             p.w.clear();
             p.trained_on = 0;
             p.vis_at = 0;

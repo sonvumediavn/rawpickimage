@@ -43,12 +43,16 @@ const PREFS_REV: u32 = 1;
 
 impl Prefs {
     fn upgrade(mut self) -> Self {
-        if self.rev < 1 {
-            self.export.copy_rejected = false;
-            self.export.copy_review = false;
-            self.export.report = false;
-        }
         self.rev = PREFS_REV;
+        self.only_picks()
+    }
+
+    /// Sơn's rule (2026-11-03, again 2026-11-27): an export holds the chosen photos only, no
+    /// «Can-xem-lai» / «Bi-loai» folders and no report files.
+    fn only_picks(mut self) -> Self {
+        self.export.copy_rejected = false;
+        self.export.copy_review = false;
+        self.export.report = false;
         self
     }
 }
@@ -76,6 +80,24 @@ struct Global {
     sync_dir: Option<PathBuf>,
     /// Random id of this computer, for the shared learning files.
     machine_id: String,
+    /// «Đăng nhanh»: where the photos to post go, and whether new picks go there by themselves.
+    post: PostPrefs,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct PostPrefs {
+    /// Folder (on Google Drive) for the photos to post; the Drive export folder when unset.
+    dir: Option<PathBuf>,
+    /// In live mode, send each new pick as soon as it is picked.
+    auto: bool,
+    opts: rawpick_core::post::PostOptions,
+}
+
+impl Default for PostPrefs {
+    fn default() -> Self {
+        Self { dir: None, auto: true, opts: Default::default() }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +128,17 @@ struct Session {
     applied: Vec<String>,
     last_export: Option<PathBuf>,
     cancel: Arc<AtomicBool>,
+    /// «Chế độ sự kiện trực tiếp»: new photos in the folder are analysed as they arrive.
+    live: bool,
+    /// The folder as last analysed, and as seen on the previous look.
+    live_sig: Option<rawpick_core::post::Signature>,
+    live_seen: Option<rawpick_core::post::Signature>,
+    /// What live mode last did, and when (seconds since 1970).
+    live_note: Option<String>,
+    live_at: Option<u64>,
+    /// Photos already sent by «Đăng nhanh», by path: never sent twice.
+    sent: std::collections::HashSet<String>,
+    posting: bool,
 }
 
 /// What survives a restart: the folder, its settings and Sơn's manual choices.
@@ -119,6 +152,10 @@ struct SavedSession {
     #[serde(default)]
     crops: HashMap<String, [f32; 4]>,
     last_export: Option<PathBuf>,
+    #[serde(default)]
+    live: bool,
+    #[serde(default)]
+    sent: std::collections::HashSet<String>,
 }
 
 impl Session {
@@ -139,6 +176,13 @@ impl Session {
             applied: vec![],
             last_export: None,
             cancel: Arc::new(AtomicBool::new(false)),
+            live: false,
+            live_sig: None,
+            live_seen: None,
+            live_note: None,
+            live_at: None,
+            sent: Default::default(),
+            posting: false,
         }
     }
 }
@@ -228,6 +272,8 @@ impl App {
                 overrides: s.overrides.clone(),
                 crops: s.crops.clone(),
                 last_export: s.last_export.clone(),
+                live: s.live,
+                sent: s.sent.clone(),
             })
             .collect();
         let _ = std::fs::write(self.data_dir.join("sessions.json"), serde_json::to_vec_pretty(&saved).unwrap_or_default());
@@ -253,6 +299,8 @@ impl App {
             trust: p.trust(weight),
             seen: p.seen_count(),
             shared,
+            locked: p.locked,
+            locked_by: p.locked_by.clone(),
         }
     }
 
@@ -313,6 +361,9 @@ struct ProfileView {
     seen: usize,
     /// Learning shared with other computers through Google Drive.
     shared: bool,
+    /// This computer locked the taste; or the computer that did (then it is not taught here).
+    locked: bool,
+    locked_by: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -388,6 +439,13 @@ struct SessionMeta {
     summary: Option<Summary>,
     prefs: Prefs,
     last_export: Option<String>,
+    live: bool,
+    live_note: Option<String>,
+    live_at: Option<u64>,
+    /// Photos sent by «Đăng nhanh», and picks not sent yet.
+    sent: usize,
+    unsent: usize,
+    posting: bool,
 }
 
 #[derive(Serialize)]
@@ -409,10 +467,27 @@ fn meta(s: &Session) -> SessionMeta {
         source: s.source.as_ref().map(|p| p.display().to_string()),
         phase: s.phase,
         error: s.error.clone(),
-        summary: (s.phase == Phase::Ready || s.phase == Phase::Exporting).then(|| cull::summarize(&s.verdicts)),
+        summary: (s.phase == Phase::Ready || s.phase == Phase::Exporting || (s.live && !s.verdicts.is_empty())).then(|| cull::summarize(&s.verdicts)),
         prefs: s.prefs.clone(),
         last_export: s.last_export.as_ref().map(|p| p.display().to_string()),
+        live: s.live,
+        live_note: s.live_note.clone(),
+        live_at: s.live_at,
+        sent: s.sent.len(),
+        unsent: unsent(s).len(),
+        posting: s.posting,
     }
+}
+
+/// Picks «Đăng nhanh» has not sent yet (places in `items`).
+fn unsent(s: &Session) -> Vec<usize> {
+    s.verdicts
+        .iter()
+        .filter(|v| v.decision == Decision::Selected)
+        .filter_map(|v| s.items.get(v.idx).map(|it| (v.idx, it)))
+        .filter(|(_, it)| it.analysis.is_some() && !s.sent.contains(&it.path.display().to_string()))
+        .map(|(i, _)| i)
+        .collect()
 }
 
 fn photo_view(idx: usize, it: &Item) -> PhotoView {
@@ -604,6 +679,7 @@ struct AppInfo {
     drive_roots: Vec<String>,
     machine: String,
     sessions: Vec<SessionMeta>,
+    post: PostPrefs,
 }
 
 fn op_app_info(app: &Arc<App>) -> AppInfo {
@@ -634,6 +710,7 @@ fn op_app_info(app: &Arc<App>) -> AppInfo {
         drive_roots: drive_roots().into_iter().map(|p| p.display().to_string()).collect(),
         machine: machine_label(),
         sessions,
+        post: g.post,
     }
 }
 
@@ -673,6 +750,7 @@ fn op_get_session(app: &Arc<App>, id: u32) -> Result<SessionView, String> {
 /// Save a session's settings (they also become the defaults for new sessions)
 /// and re-decide instantly; no re-analysis needed.
 fn op_save_prefs(app: &Arc<App>, id: Option<u32>, prefs: Prefs) -> Option<VerdictsView> {
+    let prefs = prefs.only_picks();
     app.global.lock().unwrap().prefs = prefs.clone();
     app.save_global();
     let mut map = app.sessions.lock().unwrap();
@@ -686,6 +764,17 @@ fn op_save_prefs(app: &Arc<App>, id: Option<u32>, prefs: Prefs) -> Option<Verdic
     };
     app.save_sessions(&map);
     out
+}
+
+/// Lock (or unlock) this computer's taste: the computers sharing it use it but do not teach it.
+fn op_lock_profile(app: &Arc<App>, name: String, on: bool) -> ProfileView {
+    let store = app.store();
+    let mut p = store.load(&name);
+    if p.locked_by.is_none() {
+        p.locked = on;
+        let _ = store.save(&p);
+    }
+    app.profile_view(&name)
 }
 
 fn op_profile_info(app: &Arc<App>, name: String) -> ProfileView {
@@ -1214,6 +1303,15 @@ fn op_set_folder(app: &Arc<App>, which: &str, path: Option<String>) -> Result<Ap
     app.save_global();
     if which != "drive" {
         app.load_eyes();
+        // Put what this computer already learned into the shared folder right away, so the
+        // other computers get it without waiting for the next click here.
+        let store = app.store();
+        for name in store.list() {
+            let p = store.load(&name);
+            let _ = store.save(&p);
+        }
+        let book = app.eyes.lock().unwrap().clone();
+        app.save_eyes(&book);
     }
     Ok(op_app_info(app))
 }
@@ -1265,6 +1363,287 @@ fn self_tune(app: &App, profile: &str) -> Option<Tuned> {
         app.save_sessions(&map);
     }
     Some(t)
+}
+
+#[derive(Serialize)]
+struct PublishedResult {
+    /// Published photos read now.
+    photos: usize,
+    /// What the website walk found (None: photos from a folder).
+    crawl: Option<rawpick_core::webref::Crawl>,
+    /// People often in those photos, taken as key people: new ones, and ones already listed.
+    people_new: usize,
+    people_known: usize,
+    profile: ProfileView,
+    tuned: Option<Tuned>,
+}
+
+/// Learn from photos the client published, saved in `dir`: how they look (the standard that
+/// gets published) and who is in many of them (the people who matter at their events).
+fn learn_published_dir(app: &App, dir: &Path, profile: &str, crawl: Option<rawpick_core::webref::Crawl>) -> Result<PublishedResult, String> {
+    let on_step = emitter(app, None);
+    let groups = rawpick_core::analyze::collect(dir, true).map_err(|e| e.to_string())?;
+    if groups.is_empty() {
+        return Err(match &crawl {
+            Some(c) => format!(
+                "Không lấy được ảnh nào từ {} (đã đọc {} trang, {} trang cũ hơn mốc, bỏ {} hình nhỏ hoặc lặp, {} lỗi tải). Trang này có thể chặn máy tự đọc; anh tải ảnh về một thư mục rồi dùng «Chọn thư mục ảnh đã đăng».",
+                c.site, c.pages, c.old_pages, c.skipped, c.errors
+            ),
+            None => "Không thấy ảnh nào trong thư mục này".into(),
+        });
+    }
+    let work = pipeline::work_dir(&app.data_dir, dir);
+    let items = {
+        let mut an = app.analyzer.lock().unwrap();
+        an.thumbs_dir = None;
+        let p = Progress { on_step: &on_step, cancel: &app.card_cancel };
+        pipeline::analyze_groups(groups, &an, Some(&work), &p, "AI đang xem ảnh đã đăng").map_err(|e| format!("{e:#}"))?.0
+    };
+    if app.card_cancel.load(Ordering::SeqCst) {
+        return Err("Đã dừng".into());
+    }
+    let ok: Vec<(String, &rawpick_core::analyze::Analysis)> = items.iter().filter_map(|it| it.analysis.as_ref().map(|a| (it.path.display().to_string(), a))).collect();
+    let samples: Vec<learn::Sample> = ok.iter().map(|(p, a)| learn::Sample::published(p.clone(), a)).collect();
+    on_step(ok.len(), ok.len(), "Đang học phong cách ảnh đã đăng");
+    let store = app.store();
+    let mut p = store.load(profile);
+    p.add(samples);
+    p.train();
+    store.save(&p).map_err(|e| e.to_string())?;
+    // Someone in many published photos matters at these events.
+    let min = (ok.len() / 40).max(4);
+    let people = rawpick_core::keypeople::frequent(&ok, min);
+    let (people_new, people_known) = {
+        let mut keys = app.keys.lock().unwrap();
+        let r = keys.learn_frequent(&people);
+        app.save_keys(&keys);
+        r
+    };
+    let tuned = self_tune(app, profile);
+    {
+        let mut map = app.sessions.lock().unwrap();
+        for s in map.values_mut().filter(|s| s.phase == Phase::Ready) {
+            app.recull(s);
+        }
+        app.save_sessions(&map);
+    }
+    sessions_changed(app);
+    Ok(PublishedResult { photos: ok.len(), crawl, people_new, people_known, profile: app.profile_view(profile), tuned })
+}
+
+/// «Học từ ảnh đã đăng» from a website: walk it, save the photos of the last `years` years, learn.
+fn op_learn_web(app: &Arc<App>, url: String, years: u32, profile: String) -> Result<PublishedResult, String> {
+    let on_step = emitter(app, None);
+    app.card_cancel.store(false, Ordering::SeqCst);
+    let dir = app.data_dir.join("anh-da-dang").join(rawpick_core::webref::site_folder(&url));
+    let lim = rawpick_core::webref::Limits::default();
+    let crawl = rawpick_core::webref::crawl(&url, rawpick_core::webref::years_ago(years.clamp(1, 10)), &dir, &lim, &|d, n, w| on_step(d, n, w), &app.card_cancel).map_err(|e| format!("{e:#}"))?;
+    learn_published_dir(app, &dir, &profile, Some(crawl))
+}
+
+/// «Học từ ảnh đã đăng» from a folder (Facebook albums saved by Sơn).
+fn op_learn_published(app: &Arc<App>, path: String, profile: String) -> Result<PublishedResult, String> {
+    let dir = PathBuf::from(&path);
+    if !dir.is_dir() {
+        return Err(format!("Không tìm thấy thư mục {path}"));
+    }
+    app.card_cancel.store(false, Ordering::SeqCst);
+    learn_published_dir(app, &dir, &profile, None)
+}
+
+/// «Chuyển định dạng thư mục»: every picture of a folder into «<folder>_JPG» (or PNG…).
+/// How often live mode looks at the folders, and how long a folder must stay unchanged (a
+/// card copy or Wi-Fi transfer finished) before its new photos are analysed.
+const LIVE_LOOK_SECS: u64 = 4;
+const LIVE_QUIET_SECS: u64 = 3;
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Turn live mode on or off; `path` also sets the folder to watch (it may still be empty).
+fn op_set_live(app: &Arc<App>, id: u32, on: bool, path: Option<String>) -> Result<SessionMeta, String> {
+    let mut map = app.sessions.lock().unwrap();
+    let s = map.get_mut(&id).ok_or("Phiên đã đóng")?;
+    if let Some(p) = path {
+        let p = PathBuf::from(p);
+        if !p.is_dir() {
+            return Err(format!("Không tìm thấy thư mục {}", p.display()));
+        }
+        if s.source.as_ref() != Some(&p) {
+            if matches!(s.phase, Phase::Waiting | Phase::Analyzing | Phase::Exporting) {
+                return Err("Phiên này đang chạy, đợi xong hoặc bấm Dừng".into());
+            }
+            s.overrides.clear();
+            s.crops.clear();
+            s.sent.clear();
+            s.items.clear();
+            s.verdicts.clear();
+            s.phase = Phase::Empty;
+            s.error = None;
+            s.live_sig = None;
+            s.name = folder_name(&p);
+            s.source = Some(p);
+        }
+    }
+    if on && s.source.is_none() {
+        return Err("Chọn thư mục ảnh của sự kiện trước".into());
+    }
+    s.live = on;
+    s.live_seen = None;
+    s.live_note = on.then(|| "Đang chờ ảnh mới vào thư mục".to_string());
+    s.live_at = on.then(now_secs);
+    let m = meta(s);
+    app.save_sessions(&map);
+    drop(map);
+    sessions_changed(app);
+    Ok(m)
+}
+
+fn op_set_post(app: &Arc<App>, path: Option<String>, auto: Option<bool>, long_side: Option<u32>) -> AppInfo {
+    {
+        let mut g = app.global.lock().unwrap();
+        if let Some(p) = path {
+            g.post.dir = (!p.is_empty()).then(|| PathBuf::from(p));
+        }
+        if let Some(a) = auto {
+            g.post.auto = a;
+        }
+        if let Some(l) = long_side {
+            g.post.opts.long_side = l;
+        }
+    }
+    app.save_global();
+    op_app_info(app)
+}
+
+#[derive(Serialize)]
+struct PostResult {
+    report: rawpick_core::post::PostReport,
+    /// Shareable link when the Drive app tells us the folder's id.
+    link: Option<String>,
+}
+
+/// «Đăng nhanh»: every pick not sent yet, as a light JPEG ready to post, into
+/// `<posting folder>/<show> - dang ngay`.
+fn op_post_new(app: &Arc<App>, id: u32) -> Result<PostResult, String> {
+    let (dir, opts) = {
+        let g = app.global.lock().unwrap();
+        (g.post.dir.clone().or(g.drive_dir.clone()), g.post.opts)
+    };
+    let dir = dir.ok_or("Chọn thư mục để gửi ảnh đăng (thư mục Google Drive) trước")?;
+    if !dir.is_dir() {
+        return Err(format!("Không thấy thư mục {}. App Google Drive đã mở và đăng nhập chưa?", dir.display()));
+    }
+    let (out, idxs, shots, cancel) = {
+        let mut map = app.sessions.lock().unwrap();
+        let s = map.get_mut(&id).ok_or("Phiên đã đóng")?;
+        if s.posting {
+            return Err("Đang gửi ảnh, đợi chút".into());
+        }
+        let src = s.source.clone().ok_or("Phiên chưa có thư mục")?;
+        let idxs = unsent(s);
+        let shots: Vec<rawpick_core::post::Shot> = idxs
+            .iter()
+            .map(|&i| {
+                let it = &s.items[i];
+                let a = it.analysis.as_ref();
+                rawpick_core::post::Shot { files: it.files.clone(), time: a.and_then(|a| a.time), crop: a.and_then(|a| a.crop).and_then(rawpick_core::crop::clean) }
+            })
+            .collect();
+        s.posting = !shots.is_empty();
+        let out = dir.join(format!("{}{}", folder_name(&src), rawpick_core::post::POST_SUFFIX));
+        (out, idxs, shots, Arc::new(AtomicBool::new(false)))
+    };
+    if shots.is_empty() {
+        return Ok(PostResult { report: rawpick_core::post::PostReport { dir: out.clone(), ..Default::default() }, link: drive_link(&out) });
+    }
+    sessions_changed(app);
+    let on_step = emitter(app, Some(id));
+    let step = |n: usize, t: usize| on_step(n, t, "Đang gửi ảnh đăng nhanh");
+    let res = rawpick_core::post::post(&shots, &out, &opts, &step, &cancel).map_err(|e| format!("{e:#}"));
+    {
+        let mut map = app.sessions.lock().unwrap();
+        if let Some(s) = map.get_mut(&id) {
+            s.posting = false;
+            if let Ok(r) = &res {
+                for &k in &r.done {
+                    if let Some(it) = s.items.get(idxs[k]) {
+                        s.sent.insert(it.path.display().to_string());
+                    }
+                }
+            }
+        }
+        app.save_sessions(&map);
+    }
+    sessions_changed(app);
+    let report = res?;
+    Ok(PostResult { link: drive_link(&out), report })
+}
+
+/// One look of live mode: analyse sessions whose folder got new photos (and has settled), then
+/// send the new picks when «Tự gửi» is on.
+fn live_tick(app: &Arc<App>) {
+    let todo: Vec<(u32, PathBuf, bool, Option<rawpick_core::post::Signature>, Option<rawpick_core::post::Signature>)> = {
+        let map = app.sessions.lock().unwrap();
+        map.values()
+            .filter(|s| s.live && !s.posting && matches!(s.phase, Phase::Ready | Phase::Empty | Phase::Failed))
+            .filter_map(|s| s.source.clone().map(|p| (s.id, p, s.prefs.recursive, s.live_sig, s.live_seen)))
+            .collect()
+    };
+    for (id, src, recursive, analysed, seen) in todo {
+        let Some(now) = rawpick_core::post::signature(&src, recursive) else { continue };
+        let go = rawpick_core::post::ready_to_analyse(now, analysed, seen, LIVE_QUIET_SECS);
+        let before = {
+            let mut map = app.sessions.lock().unwrap();
+            let Some(s) = map.get_mut(&id) else { continue };
+            s.live_seen = Some(now);
+            s.items.len()
+        };
+        if !go {
+            continue;
+        }
+        let res = op_analyze(app, id, None);
+        let picked_new = {
+            let mut map = app.sessions.lock().unwrap();
+            let Some(s) = map.get_mut(&id) else { continue };
+            s.live_sig = Some(now);
+            s.live_at = Some(now_secs());
+            let fresh = unsent(s).len();
+            s.live_note = Some(match &res {
+                Ok(_) => format!("{} ảnh mới đã lọc · {} ảnh chọn chưa gửi", s.items.len().saturating_sub(before), fresh),
+                Err(e) => e.clone(),
+            });
+            fresh
+        };
+        let auto = app.global.lock().unwrap().post.auto;
+        if res.is_ok() && auto && picked_new > 0 {
+            let r = op_post_new(app, id);
+            let mut map = app.sessions.lock().unwrap();
+            if let Some(s) = map.get_mut(&id) {
+                s.live_at = Some(now_secs());
+                s.live_note = Some(match r {
+                    Ok(r) if r.report.errors.is_empty() => format!("Đã tự gửi {} ảnh mới lên thư mục đăng", r.report.done.len()),
+                    Ok(r) => format!("Đã gửi {} ảnh, {} ảnh lỗi: {}", r.report.done.len(), r.report.errors.len(), r.report.errors[0]),
+                    Err(e) => format!("Chưa gửi được: {e}"),
+                });
+            }
+        }
+        app.emit("session-updated", id);
+        sessions_changed(app);
+    }
+}
+
+fn op_convert_folder(app: &Arc<App>, path: String, format: rawpick_core::convert::Format, quality: u8) -> Result<rawpick_core::convert::ConvertReport, String> {
+    let src = PathBuf::from(&path);
+    if !src.is_dir() {
+        return Err(format!("Không tìm thấy thư mục {path}"));
+    }
+    let out = rawpick_core::convert::default_out(&src, format);
+    let on_step = emitter(app, None);
+    let what = format!("Đang chuyển ảnh sang {}", format.ext().to_uppercase());
+    app.card_cancel.store(false, Ordering::SeqCst);
+    rawpick_core::convert::convert_folder(&src, &out, format, quality, &|d, n| on_step(d, n, &what), &app.card_cancel).map_err(|e| format!("{e:#}"))
 }
 
 #[derive(Serialize)]
@@ -2019,6 +2398,13 @@ struct Args {
     person: Option<u32>,
     idxs: Option<Vec<usize>>,
     other: Option<u32>,
+    url: Option<String>,
+    years: Option<u32>,
+    format: Option<rawpick_core::convert::Format>,
+    quality: Option<u8>,
+    yes_live: Option<bool>,
+    auto: Option<bool>,
+    long_side: Option<u32>,
 }
 
 fn need<T>(v: Option<T>, what: &str) -> Result<T, String> {
@@ -2050,6 +2436,13 @@ fn dispatch(app: &Arc<App>, cmd: &str, args: serde_json::Value) -> Result<serde_
         "set_drive_dir" => json(op_set_folder(app, "drive", a.path)?),
         "set_sync_dir" => json(op_set_folder(app, "sync", a.path)?),
         "learn_show" => json(op_learn_show(app, need(a.path, "path")?, need(a.name, "name")?)?),
+        "learn_web" => json(op_learn_web(app, need(a.url, "url")?, a.years.unwrap_or(2), need(a.name, "name")?)?),
+        "learn_published" => json(op_learn_published(app, need(a.path, "path")?, need(a.name, "name")?)?),
+        "set_live" => json(op_set_live(app, need(a.id, "id")?, need(a.yes_live, "yes_live")?, a.path)?),
+        "post_new" => json(op_post_new(app, need(a.id, "id")?)?),
+        "set_post" => json(op_set_post(app, a.path, a.auto, a.long_side)),
+        "convert_folder" => json(op_convert_folder(app, need(a.path, "path")?, need(a.format, "format")?, a.quality.unwrap_or(rawpick_core::convert::DEFAULT_QUALITY))?),
+        "lock_profile" => json(op_lock_profile(app, need(a.name, "name")?, need(a.yes, "yes")?)),
         "self_tune" => json(op_self_tune(app, need(a.name, "name")?)?),
         "learn_pair" => json(op_learn_pair(app, need(a.id, "id")?, need(a.other, "other")?, need(a.name, "name")?)?),
         "gather_selected" => json(op_gather_selected(app, need(a.id, "id")?, need(a.sub, "sub")?)?),
@@ -2127,6 +2520,8 @@ fn main() {
                 x.overrides = s.overrides;
                 x.crops = s.crops;
                 x.last_export = s.last_export;
+                x.live = s.live;
+                x.sent = s.sent;
                 sessions.insert(x.id, x);
             }
             let next = sessions.keys().max().map(|m| m + 1).unwrap_or(1);
@@ -2154,6 +2549,13 @@ fn main() {
                 std::thread::spawn(move || loop {
                     std::thread::sleep(std::time::Duration::from_secs(150));
                     a.flush_shared();
+                });
+            }
+            {
+                let a = app_state.clone();
+                std::thread::spawn(move || loop {
+                    std::thread::sleep(std::time::Duration::from_secs(LIVE_LOOK_SECS));
+                    live_tick(&a);
                 });
             }
             let _ = app_state.handle.set(app.handle().clone());
@@ -2231,6 +2633,76 @@ mod tests {
         let a = app.clone();
         let r = within(10, move || dispatch(&a, "self_tune", serde_json::json!({ "name": "Sự kiện chung" }))).unwrap();
         assert!(r["tuned"].is_null(), "{r}");
+        // Published photos from a folder (Facebook albums saved by Sơn): learned as looks only.
+        let a = app.clone();
+        let path = picks.display().to_string();
+        let r = within(60, move || dispatch(&a, "learn_published", serde_json::json!({ "path": path, "name": "Sự kiện chung" }))).unwrap();
+        assert!(r["photos"].as_u64().unwrap() >= 1, "{r}");
+        // A folder changed to PNG next to itself; the originals stay.
+        let a = app.clone();
+        let path = show.display().to_string();
+        let r = within(60, move || dispatch(&a, "convert_folder", serde_json::json!({ "path": path, "format": "png" }))).unwrap();
+        assert!(r["converted"].as_u64().unwrap() >= 6, "{r}");
+        assert!(d.join("show_PNG").join("IMG_0.png").exists() && show.join("IMG_0.JPG").exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn live_mode_analyses_new_photos_and_sends_each_pick_once() {
+        let d = std::env::temp_dir().join(format!("rawpick-app-test-{}", rand_u32()));
+        let show = d.join("Le tot nghiep");
+        let drive = d.join("drive");
+        std::fs::create_dir_all(&show).unwrap();
+        std::fs::create_dir_all(&drive).unwrap();
+        let app = test_app(&d.join("data"));
+        let id = dispatch(&app, "new_session", serde_json::json!({})).unwrap()["id"].as_u64().unwrap();
+        dispatch(&app, "set_post", serde_json::json!({ "path": drive.display().to_string(), "auto": false })).unwrap();
+        let m = dispatch(&app, "set_live", serde_json::json!({ "id": id, "yesLive": true, "path": show.display().to_string() })).unwrap();
+        assert!(m["live"].as_bool().unwrap(), "{m}");
+        // Photos copied in a while ago (a finished card copy).
+        let put = |i: u32| {
+            let img = image::RgbImage::from_fn(640, 480, |x, y| image::Rgb([((x * (i + 2)) % 256) as u8, ((y * 3 + i * 50) % 256) as u8, 120]));
+            let p = show.join(format!("IMG_{i}.JPG"));
+            std::fs::write(&p, metrics::encode_jpeg(&img, 90).unwrap()).unwrap();
+            let f = std::fs::File::options().write(true).open(&p).unwrap();
+            f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(30)).unwrap();
+        };
+        let photos = |app: &Arc<App>| dispatch(app, "get_session", serde_json::json!({ "id": id })).map(|v| v["photos"].as_array().unwrap().len()).unwrap_or(0);
+        live_tick(&app);
+        assert_eq!(photos(&app), 0, "empty folder: nothing to do");
+        for i in 0..3 {
+            put(i);
+        }
+        live_tick(&app);
+        assert_eq!(photos(&app), 0, "first look: wait until the folder settles");
+        let a = app.clone();
+        within(60, move || {
+            live_tick(&a);
+            Ok::<_, String>(())
+        })
+        .unwrap();
+        assert_eq!(photos(&app), 3);
+        dispatch(&app, "set_decisions", serde_json::json!({ "id": id, "idxs": [0, 1, 2], "decision": { "kind": "rejected", "reason": "low-score" } })).unwrap();
+        dispatch(&app, "set_decisions", serde_json::json!({ "id": id, "idxs": [0, 2], "decision": { "kind": "selected" } })).unwrap();
+        let r = dispatch(&app, "post_new", serde_json::json!({ "id": id })).unwrap();
+        assert_eq!(r["report"]["done"].as_array().unwrap().len(), 2, "{r}");
+        let out = drive.join("Le tot nghiep - dang ngay");
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 2);
+        let r = dispatch(&app, "post_new", serde_json::json!({ "id": id })).unwrap();
+        assert_eq!(r["report"]["done"].as_array().unwrap().len(), 0, "never sent twice");
+        // One more photo arrives: analysed on the next looks, the earlier choices stay.
+        put(3);
+        live_tick(&app);
+        let a = app.clone();
+        within(60, move || {
+            live_tick(&a);
+            Ok::<_, String>(())
+        })
+        .unwrap();
+        assert_eq!(photos(&app), 4);
+        let m = dispatch(&app, "list_sessions", serde_json::json!({})).unwrap();
+        assert_eq!(m[0]["sent"].as_u64(), Some(2), "{m}");
+        assert!(show.join("IMG_0.JPG").exists());
         let _ = std::fs::remove_dir_all(&d);
     }
 

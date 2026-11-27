@@ -36,6 +36,9 @@ pub struct Options {
     /// A person alone in the frame (a speaker at the lectern) looking down goes to review.
     /// Looking down in a candid moment with others is fine.
     pub speaker_head_up: bool,
+    /// People standing in a row for the camera: the one in the middle (the main person) with
+    /// the face turned away or eyes closed goes to review.
+    pub centre_facing: bool,
     /// Tell the whole story: every kind of photo the event has (overview, speaker, details,
     /// group, interaction…) keeps its best usable one, not only the prettiest kind.
     pub story: bool,
@@ -92,6 +95,7 @@ impl Default for Options {
             dedupe: true,
             keep_each_shot: true,
             speaker_head_up: true,
+            centre_facing: true,
             story: true,
             per_subject: true,
             self_tune: true,

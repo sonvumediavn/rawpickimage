@@ -21,6 +21,7 @@
       </div>
       <div class="row2">
         <button class="btn" id="btnCard">Chép từ thẻ nhớ…</button>
+        <button class="btn" id="btnConvertTop" title="Ảnh điện thoại (HEIC/HEIF của iPhone…) không mở được trên máy tính? Chọn thư mục ảnh, app đổi hết sang JPG vào thư mục mới bên cạnh, ảnh gốc giữ nguyên.">Đổi đuôi ảnh (HEIC → JPG)…</button>
         <button class="btn" id="btnStarCopy" title="Chép ngay các ảnh bạn gắn sao trên máy ảnh, lấy thẳng từ thẻ nhớ hoặc thư mục, không cần đợi AI chấm">★ Chép nhanh ảnh gắn sao…</button>
         <label class="chk"><input type="checkbox" id="optRecursive"> Gồm thư mục con</label>
       </div>
@@ -38,6 +39,7 @@
       <button class="btn" id="btnTrain" disabled>Huấn luyện AI từ lựa chọn hiện tại</button>
       <button class="btn" id="btnLearnShow" title="Chọn thư mục một show bạn đã lọc xong (ảnh gốc và ảnh đã chọn, xếp kiểu gì cũng được). AI tự nhận ra ảnh bạn chọn bằng hình và học theo.">Học từ show cũ…</button>
       <button class="btn" id="btnLearnPair" title="Mở một phiên ảnh gốc và một phiên ảnh bạn đã chọn từ show đó, rồi bấm nút này. AI so từng ảnh bằng hình để biết bạn giữ ảnh nào, bỏ ảnh nào.">Học từ 2 phiên đang mở…</button>
+      <button class="btn" id="btnLearnPublished" title="Ảnh khách đã đăng (website, Facebook) là ảnh đẹp đạt chuẩn: AI học phong cách của chúng, và ai hay xuất hiện trong đó thì coi là nhân vật quan trọng.">Học từ ảnh đã đăng…</button>
       <button class="btn" id="btnSelfTune" title="AI che lựa chọn của bạn trên từng show đã dạy, tự chọn lại với gu học từ các show khác, so với bạn, rồi giữ cài đặt khớp bạn nhất. Tự chạy sau mỗi lần học.">AI tự rèn lại</button>
       <div class="drivebox" id="syncBox"></div>
     </section>
@@ -82,14 +84,24 @@
     <section class="sec">
       <h2>Khi xuất</h2>
       <div class="drivebox" id="driveBox"></div>
+      <div class="drivebox" id="postBox"></div>
       <div class="seg" id="expMode" role="radiogroup" aria-label="Cách xuất">
         <button data-m="copy" role="radio">Chép (giữ ảnh gốc)</button>
         <button data-m="move" role="radio">Chuyển sang thư mục mới</button>
       </div>
       <div class="opts">
-        <label class="chk"><input type="checkbox" id="expReview"> Gồm cả ảnh «Cần xem lại»</label>
-        <label class="chk"><input type="checkbox" id="expRejected"> Gồm cả ảnh bị loại (chia theo lý do)</label>
-        <label class="chk"><input type="checkbox" id="expReport"> Kèm file báo cáo (bao-cao.csv, tong-ket.txt)</label>
+        <label class="field">Định dạng ảnh khi xuất
+          <select id="expFormat">
+            <option value="keep">Giữ nguyên như máy chụp (RAW vẫn là RAW)</option>
+            <option value="jpeg">JPG</option>
+            <option value="png">PNG (không nén mất chất lượng, file lớn)</option>
+            <option value="tiff">TIFF (để in, file rất lớn)</option>
+            <option value="webp">WebP (không mất chất lượng)</option>
+          </select>
+        </label>
+        <label class="field" id="expQualityRow">Chất lượng JPG: <b id="expQualityVal"></b>
+          <input type="range" id="expQuality" min="60" max="100" step="1">
+        </label>
         <label class="chk" title="Toan-canh, Phat-bieu, Nhan-vat, Tuong-tac, Tap-the, Hoat-dong, Chi-tiet, Khoanh-khac"><input type="checkbox" id="expByScene"> Chia ảnh chọn vào thư mục theo loại ảnh</label>
         <label class="field">Ảnh RAW đã crop
           <select id="expRawCrop">
@@ -100,6 +112,7 @@
         </label>
       </div>
       <p class="note" id="expNote"></p>
+      <button class="btn" id="btnConvertFolder" title="Chọn một thư mục ảnh bất kỳ (ảnh điện thoại HEIC của sinh viên, PNG, RAW…). App chuyển hết sang định dạng chọn ở trên (mặc định JPG) vào thư mục mới bên cạnh, ảnh gốc giữ nguyên.">Chuyển định dạng thư mục…</button>
     </section>
   </aside>
 
@@ -110,7 +123,9 @@
       <div>
         <p class="big">Thả thư mục ảnh sự kiện vào đây.</p>
         <p class="note err" id="emptyErr" hidden></p>
-        <p><button class="btn primary" id="btnPickMain">Chọn thư mục cho phiên này…</button></p>
+        <p class="note live" id="emptyLive" hidden></p>
+        <p><button class="btn primary" id="btnPickMain">Chọn thư mục cho phiên này…</button>
+          <button class="btn" id="btnLiveMain" title="Cho sự kiện đang diễn ra: chọn thư mục bạn chép ảnh vào (thẻ nhớ, ảnh Wi-Fi từ máy ảnh). Thư mục trống cũng được. Ảnh mới vào là app tự lọc, và có thể tự gửi ảnh chọn lên Google Drive để đăng fanpage.">● Theo dõi thư mục trực tiếp…</button></p>
         <p>Mỗi phiên lọc một thư mục. Bấm <b>+ Phiên mới</b> để mở thêm thư mục khác, hoặc kéo nhiều thư mục vào cùng lúc. Các phiên được phân tích lần lượt để máy không bị chậm, và tự mở lại khi bật ứng dụng.</p>
         <p>SonVu Raw Pick đọc ảnh xem trước nhúng trong file RAW nên chạy nhanh cả trên máy không có card đồ hoạ. Ảnh được chấm điểm theo phơi sáng, độ nét, bố cục, màu, nhiễu và người (mắt nhắm, mặt mờ), rồi chia vào <b>Đã chọn</b>, <b>Cần xem lại</b> và <b>Bị loại</b>.</p>
         <p class="note" id="faceWarn" hidden></p>
@@ -127,6 +142,13 @@
     <div id="results" hidden>
      <div class="rwrap">
      <div class="rmain">
+      <div class="livebar" id="liveBar">
+        <label class="chk livesw" title="Cho sự kiện đang diễn ra: ảnh mới chép vào thư mục (thẻ nhớ, Wi-Fi máy ảnh) được app tự lọc ngay, không cần bấm lại"><input type="checkbox" id="optLive"> <b>Trực tiếp</b></label>
+        <span class="livenote" id="liveNote"></span>
+        <span class="grow"></span>
+        <label class="chk" title="Mỗi lần lọc xong ảnh mới, app tự gửi ảnh vừa chọn vào thư mục đăng nhanh"><input type="checkbox" id="optAutoPost"> Tự gửi</label>
+        <button class="btn post" id="btnPost" title="Gửi ảnh đã chọn chưa gửi lần nào: JPG gọn cỡ Facebook (2048px), đúng chiều, theo khung crop, tên theo giờ chụp, vào thư mục «… - dang ngay» trên Google Drive. Mở Drive trên điện thoại để đăng.">Đăng nhanh</button>
+      </div>
       <div class="summary" id="summary"></div>
       <div class="suggest" id="suggest" hidden></div>
       <div class="toolbar">

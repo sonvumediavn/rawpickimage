@@ -25,6 +25,7 @@ const CORE_OPTS = [
   ["dedupe", "Lọc ảnh trùng, giữ ảnh đẹp nhất mỗi loạt"],
   ["keep_each_shot", "Cảnh chụp nhiều tấm (nhóm nhận giải…) giữ ít nhất 1 tấm đẹp nhất"],
   ["speaker_head_up", "Người phát biểu một mình cúi đầu: đưa vào «Cần xem lại»"],
+  ["centre_facing", "Hàng người đứng chụp (nhóm lên sân khấu…): người đứng giữa quay mặt đi hoặc nhắm mắt thì đưa vào «Cần xem lại»"],
   ["story", "Đủ loại ảnh kể câu chuyện (toàn cảnh, phát biểu, chi tiết, tập thể…)"],
   ["per_subject", "Mỗi chủ thể chọn vừa đủ: người phát biểu 3–5 tấm, mỗi nhóm và mỗi nhân vật quan trọng khoảng 3 tấm đẹp nhất"],
   ["use_learned", "Dùng điều AI đã học từ lựa chọn của bạn"],
@@ -143,8 +144,26 @@ T.event.listen("progress", (e) => {
   }
   st.progress[session] = { done, total, stage };
   renderTabs();
-  if (session === st.sid) renderProgress();
+  if (session === st.sid) { renderProgress(); renderLive(); }
 });
+// Live mode analysed new photos (or sent them): show them without losing the place in the grid.
+T.event.listen("session-updated", async (e) => {
+  const id = e.payload;
+  const v = await invoke("get_session", { id }).catch(() => null);
+  if (!v) return;
+  // Not under the open viewer: its photo numbers would move. Shown when the viewer closes.
+  if (id === st.sid && !$("detail").hidden) { st.pendingLive = v; return; }
+  applyLiveView(v);
+});
+function applyLiveView(v) {
+  const id = v.meta.id;
+  const main = document.querySelector("main");
+  const top = main.scrollTop;
+  st.views[id] = v;
+  Object.assign(meta(id) || {}, v.meta);
+  if (st.sid === id) { renderMain(); main.scrollTop = top; }
+  renderTabs();
+}
 T.event.listen("sessions-changed", async () => {
   st.metas = await invoke("list_sessions");
   renderTabs();
@@ -200,9 +219,6 @@ function renderRules() {
   $("keepSeries").value = s.keep_per_series;
   $("optRecursive").checked = st.prefs.recursive;
   $("optAuto").checked = s.options.auto_apply;
-  $("expReview").checked = st.prefs.export.copy_review;
-  $("expRejected").checked = st.prefs.export.copy_rejected;
-  $("expReport").checked = st.prefs.export.report;
   $("expRawCrop").value = st.prefs.export.raw_crop || "both";
   $("expByScene").checked = !!st.prefs.export.by_scene;
   renderExpMode();
@@ -276,13 +292,29 @@ function renderProfile(p) {
        <p class="note">Thấy AI chọn sai thì bấm Chọn (P) hoặc Loại (X): AI học ngay từng lần bấm.</p>`
     : `Đang học gu của bạn: <b>${p.samples}</b> / ${p.min_samples} lựa chọn (cần cả ảnh giữ lẫn ảnh bỏ).
        <p class="note">Mở ảnh AI chọn sai, bấm Chọn (P) hoặc Loại (X). Mỗi lần bấm AI học ngay, đủ ${p.min_samples} lần là bắt đầu chấm theo gu bạn.</p>`;
+  if (p.locked_by) {
+    $("profileBox").insertAdjacentHTML("beforeend", `<p class="note live">🔒 Gu này do máy <b>${esc(p.locked_by)}</b> khoá: máy này dùng gu đó để chọn ảnh nhưng không dạy thêm. Muốn dạy theo gu riêng, tạo loại sự kiện mới (nút +).</p>`);
+  } else if (p.shared) {
+    $("profileBox").insertAdjacentHTML("beforeend", `<label class="chk" title="Máy khác dùng chung thư mục học vẫn chọn ảnh theo gu này, nhưng lựa chọn của họ không dạy thêm vào gu này"><input type="checkbox" id="lockTaste" ${p.locked ? "checked" : ""}> 🔒 Khoá gu này: máy khác chỉ dùng, không dạy thêm</label>`);
+    $("lockTaste").onchange = async (e) => {
+      renderProfile(await invoke("lock_profile", { name: st.prefs.profile, yes: e.target.checked }));
+      toast(e.target.checked ? "Đã khoá gu. Máy khác chọn loại sự kiện này sẽ chọn ảnh theo gu bạn, không làm thay đổi gu." : "Đã mở khoá: máy khác dạy thêm được vào gu này.", 7000);
+    };
+  }
   $("btnTrain").disabled = !(st.session && meta()?.phase === "ready");
 }
 
 function renderExpMode() {
-  const mv = !!st.prefs.export.move_files;
+  const fmt = st.prefs.export.format || "keep";
+  $("expFormat").value = fmt;
+  $("expQuality").value = st.prefs.export.quality || 92;
+  $("expQualityVal").textContent = $("expQuality").value;
+  $("expQualityRow").hidden = fmt !== "jpeg";
+  const mv = !!st.prefs.export.move_files && fmt === "keep";
   for (const b of $("expMode").children) b.setAttribute("aria-checked", String((b.dataset.m === "move") === mv)), b.setAttribute("aria-pressed", String((b.dataset.m === "move") === mv));
-  $("expNote").textContent = mv
+  $("expNote").textContent = fmt !== "keep"
+    ? `Mỗi ảnh xuất ra một file ${FORMAT_NAMES[fmt]} (ảnh RAW lấy từ ảnh xem trước cỡ lớn trong file, ảnh đã crop thì cắt sẵn). Ảnh gốc luôn giữ nguyên, kể cả khi chọn «Chuyển».`
+    : mv
     ? "Ảnh được chuyển sang thư mục bạn chọn khi bấm Xuất. Bản gốc chỉ bị xoá sau khi bản mới đã kiểm tra khớp từng byte; cùng ổ đĩa thì chỉ đổi chỗ, không ghi lại file."
     : "Ảnh gốc giữ nguyên. File RAW và JPEG được chép nguyên bản, kiểm tra checksum từng file.";
 }
@@ -317,11 +349,11 @@ function wireRail() {
   $("keepSeries").onchange = () => { st.prefs.settings.keep_per_series = Math.max(1, parseInt($("keepSeries").value, 10) || 1); savePrefs(); };
   $("optRecursive").onchange = () => { st.prefs.recursive = $("optRecursive").checked; savePrefs(); };
   $("optAuto").onchange = () => { st.prefs.settings.options.auto_apply = $("optAuto").checked; savePrefs(); };
-  $("expReview").onchange = () => { st.prefs.export.copy_review = $("expReview").checked; savePrefs(); };
-  $("expRejected").onchange = () => { st.prefs.export.copy_rejected = $("expRejected").checked; savePrefs(); };
-  $("expReport").onchange = () => { st.prefs.export.report = $("expReport").checked; savePrefs(); };
   $("expRawCrop").onchange = () => { st.prefs.export.raw_crop = $("expRawCrop").value; savePrefs(); };
   $("expByScene").onchange = () => { st.prefs.export.by_scene = $("expByScene").checked; savePrefs(); };
+  $("expFormat").onchange = () => { st.prefs.export.format = $("expFormat").value; renderExpMode(); savePrefs(); };
+  $("expQuality").oninput = () => { $("expQualityVal").textContent = $("expQuality").value; };
+  $("expQuality").onchange = () => { st.prefs.export.quality = +$("expQuality").value; savePrefs(); };
   for (const b of $("expMode").children) {
     b.onclick = () => { st.prefs.export.move_files = b.dataset.m === "move"; renderExpMode(); savePrefs(); };
   }
@@ -414,10 +446,14 @@ function renderMain() {
   const m = meta();
   if (!m) return;
   const view = st.views[m.id];
-  const ready = (m.phase === "ready" || m.phase === "exporting") && view;
-  $("empty").hidden = !(m.phase === "empty" || (m.phase === "failed" && !view));
-  $("emptyErr").hidden = m.phase !== "failed";
+  // Live mode keeps the photos on screen while it analyses the new ones.
+  const liveRun = m.live && view && view.photos.length && ["waiting", "analyzing"].includes(m.phase);
+  const ready = ((m.phase === "ready" || m.phase === "exporting") && view) || liveRun;
+  $("empty").hidden = !!ready || !(m.phase === "empty" || (m.phase === "failed" && !view));
+  $("emptyErr").hidden = m.phase !== "failed" || m.live;
   $("emptyErr").textContent = m.error || "";
+  $("emptyLive").hidden = !m.live;
+  $("emptyLive").innerHTML = m.live ? `● Đang theo dõi <b>${esc(m.source || "")}</b>. Ảnh chép vào đây sẽ được lọc ngay, không cần bấm gì.` : "";
   $("results").hidden = !ready;
   renderProgress();
   if (ready) {
@@ -436,6 +472,101 @@ function renderMain() {
   $("btnExportOther").disabled = m.phase !== "ready";
   $("btnTrain").disabled = m.phase !== "ready";
   renderAiSwitch();
+  renderLive();
+}
+
+function clock(s) {
+  return new Date(s * 1000).toLocaleTimeString("vi-VN", { hour: "2-digit", minute: "2-digit" });
+}
+
+function renderLive() {
+  const m = meta();
+  if (!m || !st.info) return;
+  const on = !!m.live;
+  $("optLive").checked = on;
+  $("liveBar").classList.toggle("on", on);
+  const pr = st.progress[m.id];
+  const count = pr && pr.total ? ` ${pr.done}/${pr.total}` : "";
+  let note;
+  if (m.posting) note = "Đang gửi ảnh đăng nhanh…" + (pr && /gửi/.test(pr.stage) ? count : "");
+  else if (on && ["waiting", "analyzing"].includes(m.phase)) note = "Đang lọc ảnh mới…" + count;
+  else if (on) note = (m.live_note || "Đang theo dõi thư mục") + (m.live_at ? ` · ${clock(m.live_at)}` : "");
+  else note = "Bật khi sự kiện đang diễn ra: ảnh mới chép vào thư mục được tự lọc ngay";
+  if (m.sent) note += ` · đã gửi ${m.sent} ảnh`;
+  $("liveNote").textContent = note;
+  $("optAutoPost").checked = !!(st.info.post && st.info.post.auto);
+  $("optAutoPost").parentElement.hidden = !on;
+  $("btnPost").textContent = m.unsent ? `Đăng nhanh (${m.unsent} ảnh mới)` : "Đăng nhanh";
+  $("btnPost").disabled = (!m.unsent && !(st.sel && st.sel.size)) || m.posting;
+}
+
+function postDir() {
+  return (st.info.post && st.info.post.dir) || st.info.drive_dir || null;
+}
+
+async function pickPostDir() {
+  const def = postDir() || (st.info.drive_roots || [])[0];
+  const d = await T.dialog.open({ directory: true, multiple: false, title: "Chọn thư mục trên Google Drive để gửi ảnh đăng nhanh (mở được trên điện thoại)", defaultPath: def || undefined });
+  if (!d) return false;
+  st.info = Object.assign(st.info, await invoke("set_post", { path: d }));
+  renderPostBox();
+  return true;
+}
+
+function renderPostBox() {
+  const p = st.info.post || {};
+  const d = postDir();
+  const size = p.opts ? p.opts.long_side : 2048;
+  $("postBox").innerHTML = `<span><b>Đăng nhanh</b> gửi ảnh chọn (JPG gọn) vào:</span>
+    <span class="path">${d ? esc(d) : "chưa chọn, app hỏi khi bấm lần đầu"}${d && !p.dir ? " (thư mục Drive ở trên)" : ""}</span>
+    <span class="row"><button class="btn sm" id="postChange">${d ? "Đổi thư mục" : "Chọn thư mục…"}</button>
+    <select id="postSize" aria-label="Cỡ ảnh đăng nhanh">
+      <option value="2048">2048px (Facebook nét nhất)</option>
+      <option value="1080">1080px (Instagram, gửi Zalo nhanh)</option>
+      <option value="0">Giữ cỡ gốc</option>
+    </select></span>`;
+  $("postSize").value = String(size);
+  $("postChange").onclick = pickPostDir;
+  $("postSize").onchange = async (e) => { st.info = Object.assign(st.info, await invoke("set_post", { longSide: +e.target.value })); };
+}
+
+async function doPost() {
+  const m = meta();
+  if (!m) return;
+  await chooseTickedFirst("gửi");
+  if (!postDir() && !(await pickPostDir())) return;
+  try {
+    const r = await invoke("post_new", { id: m.id });
+    const n = r.report.done.length;
+    const mb = (r.report.bytes / 1e6).toFixed(1);
+    toast(
+      (n ? `Đã gửi ${n} ảnh (${mb} MB) vào <span class="path">${esc(r.report.dir)}</span>. Mở Google Drive trên điện thoại để đăng.` : "Không có ảnh chọn mới để gửi.") +
+        (r.report.errors.length ? `<br>${r.report.errors.length} ảnh lỗi: ${esc(r.report.errors[0])}` : "") +
+        (r.link ? ` · <a id="postLink">Mở trên Drive</a>` : ` · <a id="postOpen">Mở thư mục</a>`),
+      12000,
+    );
+    const a = document.getElementById("postLink");
+    if (a) a.onclick = () => T.opener.openUrl(r.link);
+    const o = document.getElementById("postOpen");
+    if (o) o.onclick = () => T.opener.openPath(r.report.dir);
+  } catch (e) {
+    toast(esc(e));
+  }
+}
+
+async function setLive(on, path) {
+  const m = meta();
+  if (!m) return;
+  try {
+    const mm = await invoke("set_live", { id: m.id, yesLive: on, path: path || null });
+    Object.assign(m, mm);
+    renderTabs();
+    renderMain();
+    if (on) toast(`Đang theo dõi thư mục. Chép ảnh vào đó (thẻ nhớ, Wi-Fi máy ảnh): vài giây sau app tự lọc${st.info.post && st.info.post.auto ? " và tự gửi ảnh chọn vào thư mục đăng nhanh" : ""}.`, 9000);
+  } catch (e) {
+    $("optLive").checked = !on;
+    toast(esc(e));
+  }
 }
 
 function renderAiSwitch() {
@@ -454,7 +585,8 @@ function renderAiSwitch() {
 
 function renderProgress() {
   const m = meta();
-  const run = m && ["waiting", "analyzing", "exporting"].includes(m.phase);
+  const liveRun = m && m.live && st.views[m.id] && st.views[m.id].photos.length;
+  const run = m && ["waiting", "analyzing", "exporting"].includes(m.phase) && !(liveRun && m.phase !== "exporting");
   $("sprog").hidden = !run;
   if (!run) return;
   const pr = st.progress[m.id] || { done: 0, total: 0, stage: "" };
@@ -518,6 +650,19 @@ function wireIn() {
   drop.onclick = async () => openFolder(await pickFolder("Chọn thư mục ảnh"));
   $("btnPickMain").onclick = async () => openFolder(await pickFolder("Chọn thư mục ảnh cho phiên này"), st.sid);
   $("sprogStop").onclick = () => invoke("cancel", { id: st.sid });
+  $("btnLiveMain").onclick = async () => {
+    const p = await pickFolder("Chọn thư mục bạn chép ảnh sự kiện vào (trống cũng được)");
+    if (!p) return;
+    if (!postDir()) await pickPostDir();
+    setLive(true, p);
+  };
+  $("optLive").onchange = (e) => setLive(e.target.checked);
+  $("optAutoPost").onchange = async (e) => {
+    st.info = Object.assign(st.info, await invoke("set_post", { auto: e.target.checked }));
+    if (e.target.checked && !postDir()) await pickPostDir();
+    renderLive();
+  };
+  $("btnPost").onclick = doPost;
   drop.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") drop.click(); };
   T.webview.getCurrentWebview().onDragDropEvent((e) => {
     const t = e.payload.type;
@@ -719,11 +864,23 @@ function renderSel() {
   $("selAll").indeterminate = n > 0 && n < all;
   $("selBar").hidden = !n;
   $("selCount").textContent = `Đã tích ${n} ảnh`;
+  renderLive();
 }
 
 function tickAll(on) {
   st.sel = on ? new Set(st.view) : new Set();
   renderSel();
+}
+
+/** Ticked photos not chosen yet when an export starts: ticking looks like choosing, so offer
+ *  to choose them first. False when Sơn cancels. */
+async function chooseTickedFirst(what) {
+  const idxs = [...st.sel].filter((i) => st.verdicts[i] && st.verdicts[i].decision.kind !== "selected");
+  if (!idxs.length) return true;
+  const ok = await ask(`Bạn đang tích ${st.sel.size} ảnh nhưng ${idxs.length} ảnh trong đó chưa được chọn.\n\nChọn ${idxs.length === st.sel.size ? "tất cả ảnh đang tích" : "các ảnh đó"} rồi ${what}?`, { title: "Chọn ảnh đang tích", ok: `Chọn rồi ${what}`, cancel: "Không" });
+  if (!ok) return true;
+  await bulkDecide("selected");
+  return true;
 }
 
 /** Sơn's choice for every ticked photo at once. */
@@ -960,6 +1117,9 @@ function wireResults() {
   $("btnLearnShow").onclick = doLearnShow;
   $("btnLearnPair").onclick = doLearnPair;
   $("btnSelfTune").onclick = doSelfTune;
+  $("btnLearnPublished").onclick = doLearnPublished;
+  $("btnConvertFolder").onclick = doConvertFolder;
+  $("btnConvertTop").onclick = doConvertFolder;
   $("btnExportOther").onclick = doExport;
   $("optStars").onchange = () => {
     const v = $("optStars").value;
@@ -983,10 +1143,14 @@ function wireResults() {
 async function doExportShow() {
   const id = st.sid, m = meta(id);
   if (!m || m.phase !== "ready") return;
-  if (!st.summary.selected) return toast("Chưa có ảnh nào được chọn.");
-  if (!st.info.drive_dir) {
-    const ok = await ask("Chọn thư mục trên Google Drive để gửi ảnh cho khách. App sẽ nhớ thư mục này, lần sau xuất thẳng không hỏi lại.\n\nBấm «Để sau» nếu lần này chỉ lưu vào thư mục gốc.", { title: "Thư mục Google Drive", ok: "Chọn thư mục Drive", cancel: "Để sau" });
+  await chooseTickedFirst("xuất");
+  if (!st.summary.selected) return toast("Chưa có ảnh nào được chọn. Tích ảnh rồi bấm «Chọn» (phím P), hoặc bật «AI tự chọn».");
+  let skipDrive = false;
+  try { skipDrive = localStorage.getItem("noDrive") === "1"; } catch (e) { /* storage off */ }
+  if (!st.info.drive_dir && !skipDrive) {
+    const ok = await ask("Chọn thư mục trên Google Drive để gửi ảnh cho khách. App sẽ nhớ thư mục này, lần sau xuất thẳng không hỏi lại.\n\nBấm «Chỉ lưu trong máy» nếu không dùng Drive: app nhớ và không hỏi lại (đổi ý thì chọn Drive ở mục «Khi xuất»).", { title: "Thư mục Google Drive", ok: "Chọn thư mục Drive", cancel: "Chỉ lưu trong máy" });
     if (ok) await pickDriveDir();
+    else try { localStorage.setItem("noDrive", "1"); } catch (e) { /* storage off */ }
   }
   m.phase = "exporting";
   st.progress[id] = { done: 0, total: 0, stage: "Đang lưu ảnh chọn vào thư mục gốc" };
@@ -997,7 +1161,7 @@ async function doExportShow() {
     m.phase = "ready";
     renderProfile(r.profile);
     const rep = r.report;
-    let msg = `Đã lưu ${rep.copied + rep.moved + rep.skipped_same} file vào <a id="openArc">${esc(rep.out_dir)}</a>` + (rep.cropped ? `, ${rep.cropped} ảnh đã crop` : "") + (rep.errors.length ? `, <b>${rep.errors.length} lỗi</b>: ${esc(rep.errors[0])}` : "") + "." + cropNotes(rep);
+    let msg = `Đã lưu ${rep.copied + rep.moved + rep.skipped_same + (rep.converted || 0)} file vào <a id="openArc">${esc(rep.out_dir)}</a>` + (rep.cropped ? `, ${rep.cropped} ảnh đã crop` : "") + (rep.errors.length ? `, <b>${rep.errors.length} lỗi</b>: ${esc(rep.errors[0])}` : "") + "." + cropNotes(rep);
     if (r.drive) {
       msg += `<br>Đã chép lên Google Drive, app Drive đang tải lên. `;
       msg += r.drive.link
@@ -1031,7 +1195,7 @@ async function pickDriveDir() {
   if (!d) return false;
   try {
     st.info = Object.assign(st.info, await invoke("set_drive_dir", { path: d }));
-    renderDrive();
+    renderDrive(); renderPostBox();
     return true;
   } catch (e) {
     toast(esc(e));
@@ -1044,11 +1208,15 @@ function renderDrive() {
   $("driveBox").innerHTML = d
     ? `<span>Xuất xong chép lên Google Drive:</span><span class="path">${esc(d)}</span>
        <span class="row"><button class="btn sm" id="driveChange">Đổi thư mục Drive</button><button class="btn sm" id="driveOff">Thôi chép lên Drive</button></span>`
-    : `<span>Chưa chọn thư mục Google Drive. Bấm «Xuất ảnh chọn» lần đầu app sẽ hỏi, hoặc chọn ngay:</span>
+    : `<span>Xuất ảnh chỉ lưu trong máy. Muốn chép thêm lên Google Drive để gửi khách thì chọn thư mục:</span>
        <span class="row"><button class="btn sm" id="driveChange">Chọn thư mục Drive…</button></span>`;
   $("driveChange").onclick = pickDriveDir;
   const off = document.getElementById("driveOff");
-  if (off) off.onclick = async () => { st.info = Object.assign(st.info, await invoke("set_drive_dir", { path: null })); renderDrive(); };
+  if (off) off.onclick = async () => {
+    try { localStorage.setItem("noDrive", "1"); } catch (e) { /* storage off */ }
+    st.info = Object.assign(st.info, await invoke("set_drive_dir", { path: null }));
+    renderDrive(); renderPostBox();
+  };
 }
 
 function renderSync() {
@@ -1073,6 +1241,104 @@ function renderSync() {
   };
   const off = document.getElementById("syncOff");
   if (off) off.onclick = async () => { st.info = Object.assign(st.info, await invoke("set_sync_dir", { path: null })); renderSync(); };
+}
+
+const FORMAT_NAMES = { keep: "giữ nguyên", jpeg: "JPG", png: "PNG", tiff: "TIFF", webp: "WebP" };
+
+/** Ask for a folder and change every picture in it to the export format (JPG when «giữ nguyên»). */
+async function doConvertFolder() {
+  const dir = await T.dialog.open({ directory: true, multiple: false, title: "Chọn thư mục ảnh cần chuyển định dạng" });
+  if (!dir) return;
+  const format = (st.prefs.export.format && st.prefs.export.format !== "keep") ? st.prefs.export.format : "jpeg";
+  const quality = +(st.prefs.export.quality || 92);
+  const name = FORMAT_NAMES[format];
+  const out = dir.replace(/[\\/]+$/, "") + "_" + (format === "jpeg" ? "JPG" : format === "tiff" ? "TIF" : name.toUpperCase());
+  const ok = await ask(`Chuyển mọi ảnh trong thư mục (cả thư mục con) sang ${name}${format === "jpeg" ? `, chất lượng ${quality}` : ""}, lưu vào:\n${out}\n\nĐọc được ảnh điện thoại HEIC/HEIF, RAW, PNG, TIFF, WebP, BMP, GIF. Ảnh gốc giữ nguyên. Ảnh đã là ${name} thì chép nguyên.`, { title: "Chuyển định dạng ảnh", ok: "Chuyển" });
+  if (!ok) return;
+  busy(true, `Đang chuyển ảnh sang ${name}…`);
+  try {
+    const r = await invoke("convert_folder", { path: dir, format, quality });
+    busy(false);
+    toast(
+      `Đã chuyển ${r.converted} ảnh sang ${name}` + (r.copied ? `, ${r.copied} ảnh vốn đã là ${name} nên chép nguyên` : "") +
+        (r.skipped ? `, bỏ qua ${r.skipped} file không phải ảnh` : "") +
+        (r.errors.length ? `, <b>${r.errors.length} lỗi</b>: ${esc(r.errors[0])}` : "") +
+        ` · <a id="openConv">Mở thư mục</a>`,
+      15000
+    );
+    const a = document.getElementById("openConv");
+    if (a) a.onclick = () => T.opener.openPath(r.out_dir);
+  } catch (e) {
+    busy(false);
+    toast(esc(e));
+  }
+}
+
+/** Ask where the published photos are: a website (with how many years back) or a folder. */
+function askPublished() {
+  return new Promise((resolve) => {
+    const wrap = document.createElement("div");
+    wrap.className = "modal ask";
+    wrap.innerHTML = `<form class="box">
+      <h3>Học từ ảnh đã đăng</h3>
+      <p class="asktext">Ảnh khách đã đăng là ảnh đẹp đạt chuẩn. AI học phong cách của chúng (ảnh kiểu này được chọn), và người xuất hiện trong nhiều ảnh (lãnh đạo, khách mời) thành nhân vật quan trọng. Chỉ dùng trên máy này.</p>
+      <label class="field">Trang web<input id="pubUrl" placeholder="https://www.hanu.vn" value="${esc(localStorage.getItem("pubUrl") || "")}"></label>
+      <label class="field">Lấy bài đăng trong
+        <select id="pubYears"><option value="1">1 năm gần đây</option><option value="2" selected>2 năm gần đây</option><option value="3">3 năm gần đây</option></select>
+      </label>
+      <p class="asktext note">Facebook bắt đăng nhập nên app không tự lấy được: tải các album về một thư mục rồi bấm «Chọn thư mục ảnh đã đăng».</p>
+      <p class="asktext err" id="pubErr" hidden>Nhập địa chỉ trang web.</p>
+      <div class="row2 end"><button type="button" class="btn" data-no>Huỷ</button><button type="button" class="btn" data-dir>Chọn thư mục ảnh đã đăng…</button><button type="submit" class="btn primary">Lấy từ trang web</button></div>
+    </form>`;
+    const done = (v) => { wrap.remove(); document.removeEventListener("keydown", onKey, true); resolve(v); };
+    const onKey = (e) => { if (e.key === "Escape") { e.stopPropagation(); done(null); } };
+    wrap.querySelector("form").onsubmit = (e) => {
+      e.preventDefault();
+      const url = wrap.querySelector("#pubUrl").value.trim();
+      if (!url) { wrap.querySelector("#pubErr").hidden = false; return; }
+      try { localStorage.setItem("pubUrl", url); } catch (_) {}
+      done({ url, years: +wrap.querySelector("#pubYears").value });
+    };
+    wrap.querySelector("[data-dir]").onclick = () => done({ dir: true });
+    wrap.querySelector("[data-no]").onclick = () => done(null);
+    wrap.onclick = (e) => { if (e.target === wrap) done(null); };
+    document.addEventListener("keydown", onKey, true);
+    document.body.append(wrap);
+    wrap.querySelector("#pubUrl").focus();
+  });
+}
+
+async function doLearnPublished() {
+  const how = await askPublished();
+  if (!how) return;
+  let r;
+  try {
+    if (how.dir) {
+      const dir = await T.dialog.open({ directory: true, multiple: false, title: "Chọn thư mục ảnh khách đã đăng (album Facebook đã tải về…)" });
+      if (!dir) return;
+      busy(true, "AI đang xem ảnh đã đăng…");
+      r = await invoke("learn_published", { path: dir, name: st.prefs.profile });
+    } else {
+      busy(true, `Đang đọc trang ${how.url}…`);
+      r = await invoke("learn_web", { url: how.url, years: how.years, name: st.prefs.profile });
+    }
+    busy(false);
+  } catch (e) {
+    busy(false);
+    toast(esc(e), 20000);
+    return;
+  }
+  renderProfile(r.profile);
+  const c = r.crawl;
+  const people = r.people_new || r.people_known
+    ? ` Nhận ra ${r.people_new + r.people_known} người hay xuất hiện trong ảnh đăng` + (r.people_new ? `, thêm ${r.people_new} người vào danh sách nhân vật quan trọng (đổi tên được trong ảnh to)` : "") + "." + (st.prefs.settings.options.key_people ? "" : " Bật tuỳ chọn «Nhân vật chính» để không bao giờ bỏ ảnh tốt duy nhất của họ.")
+    : "";
+  toast(
+    (c ? `Đã đọc ${c.pages} trang của ${esc(c.site)}, lấy ${c.saved + c.had} ảnh đã đăng (bỏ ${c.skipped} hình nhỏ, logo, banner). ` : "") +
+      `AI đã học phong cách của ${r.photos} ảnh đã đăng: ảnh giống kiểu được đăng sẽ được cộng điểm.` + people + tunedNote(r.tuned),
+    25000
+  );
+  await reloadAfterLearning();
 }
 
 /** What the AI found checking itself on the shows taught. */
@@ -1207,15 +1473,19 @@ async function doLearnPair() {
 async function doExport() {
   const id = st.sid, m = meta(id);
   if (!m || m.phase !== "ready") return;
+  await chooseTickedFirst("xuất");
   const src = m.source || "";
   const defParent = st.info.export_parent || src.replace(/[\\/][^\\/]+[\\/]?$/, "");
   const parent = await T.dialog.open({ directory: true, multiple: false, title: "Chọn thư mục để xuất ảnh đã lọc", defaultPath: defParent || undefined });
   if (!parent) return;
   const target = await invoke("export_target", { id, parent });
-  const mv = st.prefs.export.move_files;
+  const fmt = st.prefs.export.format || "keep";
+  const mv = st.prefs.export.move_files && fmt === "keep";
   const what = [`${st.summary.selected} ảnh đã chọn`, st.prefs.export.copy_review ? `${st.summary.review} ảnh cần xem lại` : "", st.prefs.export.copy_rejected ? `${st.summary.rejected} ảnh bị loại` : ""].filter(Boolean).join(", ");
   const msg = mv
     ? `CHUYỂN ${what} (kèm file RAW) sang:\n${target}\n\nẢnh gốc sẽ bị xoá khỏi thư mục cũ, chỉ sau khi bản mới đã kiểm tra khớp từng byte.`
+    : fmt !== "keep"
+    ? `Xuất ${what} thành file ${FORMAT_NAMES[fmt]}${fmt === "jpeg" ? ` (chất lượng ${st.prefs.export.quality || 92})` : ""} vào:\n${target}\n\nẢnh gốc giữ nguyên.`
     : `Chép ${what} (kèm file RAW, giữ nguyên chất lượng) vào:\n${target}\n\nẢnh gốc giữ nguyên.`;
   if (!(await ask(msg, { title: mv ? "Chuyển ảnh sang thư mục mới" : "Xuất ảnh", ok: mv ? "Chuyển ảnh" : "Chép ảnh" }))) return;
   st.info.export_parent = parent;
@@ -1228,7 +1498,7 @@ async function doExport() {
     m.phase = "ready";
     renderProfile(r.profile);
     const rep = r.report;
-    const n = rep.moved || rep.copied;
+    const n = rep.moved || rep.copied + (rep.converted || 0);
     toast(
       `${mv ? "Đã chuyển" : "Đã chép"} ${n} file (${(rep.bytes / 1e9).toFixed(2)} GB) vào ${esc(target)}` +
         (rep.skipped_same ? `, bỏ qua ${rep.skipped_same} file đã có` : "") +
@@ -1675,7 +1945,10 @@ function step(d) {
 }
 
 function wireDetail() {
-  $("dclose").onclick = () => { cropEd.on = false; hideCropResult(); $("detail").hidden = true; st.cur = -1; zoom.idx = -1; };
+  $("dclose").onclick = () => {
+    cropEd.on = false; hideCropResult(); $("detail").hidden = true; st.cur = -1; zoom.idx = -1;
+    if (st.pendingLive) { const v = st.pendingLive; st.pendingLive = null; applyLiveView(v); }
+  };
   wireCrop();
   for (const b of document.querySelectorAll(".dact button")) b.onclick = () => decide(b.dataset.d === "ai" ? null : b.dataset.d);
   document.addEventListener("keydown", (e) => {
@@ -2221,7 +2494,7 @@ function wireWeb() {
   wireZoom();
   wireChat();
   wireWeb();
-  renderDrive();
+  renderDrive(); renderPostBox();
   renderSync();
   if (!st.metas.length) await newSession();
   await selectSession(st.metas[0].id);

@@ -414,6 +414,10 @@ fn read_bodies(pm: &crate::pose::PoseModel, img: &image::RgbImage, people: &mut 
 /// Faces looked at again at most (the largest ones).
 #[cfg(feature = "faces")]
 const FAR_MAX: usize = 10;
+/// Side of one window in the mosaic the far faces are re-detected on (two by two make the
+/// detector's input).
+#[cfg(feature = "faces")]
+const MOSAIC_CELL: u32 = 320;
 
 /// Second look for wide shots where every face is small: find more far faces by detecting on
 /// nine overlapping windows of the picture, then decode the photo at about three times the size and re-detect
@@ -440,9 +444,11 @@ fn far_faces(path: &Path, hi: &image::RgbImage, raw: &[faces::RawFace], det: &fa
     }
     // More far faces (the speaker when only people in the audience were found).
     let mut found: Vec<faces::RawFace> = raw.to_vec();
+    // With FAR_MAX faces already found, only the largest FAR_MAX are looked at again anyway:
+    // the faces the windows would add are smaller still, so they would be dropped.
+    let spots: &[f32] = if raw.len() >= FAR_MAX { &[] } else { &[0.0, 0.3, 0.6] };
     // 3 × 3 overlapping windows, each 2/5 of the picture: the detector sees it ~2.5× closer.
     let (tw, th) = (w * 2 / 5, h * 2 / 5);
-    let spots = [0.0f32, 0.3, 0.6];
     for (x0, y0) in spots.iter().flat_map(|&a| spots.iter().map(move |&b| (((w as f32) * a) as u32, ((h as f32) * b) as u32))) {
         let (x0, y0) = (x0.min(w - tw), y0.min(h - th));
         let tile = image::imageops::crop_imm(hi, x0, y0, tw, th).to_image();
@@ -467,28 +473,63 @@ fn far_faces(path: &Path, hi: &image::RgbImage, raw: &[faces::RawFace], det: &fa
     found.truncate(FAR_MAX);
     let k = big.width() as f32 / w as f32;
     let (bw, bh) = (big.width() as f32, big.height() as f32);
-    let out = found
+    // A window twice the face around each face. Four windows share one detector run (a 2 × 2
+    // mosaic), so the face is as large there (half a window: ~160 px) as it was when each
+    // window had a run of its own: same landmarks, a quarter of the runs.
+    struct Win {
+        scaled: faces::RawFace,
+        x0: f32,
+        y0: f32,
+        scale: f32,
+    }
+    let wins: Vec<(Win, image::RgbImage)> = found
         .iter()
         .map(|f| {
             let scaled = faces::RawFace { x: f.x * k, y: f.y * k, w: f.w * k, h: f.h * k, score: f.score, lm: f.lm.map(|(a, b)| (a * k, b * k)) };
-            // Window around the face; the detector enlarges it, so the face fills it well.
-            let side = (scaled.w.max(scaled.h) * 4.0).max(160.0);
+            let side = (scaled.w.max(scaled.h) * 2.0).max(160.0);
             let (cx, cy) = (scaled.x + scaled.w / 2.0, scaled.y + scaled.h / 2.0);
-            let x0 = (cx - side / 2.0).clamp(0.0, (bw - side).max(0.0));
-            let y0 = (cy - side / 2.0).clamp(0.0, (bh - side).max(0.0));
-            let (cw, ch) = (side.min(bw - x0) as u32, side.min(bh - y0) as u32);
-            let crop = image::imageops::crop_imm(&big, x0 as u32, y0 as u32, cw.max(1), ch.max(1)).to_image();
-            det.detect(&crop, 0.5)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|g| faces::RawFace { x: g.x + x0, y: g.y + y0, w: g.w, h: g.h, score: g.score, lm: g.lm.map(|(a, b)| (a + x0, b + y0)) })
+            let x0 = (cx - side / 2.0).clamp(0.0, (bw - side).max(0.0)).floor();
+            let y0 = (cy - side / 2.0).clamp(0.0, (bh - side).max(0.0)).floor();
+            let (cw, ch) = ((side.min(bw - x0) as u32).max(1), (side.min(bh - y0) as u32).max(1));
+            let scale = MOSAIC_CELL as f32 / cw.max(ch) as f32;
+            let crop = image::imageops::crop_imm(&big, x0 as u32, y0 as u32, cw, ch).to_image();
+            let (nw, nh) = (((cw as f32 * scale).round() as u32).clamp(1, MOSAIC_CELL), ((ch as f32 * scale).round() as u32).clamp(1, MOSAIC_CELL));
+            let cell = metrics::resize(&crop, nw, nh);
+            (Win { scaled, x0, y0, scale }, cell)
+        })
+        .collect();
+    let mut out: Vec<faces::RawFace> = wins.iter().map(|(w, _)| w.scaled).collect();
+    for (n, chunk) in wins.chunks(4).enumerate() {
+        let mut mosaic = image::RgbImage::new(MOSAIC_CELL * 2, MOSAIC_CELL * 2);
+        for (j, (_, cell)) in chunk.iter().enumerate() {
+            image::imageops::replace(&mut mosaic, cell, ((j % 2) as u32 * MOSAIC_CELL) as i64, ((j / 2) as u32 * MOSAIC_CELL) as i64);
+        }
+        let seen = det.detect(&mosaic, 0.5).unwrap_or_default();
+        for (j, (win, _)) in chunk.iter().enumerate() {
+            let (ox, oy) = ((j % 2) as f32 * MOSAIC_CELL as f32, (j / 2) as f32 * MOSAIC_CELL as f32);
+            let back = |x: f32, y: f32| (win.x0 + (x - ox) / win.scale, win.y0 + (y - oy) / win.scale);
+            let s = &win.scaled;
+            let (cx, cy) = (s.x + s.w / 2.0, s.y + s.h / 2.0);
+            let cell = MOSAIC_CELL as f32;
+            let best = seen
+                .iter()
+                .filter(|g| {
+                    let (gx, gy) = (g.x + g.w / 2.0, g.y + g.h / 2.0);
+                    gx >= ox && gx < ox + cell && gy >= oy && gy < oy + cell
+                })
+                .map(|g| {
+                    let (x, y) = back(g.x, g.y);
+                    faces::RawFace { x, y, w: g.w / win.scale, h: g.h / win.scale, score: g.score, lm: g.lm.map(|(a, b)| back(a, b)) }
+                })
                 .min_by(|a, b| {
                     let d = |g: &faces::RawFace| (g.x + g.w / 2.0 - cx).powi(2) + (g.y + g.h / 2.0 - cy).powi(2);
                     d(a).total_cmp(&d(b))
                 })
-                .filter(|g| (g.x + g.w / 2.0 - cx).abs() < scaled.w.max(8.0) && (g.y + g.h / 2.0 - cy).abs() < scaled.h.max(8.0))
-                .unwrap_or(scaled)
-        })
-        .collect();
+                .filter(|g| (g.x + g.w / 2.0 - cx).abs() < s.w.max(8.0) && (g.y + g.h / 2.0 - cy).abs() < s.h.max(8.0));
+            if let Some(g) = best {
+                out[n * 4 + j] = g;
+            }
+        }
+    }
     Some((big, out))
 }
