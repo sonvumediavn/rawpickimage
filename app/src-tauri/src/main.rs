@@ -1268,6 +1268,105 @@ fn self_tune(app: &App, profile: &str) -> Option<Tuned> {
 }
 
 #[derive(Serialize)]
+struct PublishedResult {
+    /// Published photos read now.
+    photos: usize,
+    /// What the website walk found (None: photos from a folder).
+    crawl: Option<rawpick_core::webref::Crawl>,
+    /// People often in those photos, taken as key people: new ones, and ones already listed.
+    people_new: usize,
+    people_known: usize,
+    profile: ProfileView,
+    tuned: Option<Tuned>,
+}
+
+/// Learn from photos the client published, saved in `dir`: how they look (the standard that
+/// gets published) and who is in many of them (the people who matter at their events).
+fn learn_published_dir(app: &App, dir: &Path, profile: &str, crawl: Option<rawpick_core::webref::Crawl>) -> Result<PublishedResult, String> {
+    let on_step = emitter(app, None);
+    let groups = rawpick_core::analyze::collect(dir, true).map_err(|e| e.to_string())?;
+    if groups.is_empty() {
+        return Err(match &crawl {
+            Some(c) => format!(
+                "Không lấy được ảnh nào từ {} (đã đọc {} trang, {} trang cũ hơn mốc, bỏ {} hình nhỏ hoặc lặp, {} lỗi tải). Trang này có thể chặn máy tự đọc; anh tải ảnh về một thư mục rồi dùng «Chọn thư mục ảnh đã đăng».",
+                c.site, c.pages, c.old_pages, c.skipped, c.errors
+            ),
+            None => "Không thấy ảnh nào trong thư mục này".into(),
+        });
+    }
+    let work = pipeline::work_dir(&app.data_dir, dir);
+    let items = {
+        let mut an = app.analyzer.lock().unwrap();
+        an.thumbs_dir = None;
+        let p = Progress { on_step: &on_step, cancel: &app.card_cancel };
+        pipeline::analyze_groups(groups, &an, Some(&work), &p, "AI đang xem ảnh đã đăng").map_err(|e| format!("{e:#}"))?.0
+    };
+    if app.card_cancel.load(Ordering::SeqCst) {
+        return Err("Đã dừng".into());
+    }
+    let ok: Vec<(String, &rawpick_core::analyze::Analysis)> = items.iter().filter_map(|it| it.analysis.as_ref().map(|a| (it.path.display().to_string(), a))).collect();
+    let samples: Vec<learn::Sample> = ok.iter().map(|(p, a)| learn::Sample::published(p.clone(), a)).collect();
+    on_step(ok.len(), ok.len(), "Đang học phong cách ảnh đã đăng");
+    let store = app.store();
+    let mut p = store.load(profile);
+    p.add(samples);
+    p.train();
+    store.save(&p).map_err(|e| e.to_string())?;
+    // Someone in many published photos matters at these events.
+    let min = (ok.len() / 40).max(4);
+    let people = rawpick_core::keypeople::frequent(&ok, min);
+    let (people_new, people_known) = {
+        let mut keys = app.keys.lock().unwrap();
+        let r = keys.learn_frequent(&people);
+        app.save_keys(&keys);
+        r
+    };
+    let tuned = self_tune(app, profile);
+    {
+        let mut map = app.sessions.lock().unwrap();
+        for s in map.values_mut().filter(|s| s.phase == Phase::Ready) {
+            app.recull(s);
+        }
+        app.save_sessions(&map);
+    }
+    sessions_changed(app);
+    Ok(PublishedResult { photos: ok.len(), crawl, people_new, people_known, profile: app.profile_view(profile), tuned })
+}
+
+/// «Học từ ảnh đã đăng» from a website: walk it, save the photos of the last `years` years, learn.
+fn op_learn_web(app: &Arc<App>, url: String, years: u32, profile: String) -> Result<PublishedResult, String> {
+    let on_step = emitter(app, None);
+    app.card_cancel.store(false, Ordering::SeqCst);
+    let dir = app.data_dir.join("anh-da-dang").join(rawpick_core::webref::site_folder(&url));
+    let lim = rawpick_core::webref::Limits::default();
+    let crawl = rawpick_core::webref::crawl(&url, rawpick_core::webref::years_ago(years.clamp(1, 10)), &dir, &lim, &|d, n, w| on_step(d, n, w), &app.card_cancel).map_err(|e| format!("{e:#}"))?;
+    learn_published_dir(app, &dir, &profile, Some(crawl))
+}
+
+/// «Học từ ảnh đã đăng» from a folder (Facebook albums saved by Sơn).
+fn op_learn_published(app: &Arc<App>, path: String, profile: String) -> Result<PublishedResult, String> {
+    let dir = PathBuf::from(&path);
+    if !dir.is_dir() {
+        return Err(format!("Không tìm thấy thư mục {path}"));
+    }
+    app.card_cancel.store(false, Ordering::SeqCst);
+    learn_published_dir(app, &dir, &profile, None)
+}
+
+/// «Chuyển định dạng thư mục»: every picture of a folder into «<folder>_JPG» (or PNG…).
+fn op_convert_folder(app: &Arc<App>, path: String, format: rawpick_core::convert::Format, quality: u8) -> Result<rawpick_core::convert::ConvertReport, String> {
+    let src = PathBuf::from(&path);
+    if !src.is_dir() {
+        return Err(format!("Không tìm thấy thư mục {path}"));
+    }
+    let out = rawpick_core::convert::default_out(&src, format);
+    let on_step = emitter(app, None);
+    let what = format!("Đang chuyển ảnh sang {}", format.ext().to_uppercase());
+    app.card_cancel.store(false, Ordering::SeqCst);
+    rawpick_core::convert::convert_folder(&src, &out, format, quality, &|d, n| on_step(d, n, &what), &app.card_cancel).map_err(|e| format!("{e:#}"))
+}
+
+#[derive(Serialize)]
 struct TuneResult {
     tuned: Option<Tuned>,
     profile: ProfileView,
@@ -2019,6 +2118,10 @@ struct Args {
     person: Option<u32>,
     idxs: Option<Vec<usize>>,
     other: Option<u32>,
+    url: Option<String>,
+    years: Option<u32>,
+    format: Option<rawpick_core::convert::Format>,
+    quality: Option<u8>,
 }
 
 fn need<T>(v: Option<T>, what: &str) -> Result<T, String> {
@@ -2050,6 +2153,9 @@ fn dispatch(app: &Arc<App>, cmd: &str, args: serde_json::Value) -> Result<serde_
         "set_drive_dir" => json(op_set_folder(app, "drive", a.path)?),
         "set_sync_dir" => json(op_set_folder(app, "sync", a.path)?),
         "learn_show" => json(op_learn_show(app, need(a.path, "path")?, need(a.name, "name")?)?),
+        "learn_web" => json(op_learn_web(app, need(a.url, "url")?, a.years.unwrap_or(2), need(a.name, "name")?)?),
+        "learn_published" => json(op_learn_published(app, need(a.path, "path")?, need(a.name, "name")?)?),
+        "convert_folder" => json(op_convert_folder(app, need(a.path, "path")?, need(a.format, "format")?, a.quality.unwrap_or(rawpick_core::convert::DEFAULT_QUALITY))?),
         "self_tune" => json(op_self_tune(app, need(a.name, "name")?)?),
         "learn_pair" => json(op_learn_pair(app, need(a.id, "id")?, need(a.other, "other")?, need(a.name, "name")?)?),
         "gather_selected" => json(op_gather_selected(app, need(a.id, "id")?, need(a.sub, "sub")?)?),
@@ -2231,6 +2337,17 @@ mod tests {
         let a = app.clone();
         let r = within(10, move || dispatch(&a, "self_tune", serde_json::json!({ "name": "Sự kiện chung" }))).unwrap();
         assert!(r["tuned"].is_null(), "{r}");
+        // Published photos from a folder (Facebook albums saved by Sơn): learned as looks only.
+        let a = app.clone();
+        let path = picks.display().to_string();
+        let r = within(60, move || dispatch(&a, "learn_published", serde_json::json!({ "path": path, "name": "Sự kiện chung" }))).unwrap();
+        assert!(r["photos"].as_u64().unwrap() >= 1, "{r}");
+        // A folder changed to PNG next to itself; the originals stay.
+        let a = app.clone();
+        let path = show.display().to_string();
+        let r = within(60, move || dispatch(&a, "convert_folder", serde_json::json!({ "path": path, "format": "png" }))).unwrap();
+        assert!(r["converted"].as_u64().unwrap() >= 6, "{r}");
+        assert!(d.join("show_PNG").join("IMG_0.png").exists() && show.join("IMG_0.JPG").exists());
         let _ = std::fs::remove_dir_all(&d);
     }
 

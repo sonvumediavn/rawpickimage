@@ -38,6 +38,7 @@
       <button class="btn" id="btnTrain" disabled>Huấn luyện AI từ lựa chọn hiện tại</button>
       <button class="btn" id="btnLearnShow" title="Chọn thư mục một show bạn đã lọc xong (ảnh gốc và ảnh đã chọn, xếp kiểu gì cũng được). AI tự nhận ra ảnh bạn chọn bằng hình và học theo.">Học từ show cũ…</button>
       <button class="btn" id="btnLearnPair" title="Mở một phiên ảnh gốc và một phiên ảnh bạn đã chọn từ show đó, rồi bấm nút này. AI so từng ảnh bằng hình để biết bạn giữ ảnh nào, bỏ ảnh nào.">Học từ 2 phiên đang mở…</button>
+      <button class="btn" id="btnLearnPublished" title="Ảnh khách đã đăng (website, Facebook) là ảnh đẹp đạt chuẩn: AI học phong cách của chúng, và ai hay xuất hiện trong đó thì coi là nhân vật quan trọng.">Học từ ảnh đã đăng…</button>
       <button class="btn" id="btnSelfTune" title="AI che lựa chọn của bạn trên từng show đã dạy, tự chọn lại với gu học từ các show khác, so với bạn, rồi giữ cài đặt khớp bạn nhất. Tự chạy sau mỗi lần học.">AI tự rèn lại</button>
       <div class="drivebox" id="syncBox"></div>
     </section>
@@ -87,6 +88,18 @@
         <button data-m="move" role="radio">Chuyển sang thư mục mới</button>
       </div>
       <div class="opts">
+        <label class="field">Định dạng ảnh khi xuất
+          <select id="expFormat">
+            <option value="keep">Giữ nguyên như máy chụp (RAW vẫn là RAW)</option>
+            <option value="jpeg">JPG</option>
+            <option value="png">PNG (không nén mất chất lượng, file lớn)</option>
+            <option value="tiff">TIFF (để in, file rất lớn)</option>
+            <option value="webp">WebP (không mất chất lượng)</option>
+          </select>
+        </label>
+        <label class="field" id="expQualityRow">Chất lượng JPG: <b id="expQualityVal"></b>
+          <input type="range" id="expQuality" min="60" max="100" step="1">
+        </label>
         <label class="chk"><input type="checkbox" id="expReview"> Gồm cả ảnh «Cần xem lại»</label>
         <label class="chk"><input type="checkbox" id="expRejected"> Gồm cả ảnh bị loại (chia theo lý do)</label>
         <label class="chk"><input type="checkbox" id="expReport"> Kèm file báo cáo (bao-cao.csv, tong-ket.txt)</label>
@@ -100,6 +113,7 @@
         </label>
       </div>
       <p class="note" id="expNote"></p>
+      <button class="btn" id="btnConvertFolder" title="Chọn một thư mục ảnh bất kỳ (ảnh điện thoại HEIC của sinh viên, PNG, RAW…). App chuyển hết sang định dạng chọn ở trên (mặc định JPG) vào thư mục mới bên cạnh, ảnh gốc giữ nguyên.">Chuyển định dạng thư mục…</button>
     </section>
   </aside>
 

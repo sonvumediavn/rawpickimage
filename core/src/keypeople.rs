@@ -125,6 +125,91 @@ impl KeyBook {
     }
 }
 
+/// Someone who appears again and again in the photos the client published (the rector, a
+/// guest of honour): the app can take them as key people without Sơn marking them one by one.
+#[derive(Debug, Clone, Serialize)]
+pub struct Frequent {
+    pub faces: Vec<Vec<i8>>,
+    /// Published photos they are in.
+    pub photos: usize,
+    /// One photo of them and the face box in it.
+    pub thumb: Option<String>,
+    pub bbox: [f32; 4],
+}
+
+/// Fingerprints compared per person when grouping faces.
+const GROUP_FACES: usize = 12;
+/// At most this many people are taken from the published photos.
+pub const FREQUENT_MAX: usize = 15;
+
+/// People in at least `min_photos` of `photos` (path, analysis), most frequent first.
+pub fn frequent(photos: &[(String, &Analysis)], min_photos: usize) -> Vec<Frequent> {
+    struct Group {
+        faces: Vec<Vec<i8>>,
+        photos: std::collections::BTreeSet<usize>,
+        thumb: Option<String>,
+        bbox: [f32; 4],
+        best: f32,
+    }
+    let mut groups: Vec<Group> = vec![];
+    for (k, (path, a)) in photos.iter().enumerate() {
+        for f in a.people.faces.iter().filter(|f| f.main && !f.small && f.id.len() == crate::faceid::DIM) {
+            let size = f.bbox[2] * f.bbox[3];
+            let hit = groups
+                .iter_mut()
+                .map(|g| (g.faces.iter().filter_map(|x| similarity(x, &f.id)).fold(0f32, f32::max), g))
+                .filter(|(s, _)| *s >= SAME_PERSON)
+                .max_by(|a, b| a.0.total_cmp(&b.0))
+                .map(|(_, g)| g);
+            match hit {
+                Some(g) => {
+                    g.photos.insert(k);
+                    if g.faces.len() < GROUP_FACES {
+                        g.faces.push(f.id.clone());
+                    }
+                    // The biggest view of the face shows them best.
+                    if size > g.best {
+                        g.best = size;
+                        g.thumb = Some(path.clone());
+                        g.bbox = f.bbox;
+                    }
+                }
+                None => groups.push(Group { faces: vec![f.id.clone()], photos: [k].into(), thumb: Some(path.clone()), bbox: f.bbox, best: size }),
+            }
+        }
+    }
+    let mut out: Vec<Frequent> = groups
+        .into_iter()
+        .filter(|g| g.photos.len() >= min_photos.max(2))
+        .map(|g| Frequent { photos: g.photos.len(), faces: g.faces, thumb: g.thumb, bbox: g.bbox })
+        .collect();
+    out.sort_by(|a, b| b.photos.cmp(&a.photos));
+    out.truncate(FREQUENT_MAX);
+    out
+}
+
+impl KeyBook {
+    /// Take the people found in published photos as key people: someone already in the list
+    /// gets the new fingerprints, someone new is added under a plain name. Returns (new, known).
+    pub fn learn_frequent(&mut self, people: &[Frequent]) -> (usize, usize) {
+        let (mut new, mut known) = (0, 0);
+        for p in people {
+            let who = p.faces.iter().find_map(|f| self.who(f));
+            let name = if who.is_some() { String::new() } else { format!("Hay có trong ảnh đã đăng {}", self.people.len() + 1) };
+            let mut pid = who;
+            for f in &p.faces {
+                pid = self.add(f.clone(), if pid.is_none() { &name } else { "" }, pid, p.thumb.clone(), p.bbox).or(pid);
+            }
+            match (who, pid) {
+                (Some(_), _) => known += 1,
+                (None, Some(_)) => new += 1,
+                _ => {}
+            }
+        }
+        (new, known)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,5 +261,37 @@ mod tests {
         b.mark(&mut a);
         assert!(a.key_faces.is_empty());
         assert!(!a.people.faces[1].main && a.people.faces[0].main);
+    }
+
+    #[test]
+    fn people_often_in_published_photos_become_key_people() {
+        // 20 published photos: the rector in 8, a guest in 3, a student once each.
+        let face = |id: Vec<i8>, x: f32| crate::faces::FaceInfo { id, main: true, bbox: [x, 0.2, 0.1, 0.15], ..Default::default() };
+        let mut photos = vec![];
+        for k in 0..20u32 {
+            let mut a = Analysis::default();
+            a.people.faces.push(face(person(100 + k, 0), 0.1));
+            if k % 5 < 2 {
+                a.people.faces.push(face(person(1, k + 1), 0.4));
+            }
+            if k % 7 == 0 {
+                a.people.faces.push(face(person(2, k + 1), 0.7));
+            }
+            photos.push((format!("/web/p{k}.jpg"), a));
+        }
+        let refs: Vec<(String, &Analysis)> = photos.iter().map(|(p, a)| (p.clone(), a)).collect();
+        let f = frequent(&refs, 4);
+        assert_eq!(f.len(), 1, "{:?}", f.iter().map(|x| x.photos).collect::<Vec<_>>());
+        assert_eq!(f[0].photos, 8);
+        assert_eq!(frequent(&refs, 3).len(), 2);
+        let mut b = KeyBook::default();
+        let marked = b.add(person(1, 0), "Thầy Hiệu trưởng", None, None, [0.0; 4]).unwrap();
+        assert_eq!(b.learn_frequent(&frequent(&refs, 3)), (1, 1));
+        assert_eq!(b.people.len(), 2);
+        assert_eq!(b.people[0].name, "Thầy Hiệu trưởng", "his own name stays");
+        assert!(b.people[0].faces.len() > 1);
+        assert_eq!(b.who(&person(2, 50)), Some(b.people[1].id));
+        assert_ne!(b.people[1].id, marked);
+        assert!(b.people[1].name.starts_with("Hay có trong ảnh đã đăng"));
     }
 }

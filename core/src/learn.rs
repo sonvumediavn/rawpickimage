@@ -40,6 +40,8 @@ const MANUAL_WEIGHT: f32 = 3.0;
 /// Stored decisions per event type. Beyond it, the biggest shows give up their oldest dropped
 /// photos first, so ten old shows all keep teaching.
 const MAX_SAMPLES: usize = 20000;
+/// Published photos kept to compare looks with.
+pub const MAX_REFS: usize = 4000;
 
 /// Indices of `items` to keep so that at most `max` remain, shared fairly between groups: each
 /// group keeps up to the same quota, and within a group `rank` decides (lower stays first).
@@ -179,11 +181,20 @@ pub struct Sample {
     /// kept among them teaches [`Profile::rank`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub series: Option<String>,
+    /// A photo published by the client (website, Facebook album): only used to compare looks
+    /// ("photos like this get published"), never as a keep/drop decision of Sơn's.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reference: bool,
 }
 
 impl Sample {
     pub fn new(name: String, a: &Analysis, keep: bool, ai_keep: bool, manual: bool) -> Self {
-        Self { name, f: features(a).to_vec(), keep, ai_keep, manual, e: a.embed.clone(), origin: None, v: None, series: None }
+        Self { name, f: features(a).to_vec(), keep, ai_keep, manual, e: a.embed.clone(), origin: None, v: None, series: None, reference: false }
+    }
+
+    /// A published photo ([`Sample::reference`]).
+    pub fn published(name: String, a: &Analysis) -> Self {
+        Self { reference: true, ..Self::new(name, a, true, true, false) }
     }
 
     /// The show (folder) the photo came from: similar frames of the same show must not vouch
@@ -331,6 +342,18 @@ impl Profile {
         let names: std::collections::HashSet<_> = s.iter().map(|x| x.name.clone()).collect();
         self.samples.retain(|x| !names.contains(&x.name));
         self.samples.append(&mut s);
+        // Published photos: the newest ones, a bounded number.
+        let refs = self.samples.iter().filter(|x| x.reference).count();
+        if refs > MAX_REFS {
+            let mut drop = refs - MAX_REFS;
+            self.samples.retain(|x| {
+                if x.reference && drop > 0 {
+                    drop -= 1;
+                    return false;
+                }
+                true
+            });
+        }
         if self.samples.len() > MAX_SAMPLES {
             // Hand choices and kept photos stay longest; the biggest shows shrink first.
             let keep = fair_pick(&self.samples, MAX_SAMPLES, |s| s.show(), |i, s| ((!s.keep as u8) + (!s.manual as u8), std::cmp::Reverse(i)));
@@ -352,16 +375,41 @@ impl Profile {
         if self.samples.is_empty() {
             return None;
         }
-        Some(self.samples.iter().filter(|s| s.keep == s.ai_keep).count() as f32 / self.samples.len() as f32)
+        let his: Vec<&Sample> = self.samples.iter().filter(|s| !s.reference).collect();
+        if his.is_empty() {
+            return None;
+        }
+        Some(his.iter().filter(|s| s.keep == s.ai_keep).count() as f32 / his.len() as f32)
     }
 
     pub fn ready(&self) -> bool {
         self.trained_on >= MIN_SAMPLES && self.w.len() == N_ALL
     }
 
-    /// Full-batch gradient descent with L2; tiny data, so this is instant.
+    /// Published photos learned to compare looks with.
+    pub fn reference_count(&self) -> usize {
+        self.samples.iter().filter(|s| s.reference).count()
+    }
+
+    /// Full-batch gradient descent with L2; tiny data, so this is instant. Published photos go
+    /// into the photos compared with, not into the decisions learned.
     pub fn train(&mut self) -> bool {
         self.build_bank();
+        let refs: Vec<Sample> = {
+            let all = std::mem::take(&mut self.samples);
+            let (refs, his): (Vec<Sample>, Vec<Sample>) = all.into_iter().partition(|s| s.reference);
+            self.samples = his;
+            refs
+        };
+        let ok = self.train_decisions();
+        self.samples.extend(refs);
+        if ok {
+            self.fp = self.fingerprint();
+        }
+        ok
+    }
+
+    fn train_decisions(&mut self) -> bool {
         self.train_rank();
         let n = self.samples.len();
         let pos = self.samples.iter().filter(|s| s.keep).count();
@@ -629,6 +677,10 @@ impl Profile {
                 top.join(", ")
             ));
         }
+        let refs = self.reference_count();
+        if refs > 0 {
+            out.push(format!("Đã xem {refs} ảnh khách đã đăng (website, Facebook): ảnh giống kiểu được đăng thì được cộng điểm"));
+        }
         if let Some(t) = &self.tuned {
             out.extend(t.summary());
         }
@@ -852,7 +904,7 @@ mod tests {
         let mut p = Profile::new("Sự kiện chung");
         let mut f = vec![5.0; N_FEAT];
         f[3] = f32::NAN;
-        p.samples.push(Sample { name: "/a/1.jpg".into(), f, keep: true, ai_keep: true, manual: true, e: vec![], origin: None, v: Some([0.8, f32::NAN]), series: Some("/a/1.jpg".into()) });
+        p.samples.push(Sample { name: "/a/1.jpg".into(), f, keep: true, ai_keep: true, manual: true, e: vec![], origin: None, v: Some([0.8, f32::NAN]), series: Some("/a/1.jpg".into()), reference: false });
         p.b = f32::NAN;
         store.save(&p).unwrap();
         let q = store.load("Sự kiện chung");
@@ -875,7 +927,7 @@ mod tests {
             let mut f = vec![6.0; N_FEAT];
             f[1] = sharp;
             f[3] = ((i * 7) % 10) as f32; // irrelevant
-            s.push(Sample { name: format!("a{i}"), f, keep: sharp >= 6.0, ai_keep: true, manual: false, e: vec![], origin: None, v: None, series: None });
+            s.push(Sample { name: format!("a{i}"), f, keep: sharp >= 6.0, ai_keep: true, manual: false, e: vec![], origin: None, v: None, series: None, reference: false });
         }
         p.add(s);
         assert!(p.train());
@@ -891,7 +943,7 @@ mod tests {
     #[test]
     fn stays_silent_without_enough_data() {
         let mut p = Profile::new("ít");
-        p.add(vec![Sample { name: "x".into(), f: vec![5.0; N_FEAT], keep: true, ai_keep: false, manual: false, e: vec![], origin: None, v: None, series: None }]);
+        p.add(vec![Sample { name: "x".into(), f: vec![5.0; N_FEAT], keep: true, ai_keep: false, manual: false, e: vec![], origin: None, v: None, series: None, reference: false }]);
         assert!(!p.train());
         assert!(p.predict(&[5.0; N_FEAT], &[]).is_none());
         assert_eq!(p.agreement(), Some(0.0));
@@ -906,10 +958,10 @@ mod tests {
             let mut f = NEUTRAL.to_vec();
             let open = i % 2 == 0;
             f[11] = if open { 4.0 } else { 0.5 };
-            s.push(Sample { name: format!("m{i}"), f, keep: !open, ai_keep: true, manual: true, e: vec![], origin: None, v: None, series: None });
+            s.push(Sample { name: format!("m{i}"), f, keep: !open, ai_keep: true, manual: true, e: vec![], origin: None, v: None, series: None, reference: false });
         }
         // Plus one sample saved by the old 11-feature version.
-        s.push(Sample { name: "old".into(), f: vec![5.0; 11], keep: true, ai_keep: true, manual: false, e: vec![], origin: None, v: None, series: None });
+        s.push(Sample { name: "old".into(), f: vec![5.0; 11], keep: true, ai_keep: true, manual: false, e: vec![], origin: None, v: None, series: None, reference: false });
         p.add(s);
         p.upgrade();
         assert!(p.ready() && p.samples.iter().all(|x| x.f.len() == N_FEAT));
@@ -942,7 +994,7 @@ mod tests {
         for i in 0..60u32 {
             let keep = i % 2 == 0;
             let e = vec_like(if keep { 1 } else { 2 }, i);
-            s.push(Sample { name: format!("/show{}/p{i}.jpg", i % 6), f: NEUTRAL.to_vec(), keep, ai_keep: true, manual: true, e, origin: None, v: None, series: None });
+            s.push(Sample { name: format!("/show{}/p{i}.jpg", i % 6), f: NEUTRAL.to_vec(), keep, ai_keep: true, manual: true, e, origin: None, v: None, series: None, reference: false });
         }
         p.add(s);
         assert!(p.train());
@@ -959,7 +1011,7 @@ mod tests {
         for show in 0..10u32 {
             for i in 0..1200u32 {
                 let keep = i % 6 == 0;
-                s.push(Sample { name: format!("/show{show}/p{i}.jpg"), f: NEUTRAL.to_vec(), keep, ai_keep: true, manual: true, e: full(vec_like(if keep { 1 } else { 2 }, i)), origin: None, v: None, series: None });
+                s.push(Sample { name: format!("/show{show}/p{i}.jpg"), f: NEUTRAL.to_vec(), keep, ai_keep: true, manual: true, e: full(vec_like(if keep { 1 } else { 2 }, i)), origin: None, v: None, series: None, reference: false });
             }
         }
         p.add(s);
@@ -972,7 +1024,7 @@ mod tests {
         assert!(p.train());
         eprintln!("train {} samples: {:?}", p.samples.len(), t.elapsed());
         // One more click: only the new photo is compared.
-        p.add(vec![Sample { name: "/show0/new.jpg".into(), f: NEUTRAL.to_vec(), keep: true, ai_keep: false, manual: true, e: full(vec_like(1, 5)), origin: None, v: None, series: None }]);
+        p.add(vec![Sample { name: "/show0/new.jpg".into(), f: NEUTRAL.to_vec(), keep: true, ai_keep: false, manual: true, e: full(vec_like(1, 5)), origin: None, v: None, series: None, reference: false }]);
         let t = std::time::Instant::now();
         assert!(p.train());
         eprintln!("one more click: {:?}", t.elapsed());
@@ -995,7 +1047,7 @@ mod tests {
         let sh = |m: &str| Some(Shared { dir: drive.clone(), machine: m.to_string(), label: m.to_string() });
         let win = Store::new(d.path().join("win")).with_shared(sh("win00001"));
         let mac = Store::new(d.path().join("mac")).with_shared(sh("mac00001"));
-        let mk = |n: &str, keep: bool| Sample { name: n.into(), f: NEUTRAL.to_vec(), keep, ai_keep: keep, manual: true, e: vec![], origin: None, v: None, series: None };
+        let mk = |n: &str, keep: bool| Sample { name: n.into(), f: NEUTRAL.to_vec(), keep, ai_keep: keep, manual: true, e: vec![], origin: None, v: None, series: None, reference: false };
         let mut p = win.load("cưới");
         p.add((0..12).map(|i| mk(&format!("w{i}"), i % 2 == 0)).collect());
         win.save(&p).unwrap();

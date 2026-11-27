@@ -12,7 +12,47 @@ use std::path::Path;
 pub const RAW_EXTS: &[&str] = &[
     "cr2", "cr3", "crw", "nef", "nrw", "arw", "srf", "sr2", "dng", "raf", "orf", "rw2", "pef", "srw", "3fr", "iiq", "erf", "kdc", "mrw", "x3f", "rwl",
 ];
-pub const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "tif", "tiff", "webp"];
+/// Every picture format the app reads: camera JPEG/TIFF, phone HEIC/HEIF (iPhone; HIF from
+/// Fujifilm and Canon), web PNG/WebP/GIF, old BMP/TGA.
+pub const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "jfif", "jpe", "png", "tif", "tiff", "webp", "heic", "heif", "hif", "heics", "bmp", "gif", "tga"];
+
+/// An HEIF file (HEIC from phones), told by its header whatever its name says.
+pub fn is_heif(bytes: &[u8]) -> bool {
+    bytes.len() >= 12 && &bytes[4..8] == b"ftyp" && matches!(&bytes[8..12], b"heic" | b"heix" | b"heim" | b"heis" | b"hevc" | b"hevx" | b"mif1" | b"msf1" | b"heif")
+}
+
+/// Decode any supported picture (not RAW) to RGB, the right way up when the format says so.
+pub fn decode_bytes(bytes: &[u8]) -> Result<RgbImage> {
+    if is_heif(bytes) {
+        // Two independent decoders: the second reads some files the first refuses.
+        let first = heic_decoder::decode(bytes).map_err(|e| anyhow!("{e:?}")).and_then(|img| {
+            let rgb = img.to_rgb8().map_err(|e| anyhow!("{e:?}"))?;
+            RgbImage::from_raw(rgb.width as u32, rgb.height as u32, rgb.data).context("ảnh HEIC hỏng")
+        });
+        if let Ok(img) = first {
+            return Ok(img);
+        }
+        use zune_heic::zune_core::bytestream::ZCursor;
+        use zune_heic::zune_core::colorspace::ColorSpace;
+        use zune_heic::zune_core::options::DecoderOptions;
+        let opts = DecoderOptions::default().hvec_set_use_videotoolbox(false).set_max_width(30000).set_max_height(30000);
+        let mut d = zune_heic::HeifDecoder::new_with_options(ZCursor::new(bytes), opts);
+        let px = d.decode().map_err(|e| anyhow!("không đọc được ảnh HEIC: {e:?}"))?;
+        let (w, h) = (d.width().unwrap_or(0) as u32, d.height().unwrap_or(0) as u32);
+        let cs = d.colorspace().unwrap_or(ColorSpace::RGB);
+        let n = cs.num_components();
+        let rgb: Vec<u8> = match n {
+            3 => px,
+            4 => px.chunks_exact(4).flat_map(|c| [c[0], c[1], c[2]]).collect(),
+            1 => px.iter().flat_map(|&v| [v, v, v]).collect(),
+            2 => px.chunks_exact(2).flat_map(|c| [c[0], c[0], c[0]]).collect(),
+            _ => bail!("ảnh HEIC có kiểu màu lạ"),
+        };
+        return RgbImage::from_raw(w, h, rgb).context("ảnh HEIC hỏng");
+    }
+    let img = image::load_from_memory(bytes).context("định dạng ảnh không hỗ trợ")?;
+    Ok(img.to_rgb8())
+}
 
 pub fn ext_of(p: &Path) -> String {
     p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase()
@@ -251,7 +291,7 @@ pub fn load(path: &Path, min_long: u32) -> Result<Preview> {
     };
 
     if kind == SourceKind::Other {
-        let img = image::load_from_memory(&bytes).context("định dạng ảnh không hỗ trợ")?.to_rgb8();
+        let img = decode_bytes(&bytes)?;
         let (nw, nh) = img.dimensions();
         let long = nw.max(nh);
         let img = if long > min_long.saturating_mul(2) {

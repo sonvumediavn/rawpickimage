@@ -226,6 +226,22 @@ Kết quả hiện trong khung «AI học theo bạn» và áp dụng ngay cho c
 tuỳ chọn «AI tự kiểm tra… và tự chỉnh»). Bài kiểm tra lấy từ phần phân tích app đã lưu của các show đó,
 không cần mở lại thư mục.
 
+**Học từ ảnh đã đăng.** Ảnh khách đã đăng (website, Facebook) là ảnh đẹp đạt chuẩn. Bấm «Học từ ảnh đã
+đăng…»: dán link trang web (ví dụ https://www.hanu.vn), chọn số năm gần đây, app tự đi qua các bài viết,
+bỏ bài cũ hơn mốc, bỏ logo, banner, hình nhỏ, hình lặp trên mọi trang, tải ảnh bài viết về máy (thư mục
+dữ liệu của app, `anh-da-dang`). Facebook bắt đăng nhập nên app không tự lấy: tải album về một thư mục rồi
+bấm «Chọn thư mục ảnh đã đăng». AI dùng các ảnh này để:
+- học phong cách: ảnh nhìn giống kiểu được đăng thì được cộng điểm (chỉ dùng để so hình, không tính là
+  lựa chọn giữ/bỏ của bạn, không làm lệch bài tự kiểm tra);
+- học nhân vật: ai xuất hiện trong nhiều ảnh đã đăng (lãnh đạo, khách mời) thành nhân vật quan trọng, đổi
+  tên được trong ảnh to.
+
+**Định dạng ảnh.** App đọc ảnh RAW của mọi hãng, JPG, TIFF, PNG, WebP, BMP, GIF, TGA và ảnh điện thoại
+HEIC/HEIF (iPhone; HIF của Fujifilm, Canon), không cần cài thêm gì. Trong «Khi xuất» chọn «Định dạng ảnh
+khi xuất»: giữ nguyên như máy chụp, JPG (kèm chất lượng), PNG, TIFF hoặc WebP. Nút «Chuyển định dạng thư
+mục…» chuyển cả một thư mục bất kỳ (ví dụ ảnh điện thoại sinh viên gửi) sang JPG, lưu vào «<thư mục>_JPG»
+bên cạnh. Ảnh gốc luôn giữ nguyên; ảnh đã đúng định dạng thì chép nguyên, không nén lại.
+
 ## Các tuỳ chọn
 
 AI trong ứng dụng gợi ý nên bật gì cho từng thư mục, bạn quyết định. Nếu bật «Để AI tự bật», AI chỉ được

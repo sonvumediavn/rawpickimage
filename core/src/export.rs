@@ -29,6 +29,11 @@ pub struct ExportOptions {
     /// Chosen photos go into one sub-folder per kind of photo (Toan-canh, Phat-bieu, Chi-tiet…).
     #[serde(default)]
     pub by_scene: bool,
+    /// Format of the exported photos: as shot (RAW stays RAW), or changed to JPG/PNG/TIFF/WebP
+    /// (one file per photo; originals are never changed or moved then).
+    pub format: crate::convert::Format,
+    /// JPEG quality when changing to JPG.
+    pub quality: u8,
 }
 
 /// A cropped RAW photo on export: the RAW itself is never changed.
@@ -47,7 +52,16 @@ pub enum RawCrop {
 impl Default for ExportOptions {
     fn default() -> Self {
         // Sơn's call (2026-11-03): only the chosen photos, no report files.
-        Self { copy_rejected: false, copy_review: false, report: false, move_files: false, raw_crop: RawCrop::Both, by_scene: false }
+        Self {
+            copy_rejected: false,
+            copy_review: false,
+            report: false,
+            move_files: false,
+            raw_crop: RawCrop::Both,
+            by_scene: false,
+            format: crate::convert::Format::Keep,
+            quality: crate::convert::DEFAULT_QUALITY,
+        }
     }
 }
 
@@ -65,6 +79,9 @@ pub struct ExportReport {
     /// Things to know about the crops (e.g. a RAW whose preview is too small for a JPEG).
     #[serde(default)]
     pub notes: Vec<String>,
+    /// Photos changed to another format.
+    #[serde(default)]
+    pub converted: usize,
 }
 
 /// Suffix of the export folder, Sơn's naming (2026-11-04): «261104_van nghe cong doan_anh chon».
@@ -241,7 +258,28 @@ pub fn export(
         if opts.by_scene && d == Decision::Selected {
             folder = folder.join(e.verdict.scene.folder());
         }
-        if let Some(r) = e.analysis.and_then(|a| a.crop).and_then(crate::crop::clean) {
+        let crop = e.analysis.and_then(|a| a.crop).and_then(crate::crop::clean);
+        if opts.format != crate::convert::Format::Keep {
+            // One file per photo: the camera's JPEG when there is one, else the RAW's preview.
+            let src = e.files.iter().find(|f| crate::preview::is_supported(f) && !crate::preview::is_raw(f)).or_else(|| e.files.iter().find(|f| crate::preview::is_raw(f))).or(e.files.first());
+            let Some(src) = src else { continue };
+            match crate::convert::convert_file(src, &folder, opts.format, opts.quality, crop, &mut used) {
+                Ok((dst, conv)) => {
+                    rep.bytes += std::fs::metadata(&dst).map(|m| m.len()).unwrap_or(0);
+                    if conv {
+                        rep.converted += 1;
+                    } else {
+                        rep.copied += 1;
+                    }
+                    if crop.is_some() {
+                        rep.cropped += 1;
+                    }
+                }
+                Err(err) => rep.errors.push(format!("{err:#}")),
+            }
+            continue;
+        }
+        if let Some(r) = crop {
             match export_cropped(e, r, &folder, opts, &mut used, &mut rep) {
                 Ok(()) => rep.cropped += 1,
                 Err(err) => rep.errors.push(format!("{err:#}")),
@@ -575,7 +613,7 @@ mod tests {
         assert_eq!(std::fs::read(out.join("IMG_1.CR3")).unwrap(), b"raw-bytes");
         assert!(out.join("IMG_1.JPG").exists() && !out.join("IMG_2.JPG").exists());
         assert!(!out.join("bao-cao.csv").exists() && !out.join("tong-ket.txt").exists() && !out.join("Bi-loai").exists());
-        let all = ExportOptions { copy_rejected: true, copy_review: true, report: true, move_files: false, raw_crop: RawCrop::Both, by_scene: false };
+        let all = ExportOptions { copy_rejected: true, copy_review: true, report: true, ..Default::default() };
         let rep = export(&entries, &out, &all, &|_, _| {}, &AtomicBool::new(false)).unwrap();
         assert_eq!((rep.copied, rep.skipped_same), (1, 2), "{:?}", rep.errors);
         assert_eq!(std::fs::read(out.join("Bi-loai/Nham-mat/IMG_2.JPG")).unwrap(), b"other");
@@ -603,6 +641,25 @@ mod tests {
         export(&entries, &out, &ExportOptions::default(), &|_, _| {}, &AtomicBool::new(false)).unwrap();
         assert_eq!(std::fs::read(out.join("HANU1.JPG")).unwrap(), b"chosen");
         assert!(!out.join("anh goc").exists());
+    }
+
+    #[test]
+    fn export_can_change_the_format_and_never_moves_originals_then() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("Su-kien");
+        std::fs::create_dir_all(&src).unwrap();
+        let img = image::RgbImage::from_fn(240, 160, |x, y| image::Rgb([(x % 256) as u8, (y % 256) as u8, 50]));
+        let a = src.join("IMG_1.png");
+        img.save(&a).unwrap();
+        let fa = vec![a.clone()];
+        let va = verdict(Decision::Selected);
+        let entries = vec![Entry { files: &fa, analysis: None, verdict: &va }];
+        let out = dir.path().join("Xuat");
+        let opts = ExportOptions { move_files: true, format: crate::convert::Format::Jpeg, ..Default::default() };
+        let rep = export(&entries, &out, &opts, &|_, _| {}, &AtomicBool::new(false)).unwrap();
+        assert_eq!(rep.converted, 1, "{:?}", rep.errors);
+        assert!(a.exists(), "the original stays when the format changes");
+        assert_eq!(image::open(out.join("IMG_1.jpg")).unwrap().width(), 240);
     }
 
     #[test]
