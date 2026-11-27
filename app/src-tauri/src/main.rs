@@ -299,6 +299,8 @@ impl App {
             trust: p.trust(weight),
             seen: p.seen_count(),
             shared,
+            locked: p.locked,
+            locked_by: p.locked_by.clone(),
         }
     }
 
@@ -359,6 +361,9 @@ struct ProfileView {
     seen: usize,
     /// Learning shared with other computers through Google Drive.
     shared: bool,
+    /// This computer locked the taste; or the computer that did (then it is not taught here).
+    locked: bool,
+    locked_by: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -759,6 +764,17 @@ fn op_save_prefs(app: &Arc<App>, id: Option<u32>, prefs: Prefs) -> Option<Verdic
     };
     app.save_sessions(&map);
     out
+}
+
+/// Lock (or unlock) this computer's taste: the computers sharing it use it but do not teach it.
+fn op_lock_profile(app: &Arc<App>, name: String, on: bool) -> ProfileView {
+    let store = app.store();
+    let mut p = store.load(&name);
+    if p.locked_by.is_none() {
+        p.locked = on;
+        let _ = store.save(&p);
+    }
+    app.profile_view(&name)
 }
 
 fn op_profile_info(app: &Arc<App>, name: String) -> ProfileView {
@@ -1287,6 +1303,15 @@ fn op_set_folder(app: &Arc<App>, which: &str, path: Option<String>) -> Result<Ap
     app.save_global();
     if which != "drive" {
         app.load_eyes();
+        // Put what this computer already learned into the shared folder right away, so the
+        // other computers get it without waiting for the next click here.
+        let store = app.store();
+        for name in store.list() {
+            let p = store.load(&name);
+            let _ = store.save(&p);
+        }
+        let book = app.eyes.lock().unwrap().clone();
+        app.save_eyes(&book);
     }
     Ok(op_app_info(app))
 }
@@ -2417,6 +2442,7 @@ fn dispatch(app: &Arc<App>, cmd: &str, args: serde_json::Value) -> Result<serde_
         "post_new" => json(op_post_new(app, need(a.id, "id")?)?),
         "set_post" => json(op_set_post(app, a.path, a.auto, a.long_side)),
         "convert_folder" => json(op_convert_folder(app, need(a.path, "path")?, need(a.format, "format")?, a.quality.unwrap_or(rawpick_core::convert::DEFAULT_QUALITY))?),
+        "lock_profile" => json(op_lock_profile(app, need(a.name, "name")?, need(a.yes, "yes")?)),
         "self_tune" => json(op_self_tune(app, need(a.name, "name")?)?),
         "learn_pair" => json(op_learn_pair(app, need(a.id, "id")?, need(a.other, "other")?, need(a.name, "name")?)?),
         "gather_selected" => json(op_gather_selected(app, need(a.id, "id")?, need(a.sub, "sub")?)?),

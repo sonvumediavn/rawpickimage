@@ -249,6 +249,12 @@ pub struct Profile {
     /// Settings the AI found by checking itself on the shows Sơn taught ([`crate::selftune`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tuned: Option<crate::selftune::Tuned>,
+    /// This computer locked the taste: the other computers sharing it use it but do not teach it.
+    #[serde(default)]
+    pub locked: bool,
+    /// Another computer locked this taste (its name): here it is used, never taught.
+    #[serde(skip)]
+    pub locked_by: Option<String>,
     #[serde(skip)]
     bank: Vec<BankEntry>,
 }
@@ -334,6 +340,10 @@ impl Profile {
     }
 
     pub fn add(&mut self, mut s: Vec<Sample>) {
+        // Locked on another computer: this one uses the taste without changing it.
+        if self.locked_by.is_some() {
+            return;
+        }
         // What Sơn decided himself (by hand, or in a show he culled) is never replaced by what
         // the AI decided for the same photo later, e.g. when the learned show is opened again.
         let his: std::collections::HashSet<String> = self.samples.iter().filter(|x| x.manual).map(|x| x.name.clone()).collect();
@@ -697,6 +707,8 @@ pub struct SharedFile {
     /// Computer name, for people.
     pub label: String,
     pub samples: Vec<Sample>,
+    /// The owner locked this taste ([`Profile::locked`]).
+    pub locked: bool,
 }
 
 /// A folder (on Google Drive) where several computers share what they learned. Each computer
@@ -762,7 +774,7 @@ impl Shared {
 
     fn write(&self, p: &Profile) -> std::io::Result<()> {
         let mine: Vec<Sample> = p.samples.iter().filter(|s| s.origin.as_deref().is_none_or(|o| o == self.machine)).cloned().collect();
-        let f = SharedFile { profile: p.name.clone(), machine: self.machine.clone(), label: self.label.clone(), samples: mine };
+        let f = SharedFile { profile: p.name.clone(), machine: self.machine.clone(), label: self.label.clone(), samples: mine, locked: p.locked };
         let path = self.own_file(&p.name);
         std::fs::create_dir_all(path.parent().unwrap())?;
         let body = serde_json::to_vec(&f)?;
@@ -815,6 +827,9 @@ impl Store {
         };
         if let Some(sh) = &self.shared {
             for f in sh.others(name) {
+                if f.locked && !p.locked {
+                    p.locked_by = Some(if f.label.is_empty() { "máy khác".into() } else { f.label.clone() });
+                }
                 p.samples.retain(|s| s.origin.as_deref() != Some(f.machine.as_str()));
                 let mut theirs = f.samples;
                 for s in &mut theirs {
@@ -1062,6 +1077,18 @@ mod tests {
         assert!(mac.list().contains(&"cưới".to_string()));
         let mac_file: SharedFile = serde_json::from_slice(&std::fs::read(mac.shared.as_ref().unwrap().own_file("cưới")).unwrap()).unwrap();
         assert_eq!(mac_file.samples.len(), 12);
+        // Windows locks its taste: the Mac uses it but its choices no longer teach it.
+        let mut p3 = win.load("cưới");
+        p3.locked = true;
+        win.save(&p3).unwrap();
+        let mut q2 = mac.load("cưới");
+        assert_eq!(q2.locked_by.as_deref(), Some("win00001"));
+        q2.add(vec![mk("m99", true)]);
+        assert_eq!(q2.samples.len(), 24, "locked elsewhere: not taught here");
+        assert!(win.load("cưới").locked_by.is_none(), "the owner keeps teaching it");
+        p3.locked = false;
+        win.save(&p3).unwrap();
+        assert!(mac.load("cưới").locked_by.is_none());
     }
 }
 

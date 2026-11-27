@@ -291,6 +291,15 @@ function renderProfile(p) {
        <p class="note">Thấy AI chọn sai thì bấm Chọn (P) hoặc Loại (X): AI học ngay từng lần bấm.</p>`
     : `Đang học gu của bạn: <b>${p.samples}</b> / ${p.min_samples} lựa chọn (cần cả ảnh giữ lẫn ảnh bỏ).
        <p class="note">Mở ảnh AI chọn sai, bấm Chọn (P) hoặc Loại (X). Mỗi lần bấm AI học ngay, đủ ${p.min_samples} lần là bắt đầu chấm theo gu bạn.</p>`;
+  if (p.locked_by) {
+    $("profileBox").insertAdjacentHTML("beforeend", `<p class="note live">🔒 Gu này do máy <b>${esc(p.locked_by)}</b> khoá: máy này dùng gu đó để chọn ảnh nhưng không dạy thêm. Muốn dạy theo gu riêng, tạo loại sự kiện mới (nút +).</p>`);
+  } else if (p.shared) {
+    $("profileBox").insertAdjacentHTML("beforeend", `<label class="chk" title="Máy khác dùng chung thư mục học vẫn chọn ảnh theo gu này, nhưng lựa chọn của họ không dạy thêm vào gu này"><input type="checkbox" id="lockTaste" ${p.locked ? "checked" : ""}> 🔒 Khoá gu này: máy khác chỉ dùng, không dạy thêm</label>`);
+    $("lockTaste").onchange = async (e) => {
+      renderProfile(await invoke("lock_profile", { name: st.prefs.profile, yes: e.target.checked }));
+      toast(e.target.checked ? "Đã khoá gu. Máy khác chọn loại sự kiện này sẽ chọn ảnh theo gu bạn, không làm thay đổi gu." : "Đã mở khoá: máy khác dạy thêm được vào gu này.", 7000);
+    };
+  }
   $("btnTrain").disabled = !(st.session && meta()?.phase === "ready");
 }
 
