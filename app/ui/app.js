@@ -1102,6 +1102,7 @@ function wireResults() {
   $("btnSelfTune").onclick = doSelfTune;
   $("btnLearnPublished").onclick = doLearnPublished;
   $("btnConvertFolder").onclick = doConvertFolder;
+  $("btnConvertTop").onclick = doConvertFolder;
   $("btnExportOther").onclick = doExport;
   $("optStars").onchange = () => {
     const v = $("optStars").value;
