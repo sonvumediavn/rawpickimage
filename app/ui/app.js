@@ -1126,9 +1126,12 @@ async function doExportShow() {
   const id = st.sid, m = meta(id);
   if (!m || m.phase !== "ready") return;
   if (!st.summary.selected) return toast("Chưa có ảnh nào được chọn.");
-  if (!st.info.drive_dir) {
-    const ok = await ask("Chọn thư mục trên Google Drive để gửi ảnh cho khách. App sẽ nhớ thư mục này, lần sau xuất thẳng không hỏi lại.\n\nBấm «Để sau» nếu lần này chỉ lưu vào thư mục gốc.", { title: "Thư mục Google Drive", ok: "Chọn thư mục Drive", cancel: "Để sau" });
+  let skipDrive = false;
+  try { skipDrive = localStorage.getItem("noDrive") === "1"; } catch (e) { /* storage off */ }
+  if (!st.info.drive_dir && !skipDrive) {
+    const ok = await ask("Chọn thư mục trên Google Drive để gửi ảnh cho khách. App sẽ nhớ thư mục này, lần sau xuất thẳng không hỏi lại.\n\nBấm «Chỉ lưu trong máy» nếu không dùng Drive: app nhớ và không hỏi lại (đổi ý thì chọn Drive ở mục «Khi xuất»).", { title: "Thư mục Google Drive", ok: "Chọn thư mục Drive", cancel: "Chỉ lưu trong máy" });
     if (ok) await pickDriveDir();
+    else try { localStorage.setItem("noDrive", "1"); } catch (e) { /* storage off */ }
   }
   m.phase = "exporting";
   st.progress[id] = { done: 0, total: 0, stage: "Đang lưu ảnh chọn vào thư mục gốc" };
@@ -1186,11 +1189,15 @@ function renderDrive() {
   $("driveBox").innerHTML = d
     ? `<span>Xuất xong chép lên Google Drive:</span><span class="path">${esc(d)}</span>
        <span class="row"><button class="btn sm" id="driveChange">Đổi thư mục Drive</button><button class="btn sm" id="driveOff">Thôi chép lên Drive</button></span>`
-    : `<span>Chưa chọn thư mục Google Drive. Bấm «Xuất ảnh chọn» lần đầu app sẽ hỏi, hoặc chọn ngay:</span>
+    : `<span>Xuất ảnh chỉ lưu trong máy. Muốn chép thêm lên Google Drive để gửi khách thì chọn thư mục:</span>
        <span class="row"><button class="btn sm" id="driveChange">Chọn thư mục Drive…</button></span>`;
   $("driveChange").onclick = pickDriveDir;
   const off = document.getElementById("driveOff");
-  if (off) off.onclick = async () => { st.info = Object.assign(st.info, await invoke("set_drive_dir", { path: null })); renderDrive(); renderPostBox(); };
+  if (off) off.onclick = async () => {
+    try { localStorage.setItem("noDrive", "1"); } catch (e) { /* storage off */ }
+    st.info = Object.assign(st.info, await invoke("set_drive_dir", { path: null }));
+    renderDrive(); renderPostBox();
+  };
 }
 
 function renderSync() {
