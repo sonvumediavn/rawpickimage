@@ -493,7 +493,7 @@ function renderLive() {
   $("optAutoPost").checked = !!(st.info.post && st.info.post.auto);
   $("optAutoPost").parentElement.hidden = !on;
   $("btnPost").textContent = m.unsent ? `Đăng nhanh (${m.unsent} ảnh mới)` : "Đăng nhanh";
-  $("btnPost").disabled = !m.unsent || m.posting;
+  $("btnPost").disabled = (!m.unsent && !(st.sel && st.sel.size)) || m.posting;
 }
 
 function postDir() {
@@ -529,6 +529,7 @@ function renderPostBox() {
 async function doPost() {
   const m = meta();
   if (!m) return;
+  await chooseTickedFirst("gửi");
   if (!postDir() && !(await pickPostDir())) return;
   try {
     const r = await invoke("post_new", { id: m.id });
@@ -859,11 +860,23 @@ function renderSel() {
   $("selAll").indeterminate = n > 0 && n < all;
   $("selBar").hidden = !n;
   $("selCount").textContent = `Đã tích ${n} ảnh`;
+  renderLive();
 }
 
 function tickAll(on) {
   st.sel = on ? new Set(st.view) : new Set();
   renderSel();
+}
+
+/** Ticked photos not chosen yet when an export starts: ticking looks like choosing, so offer
+ *  to choose them first. False when Sơn cancels. */
+async function chooseTickedFirst(what) {
+  const idxs = [...st.sel].filter((i) => st.verdicts[i] && st.verdicts[i].decision.kind !== "selected");
+  if (!idxs.length) return true;
+  const ok = await ask(`Bạn đang tích ${st.sel.size} ảnh nhưng ${idxs.length} ảnh trong đó chưa được chọn.\n\nChọn ${idxs.length === st.sel.size ? "tất cả ảnh đang tích" : "các ảnh đó"} rồi ${what}?`, { title: "Chọn ảnh đang tích", ok: `Chọn rồi ${what}`, cancel: "Không" });
+  if (!ok) return true;
+  await bulkDecide("selected");
+  return true;
 }
 
 /** Sơn's choice for every ticked photo at once. */
@@ -1126,7 +1139,8 @@ function wireResults() {
 async function doExportShow() {
   const id = st.sid, m = meta(id);
   if (!m || m.phase !== "ready") return;
-  if (!st.summary.selected) return toast("Chưa có ảnh nào được chọn.");
+  await chooseTickedFirst("xuất");
+  if (!st.summary.selected) return toast("Chưa có ảnh nào được chọn. Tích ảnh rồi bấm «Chọn» (phím P), hoặc bật «AI tự chọn».");
   let skipDrive = false;
   try { skipDrive = localStorage.getItem("noDrive") === "1"; } catch (e) { /* storage off */ }
   if (!st.info.drive_dir && !skipDrive) {
@@ -1455,6 +1469,7 @@ async function doLearnPair() {
 async function doExport() {
   const id = st.sid, m = meta(id);
   if (!m || m.phase !== "ready") return;
+  await chooseTickedFirst("xuất");
   const src = m.source || "";
   const defParent = st.info.export_parent || src.replace(/[\\/][^\\/]+[\\/]?$/, "");
   const parent = await T.dialog.open({ directory: true, multiple: false, title: "Chọn thư mục để xuất ảnh đã lọc", defaultPath: defParent || undefined });
