@@ -25,6 +25,7 @@ const CORE_OPTS = [
   ["dedupe", "Lọc ảnh trùng, giữ ảnh đẹp nhất mỗi loạt"],
   ["keep_each_shot", "Cảnh chụp nhiều tấm (nhóm nhận giải…) giữ ít nhất 1 tấm đẹp nhất"],
   ["speaker_head_up", "Người phát biểu một mình cúi đầu: đưa vào «Cần xem lại»"],
+  ["centre_facing", "Hàng người đứng chụp (nhóm lên sân khấu…): người đứng giữa quay mặt đi hoặc nhắm mắt thì đưa vào «Cần xem lại»"],
   ["story", "Đủ loại ảnh kể câu chuyện (toàn cảnh, phát biểu, chi tiết, tập thể…)"],
   ["per_subject", "Mỗi chủ thể chọn vừa đủ: người phát biểu 3–5 tấm, mỗi nhóm và mỗi nhân vật quan trọng khoảng 3 tấm đẹp nhất"],
   ["use_learned", "Dùng điều AI đã học từ lựa chọn của bạn"],
